@@ -25,6 +25,13 @@ function inspect(
 ): { maps: number; violations: string[] } {
   // Scan every source file, but do not build ASTs for unrelated modules.
   // This keeps the repository boundary check below CI's unchanged timeout.
+  // Any static import uses the literal keyword. Keep escaped module strings
+  // as candidates too; the TypeScript scanner resolves their actual value.
+  if (
+    !text.includes("import") ||
+    (!text.includes("maplibre") && !text.includes("\\"))
+  )
+    return { maps: 0, violations: [] };
   const imports = ts.preProcessFile(text, true, true).importedFiles;
   if (!imports.some((entry) => entry.fileName.includes("maplibre"))) {
     return { maps: 0, violations: [] };
@@ -123,5 +130,14 @@ describe("MapLibre attribution exposure boundary", () => {
     );
     expect(result.maps).toBe(1);
     expect(result.violations).toEqual([]);
+  });
+
+  it("does not skip escaped module specifiers", () => {
+    const result = inspect(
+      join(root, "fixture.tsx"),
+      String.raw`import Map from "react-map-gl/mapli\u0062re"; const fixture = <Map />;`,
+    );
+    expect(result.maps).toBe(1);
+    expect(result.violations.length).toBeGreaterThan(0);
   });
 });
