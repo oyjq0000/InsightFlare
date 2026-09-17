@@ -47,4 +47,51 @@ describe("calculateQueryCost", () => {
       }),
     ).toBe(defaultQueryCostPolicy.maxCost);
   });
+
+  it("weights entity scopes and raw-source plans above event scope", () => {
+    const event = calculateQueryCost({ rangeMs: 86_400_000, scope: "event" });
+    const session = calculateQueryCost({
+      rangeMs: 86_400_000,
+      scope: "session",
+      entityAlgebraComplexity: 2,
+    });
+    const visitor = calculateQueryCost({
+      rangeMs: 86_400_000,
+      scope: "visitor",
+      entityAlgebraComplexity: 2,
+      requiredSourceCount: 2,
+      requiresRawSource: true,
+    });
+
+    expect(event).toBeLessThan(session);
+    expect(session).toBeLessThan(visitor);
+  });
+
+  it("charges Funnel structural dimensions and worst-case planning", () => {
+    const ordinary = calculateQueryCost({
+      rangeMs: 86_400_000,
+      provider: "d1",
+    });
+    const tenStepWorstCase = calculateQueryCost({
+      rangeMs: 86_400_000,
+      provider: "d1",
+      funnelStepCount: 10,
+      funnelCteCount: 61,
+      funnelSqlLength: 1_000_000,
+      funnelBindingCount: 100,
+      funnelWorstCase: true,
+    });
+    expect(tenStepWorstCase).toBeGreaterThan(ordinary);
+    expect(
+      calculateQueryCost({
+        rangeMs: 86_400_000,
+        provider: "d1",
+        funnelStepCount: 10,
+        funnelCteCount: 61,
+        funnelSqlLength: 1_000_000,
+        funnelBindingCount: 100,
+        funnelWorstCase: true,
+      }),
+    ).toBe(tenStepWorstCase);
+  });
 });

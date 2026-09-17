@@ -1,3 +1,4 @@
+import { scopedFilterMetadata } from "@/lib/edge/analytics/contract";
 import {
   currentD1Operation,
   currentInvocationLogger,
@@ -11,6 +12,7 @@ import type { Env } from "@/lib/edge/types";
 import { buildEventFilterSql, usesSessionBoundaryFilter } from "./core-filters";
 import type { FilterDocument, QueryWindow } from "./core-types";
 import { type D1ReadDiagnostics, recordD1RowsRead } from "./diagnostics";
+import { compileScopedDatasetSql } from "./scoped-dataset";
 
 export const VISIT_SOURCE_COLUMNS = `
     visit_id, site_id, site_pk, visitor_id, session_id, status, started_at, last_activity_at,
@@ -20,6 +22,7 @@ export const VISIT_SOURCE_COLUMNS = `
     is_eu, country, region, region_code, city, continent, latitude, longitude,
     postal_code, metro_code, timezone, as_organization, ua_raw, browser, browser_version,
     os, os_version, device_type, screen_width, screen_height, language,
+    user_id, user_name,
     perf_ttfb_ms, perf_fcp_ms, perf_lcp_ms, perf_cls, perf_inp_ms,
     ae_synced_at
   `;
@@ -59,6 +62,10 @@ event_source AS (
     v.utm_campaign,
     v.utm_term,
     v.utm_content,
+    v.duration_ms,
+    v.user_id,
+    v.user_name,
+    v.is_eu,
     v.country,
     v.region,
     v.region_code,
@@ -74,6 +81,11 @@ event_source AS (
     v.as_organization,
     v.screen_width,
     v.screen_height,
+    v.perf_ttfb_ms,
+    v.perf_fcp_ms,
+    v.perf_lcp_ms,
+    v.perf_cls,
+    v.perf_inp_ms,
     ce.ae_synced_at
   FROM custom_events ce
   INNER JOIN custom_event_names cen
@@ -111,6 +123,7 @@ event_source${options?.materialize ? " AS MATERIALIZED" : " AS"} (
     fv.hash_fragment,
     fv.hostname, fv.title,
     fv.referrer_url, fv.referrer_host, fv.country, fv.region, fv.city,
+    fv.duration_ms, fv.user_id, fv.user_name, fv.is_eu,
     fv.browser, fv.browser_version, fv.os, fv.os_version, fv.device_type,
     fv.language, fv.timezone, fv.screen_width, fv.screen_height,
     fv.perf_ttfb_ms, fv.perf_fcp_ms, fv.perf_lcp_ms, fv.perf_cls, fv.perf_inp_ms,
@@ -140,6 +153,7 @@ export function buildEventAnalyticsSourceCte(options?: {
     ce.site_id,
     ce.site_pk,
     ce.visit_id,
+    '{}' AS event_data_json,
     cen.name AS event_name,
     ce.occurred_at,
     ce.received_at,
@@ -160,6 +174,10 @@ export function buildEventAnalyticsSourceCte(options?: {
     v.utm_campaign,
     v.utm_term,
     v.utm_content,
+    v.duration_ms,
+    v.user_id,
+    v.user_name,
+    v.is_eu,
     v.country,
     v.region,
     v.region_code,
@@ -174,6 +192,11 @@ export function buildEventAnalyticsSourceCte(options?: {
     v.timezone,
     v.screen_width,
     v.screen_height,
+    v.perf_ttfb_ms,
+    v.perf_fcp_ms,
+    v.perf_lcp_ms,
+    v.perf_cls,
+    v.perf_inp_ms,
     v.as_organization`;
   const eventNameSource = options?.eventName
     ? `
@@ -219,8 +242,34 @@ export function buildEventFilteredSourceCte(
   options?: { materialize?: boolean },
 ): {
   cte: string;
-  bindings: Array<string | number>;
+  bindings: Array<string | number | null>;
 } {
+  const scopedMetadata = scopedFilterMetadata(filters);
+  if (scopedMetadata) {
+    const dataset = compileScopedDatasetSql({
+      filters,
+      plan: scopedMetadata.plan,
+      siteIds: [siteId],
+      window,
+    });
+    const eventNameClause = eventName
+      ? "WHERE TRIM(COALESCE(es.event_name, '')) = ?"
+      : "";
+    return {
+      cte: `
+WITH
+${dataset.ctes},
+filtered_events ${options?.materialize ? "AS MATERIALIZED" : "AS"} (
+  SELECT *
+  FROM ${dataset.eventRelation} es
+  ${eventNameClause}
+)`,
+      bindings: [
+        ...dataset.bindings.map((binding) => binding.value),
+        ...(eventName ? [eventName] : []),
+      ],
+    };
+  }
   const needsVisitSource = usesSessionBoundaryFilter(filters);
   const filter = buildEventFilterSql(filters, "es", {
     sessionSource: needsVisitSource ? "visit_source" : undefined,
@@ -325,5 +374,8 @@ export async function queryD1All<T extends object>(
         typeof rowsRead === "number" && Number.isFinite(rowsRead),
     });
   }
-  return result.results;
+  // D1 normally always returns an array, but keep the shared source boundary
+  // defensive when a test double or a transient adapter response omits results.
+  // Providers should never leak an undefined collection into map/filter code.
+  return Array.isArray(result.results) ? result.results : [];
 }

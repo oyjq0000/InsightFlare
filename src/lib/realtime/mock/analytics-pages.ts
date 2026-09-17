@@ -1,4 +1,8 @@
 import {
+  buildDemoComparisonRows,
+  resolveDemoComparison,
+} from "@/lib/realtime/mock/comparison";
+import {
   aggregateDimensionRowsFromVisits,
   aggregateOverviewMetrics,
   applyDemoFilters,
@@ -7,12 +11,14 @@ import {
   collectReferrerRows,
 } from "@/lib/realtime/mock/fact-builder";
 import {
+  parseDemoBoolean,
   parseDemoFilters,
   parseDemoInterval,
-  parseDemoLimit,
   parseDemoNumber,
+  parseDemoQueryLimit,
   withoutDemoGeoFilter,
 } from "@/lib/realtime/mock/filters";
+import { demoPage } from "@/lib/realtime/mock/pagination";
 import {
   buildDemoTrendBuckets,
   parseDemoTimeZone,
@@ -28,28 +34,68 @@ import {
 export function generateDemoPages(
   siteId: string,
   params: Record<string, string | number>,
+  options: { includeTabs?: boolean; defaultLimit?: number } = {},
 ): Record<string, unknown> {
-  const limit = parseDemoLimit(params.limit, 100, 1, 500);
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   const filters = parseDemoFilters(params);
+  const includeDetails = parseDemoBoolean(params.details);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
-  const pages = collectPageDataAndTabs(dataset, filtered, limit);
+  const allPages = aggregateDimensionRowsFromVisits(
+    dataset,
+    filtered.visits,
+    Math.max(1, filtered.visits.length),
+    (visit) =>
+      includeDetails
+        ? [
+            visit.pathname,
+            demoQueryStringForVisit(visit),
+            demoHashFragmentForVisit(visit),
+          ].join("\u001f")
+        : visit.pathname,
+  );
+  const page = demoPage(
+    allPages.map((row) => ({
+      pathname: row.label.split("\u001f")[0] ?? row.label,
+      query: includeDetails ? (row.label.split("\u001f")[1] ?? "") : "",
+      hash: includeDetails ? (row.label.split("\u001f")[2] ?? "") : "",
+      views: row.views,
+      sessions: row.sessions,
+    })),
+    params,
+    {
+      operation: "pages",
+      siteId,
+      from,
+      to,
+      filters,
+      search: String(params.search ?? "")
+        .trim()
+        .toLowerCase(),
+      sort: String(params.sort ?? params.sortBy ?? "views"),
+      direction: String(params.direction ?? params.sortDir ?? "desc"),
+    },
+    options.defaultLimit ?? 20,
+    200,
+  );
+  const pages = collectPageDataAndTabs(dataset, filtered, 100);
 
-  return {
+  const result: Record<string, unknown> = {
     ok: true,
-    data: pages.data,
-    tabs: pages.tabs,
+    data: {
+      items: page.items,
+      pagination: page.pagination,
+    },
   };
+  if (options.includeTabs !== false) result.tabs = pages.tabs;
+  return result;
 }
 
 export function generateDemoPagesDashboard(
   siteId: string,
   params: Record<string, string | number>,
 ): Record<string, unknown> {
-  const page = parseDemoLimit(params.page, 1, 1, 10_000);
-  const pageSize = parseDemoLimit(params.pageSize, 12, 1, 24);
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   const interval = parseDemoInterval(params.interval);
@@ -60,13 +106,9 @@ export function generateDemoPagesDashboard(
   const allPathRows = aggregateDimensionRowsFromVisits(
     dataset,
     filtered.visits,
-    Math.max(filtered.visits.length, page * pageSize + 1),
+    Math.max(1, filtered.visits.length),
     (visit) => visit.pathname,
   );
-  const offset = (page - 1) * pageSize;
-  const requestedRows = allPathRows.slice(offset, offset + pageSize + 1);
-  const hasMore = requestedRows.length > pageSize;
-  const currentRows = requestedRows.slice(0, pageSize);
   const span = Math.max(0, to - from);
   const previousFrom = Math.max(0, from - span);
   const previousTo = Math.max(previousFrom, from);
@@ -79,50 +121,62 @@ export function generateDemoPagesDashboard(
   const percentDelta = (current: number, previous: number) =>
     previous <= 0 ? null : ((current - previous) / previous) * 100;
 
-  return {
-    ok: true,
-    interval,
-    data: currentRows.map((row) => {
-      const pathname = row.label;
-      const currentMetrics = aggregateOverviewMetrics(
-        dataset,
-        applyDemoFilters(dataset, { ...filters, path: pathname }),
-      );
-      const previousMetrics = aggregateOverviewMetrics(
-        previousDataset,
-        applyDemoFilters(previousDataset, { ...filters, path: pathname }),
-      );
-      const currentPagesPerSession =
-        currentMetrics.sessions > 0
-          ? currentMetrics.views / currentMetrics.sessions
-          : 0;
-      const previousPagesPerSession =
-        previousMetrics.sessions > 0
-          ? previousMetrics.views / previousMetrics.sessions
-          : 0;
-      const titles = aggregateDimensionRowsFromVisits(
-        dataset,
-        filtered.visits.filter((visit) => visit.pathname === pathname),
-        3,
-        (visit) => visit.title,
-      ).map((titleRow) => titleRow.label);
-      const trend = buildDemoTrendBuckets(
-        siteId,
-        from,
-        to,
-        interval,
-        {
-          ...filters,
-          path: pathname,
-        },
-        timeZone,
-      ).map((point) => ({
-        timestampMs: point.timestampMs,
-        views: point.views,
-        visitors: point.visitors,
-      }));
-
-      return {
+  const page = demoPage(
+    allPathRows.map((row) => row.label),
+    params,
+    {
+      operation: "pages-dashboard",
+      siteId,
+      from,
+      to,
+      interval,
+      timeZone,
+      filters,
+      includeDetails: true,
+      sort: "views:desc,sessions:desc,pathname:asc",
+    },
+    12,
+    24,
+  );
+  const items = page.items.flatMap((pathname) => {
+    const row = allPathRows.find((candidate) => candidate.label === pathname);
+    if (!row) return [];
+    const currentMetrics = aggregateOverviewMetrics(
+      dataset,
+      applyDemoFilters(dataset, { ...filters, path: pathname }),
+    );
+    const previousMetrics = aggregateOverviewMetrics(
+      previousDataset,
+      applyDemoFilters(previousDataset, { ...filters, path: pathname }),
+    );
+    const currentPagesPerSession =
+      currentMetrics.sessions > 0
+        ? currentMetrics.views / currentMetrics.sessions
+        : 0;
+    const previousPagesPerSession =
+      previousMetrics.sessions > 0
+        ? previousMetrics.views / previousMetrics.sessions
+        : 0;
+    const titles = aggregateDimensionRowsFromVisits(
+      dataset,
+      filtered.visits.filter((visit) => visit.pathname === pathname),
+      3,
+      (visit) => visit.title,
+    ).map((titleRow) => titleRow.label);
+    const trend = buildDemoTrendBuckets(
+      siteId,
+      from,
+      to,
+      interval,
+      { ...filters, path: pathname },
+      timeZone,
+    ).map((point) => ({
+      timestampMs: point.timestampMs,
+      views: point.views,
+      visitors: point.visitors,
+    }));
+    return [
+      {
         pathname,
         titles,
         trend,
@@ -157,32 +211,106 @@ export function generateDemoPagesDashboard(
             previousMetrics.avgDurationMs,
           ),
         },
-      };
-    }),
-    meta: {
-      page,
-      pageSize,
-      returned: currentRows.length,
-      hasMore,
-      nextPage: hasMore ? page + 1 : null,
-    },
+      },
+    ];
+  });
+
+  return {
+    ok: true,
+    interval,
+    data: { items, pagination: page.pagination },
   };
 }
 
 export function generateDemoReferrers(
   siteId: string,
   params: Record<string, string | number>,
+  options: { allowFullUrl?: boolean; defaultLimit?: number } = {},
 ): Record<string, unknown> {
-  const limit = parseDemoLimit(params.limit, 100, 1, 500);
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   const filters = parseDemoFilters(params);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
+  const includeFullUrl =
+    options.allowFullUrl !== false && parseDemoBoolean(params.fullUrl);
 
+  const allRows = collectReferrerRows(
+    dataset,
+    filtered,
+    Math.max(1, filtered.visits.length),
+    { includeFullUrl },
+  );
+  const page = demoPage(
+    allRows.map(({ referrer, views, sessions }) => ({
+      referrer,
+      views,
+      sessions,
+    })),
+    params,
+    {
+      operation: "referrers",
+      siteId,
+      from,
+      to,
+      filters,
+      includeFullUrl,
+      search: String(params.search ?? "")
+        .trim()
+        .toLowerCase(),
+      sort: String(params.sort ?? params.sortBy ?? "views"),
+      direction: String(params.direction ?? params.sortDir ?? "desc"),
+    },
+    options.defaultLimit ?? 20,
+    200,
+  );
   return {
     ok: true,
-    data: collectReferrerRows(dataset, filtered, limit),
+    data: {
+      items: page.items,
+      pagination: page.pagination,
+    },
+  };
+}
+
+export function generateDemoReferrerSummary(
+  siteId: string,
+  params: Record<string, string | number>,
+): Record<string, unknown> {
+  const topN = parseDemoQueryLimit(params.topN, 5, 1, 20);
+  const from = parseDemoNumber(params.from, 0);
+  const to = parseDemoNumber(params.to, Date.now());
+  const filters = parseDemoFilters(params);
+  const dataset = buildDemoFactDataset(siteId, from, to);
+  const filtered = applyDemoFilters(dataset, filters);
+  const domains = new Set<string>();
+  const links = new Set<string>();
+  let directViews = 0;
+  for (const visit of filtered.visits) {
+    const domain = visit.referrerHost.trim();
+    const link = visit.referrerUrl.trim();
+    if (domain) domains.add(domain);
+    else directViews += dataset.viewWeight;
+    if (link) links.add(link);
+  }
+  const totalViews = filtered.visits.length * dataset.viewWeight;
+  const topSources = collectReferrerRows(dataset, filtered, topN + 1).filter(
+    (row) => row.referrer !== "(direct)",
+  );
+  return {
+    ok: true,
+    data: {
+      totalViews,
+      directViews,
+      externalViews: totalViews - directViews,
+      uniqueDomains: domains.size,
+      uniqueLinks: links.size,
+      truncated: topSources.length > topN,
+      topSources: topSources.slice(0, topN).map((row) => ({
+        referrer: row.referrer,
+        views: row.views,
+      })),
+    },
   };
 }
 
@@ -191,7 +319,6 @@ export function generateDemoDimension(
   dimensionType: string,
   params: Record<string, string | number>,
 ): Record<string, unknown> {
-  const limit = parseDemoLimit(params.limit, 20, 1, 500);
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   let filters = parseDemoFilters(params);
@@ -206,52 +333,123 @@ export function generateDemoDimension(
     rows = aggregateDimensionRowsFromVisits(
       dataset,
       filtered.visits,
-      limit,
+      Math.max(1, filtered.visits.length),
       (visit) => visit.country,
     );
   } else if (dimensionType === "devices") {
     rows = aggregateDimensionRowsFromVisits(
       dataset,
       filtered.visits,
-      limit,
+      Math.max(1, filtered.visits.length),
       (visit) => visit.deviceType,
     );
   } else if (dimensionType === "page-hash") {
     rows = aggregateDimensionRowsFromVisits(
       dataset,
       filtered.visits,
-      limit,
+      Math.max(1, filtered.visits.length),
       (visit) => demoHashFragmentForVisit(visit) || DEMO_EMPTY_HASH_VALUE,
     );
   } else if (dimensionType === "page-query") {
     rows = aggregateDimensionRowsFromVisits(
       dataset,
       filtered.visits,
-      limit,
+      Math.max(1, filtered.visits.length),
       (visit) => demoQueryStringForVisit(visit) || DEMO_EMPTY_QUERY_VALUE,
     );
   } else if (dimensionType === "event-types") {
     rows = aggregateDimensionRowsFromVisits(
       dataset,
       filtered.visits,
-      limit,
+      Math.max(1, filtered.visits.length),
       (visit) => (visit.eventType === "pageview" ? "" : visit.eventType),
     );
   }
 
-  return {
-    ok: true,
-    data: rows
-      .map((row) => ({
-        value:
-          row.label === DEMO_EMPTY_HASH_VALUE ||
-          row.label === DEMO_EMPTY_QUERY_VALUE
-            ? ""
-            : row.label,
+  const items = rows
+    .map((row) => {
+      const value =
+        row.label === DEMO_EMPTY_HASH_VALUE ||
+        row.label === DEMO_EMPTY_QUERY_VALUE
+          ? ""
+          : row.label;
+      return {
+        value,
+        label: value,
         views: row.views,
         sessions: row.sessions,
         visitors: row.visitors,
-      }))
-      .sort((a, b) => b.views - a.views),
-  };
+      };
+    })
+    .sort((a, b) => b.views - a.views || a.value.localeCompare(b.value));
+  const comparison = resolveDemoComparison(params, filters);
+  const comparisonItems = comparison
+    ? (() => {
+        const referenceDataset = buildDemoFactDataset(
+          siteId,
+          comparison.from,
+          comparison.to,
+        );
+        const referenceFilters =
+          dimensionType === "countries"
+            ? withoutDemoGeoFilter(comparison.filters)
+            : comparison.filters;
+        const referenceFiltered = applyDemoFilters(
+          referenceDataset,
+          referenceFilters,
+        );
+        const referenceRows = aggregateDimensionRowsFromVisits(
+          referenceDataset,
+          referenceFiltered.visits,
+          Math.max(1, referenceFiltered.visits.length),
+          (visit) => {
+            if (dimensionType === "countries") return visit.country;
+            if (dimensionType === "devices") return visit.deviceType;
+            if (dimensionType === "page-hash") {
+              return demoHashFragmentForVisit(visit) || DEMO_EMPTY_HASH_VALUE;
+            }
+            if (dimensionType === "page-query") {
+              return demoQueryStringForVisit(visit) || DEMO_EMPTY_QUERY_VALUE;
+            }
+            return visit.eventType === "pageview" ? "" : visit.eventType;
+          },
+        ).map((row) => {
+          const value =
+            row.label === DEMO_EMPTY_HASH_VALUE ||
+            row.label === DEMO_EMPTY_QUERY_VALUE
+              ? ""
+              : row.label;
+          return {
+            value,
+            label: value,
+            views: row.views,
+            sessions: row.sessions,
+            visitors: row.visitors,
+          };
+        });
+        return buildDemoComparisonRows(items, referenceRows, params);
+      })()
+    : items;
+  const page = demoPage(
+    comparisonItems,
+    params,
+    {
+      operation: "dimension",
+      siteId,
+      dimensionType,
+      from,
+      to,
+      filters,
+      compare: params.compare ?? null,
+      metric: params.metric ?? null,
+      sortBy: params.sortBy ?? null,
+      search: String(params.search ?? "")
+        .trim()
+        .toLowerCase(),
+      sort: "views:desc,value:asc",
+    },
+    20,
+    200,
+  );
+  return { ok: true, data: page };
 }

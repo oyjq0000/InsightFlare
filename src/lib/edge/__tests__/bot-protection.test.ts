@@ -2,11 +2,11 @@ import { classifyASN } from "asn-blocklist";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  BOT_ANALYTICS_BLOBS,
-  BOT_ANALYTICS_DOUBLES,
-  classifyCollectBotTraffic,
-  writeBotAnalyticsEvent,
-} from "@/lib/edge/bot-protection";
+  REQUEST_ANALYTICS_BLOBS,
+  REQUEST_ANALYTICS_DOUBLES,
+  writeRequestAnalyticsPoint,
+} from "@/lib/edge/analytics-engine/index";
+import { classifyCollectBotTraffic } from "@/lib/edge/bot-protection";
 import type { Env, TrackerClientPayload } from "@/lib/edge/types";
 
 vi.mock("asn-blocklist", () => ({
@@ -50,11 +50,11 @@ const payload: TrackerClientPayload = {
 
 describe("bot protection", () => {
   it("keeps the Analytics Engine schema within data point limits", () => {
-    expect(BOT_ANALYTICS_BLOBS).toHaveLength(20);
-    expect(BOT_ANALYTICS_DOUBLES.length).toBeLessThanOrEqual(20);
+    expect(REQUEST_ANALYTICS_BLOBS).toHaveLength(20);
+    expect(REQUEST_ANALYTICS_DOUBLES).toHaveLength(20);
   });
 
-  it("classifies known bot user agents as high confidence bot traffic", () => {
+  it("classifies known bot user agents as bot traffic", () => {
     const result = classifyCollectBotTraffic({
       request: request({
         "user-agent": "Googlebot/2.1",
@@ -65,13 +65,12 @@ describe("bot protection", () => {
     });
 
     expect(result).toMatchObject({
-      isBot: true,
-      confidence: "high",
+      category: "bot",
     });
     expect(result.reasons).toContain("ua_isbot");
   });
 
-  it("classifies script user agents as high confidence bot traffic", () => {
+  it("classifies script user agents as bot traffic", () => {
     const result = classifyCollectBotTraffic({
       request: request({
         "user-agent": "curl/8.14.1",
@@ -82,13 +81,31 @@ describe("bot protection", () => {
     });
 
     expect(result).toMatchObject({
-      isBot: true,
-      confidence: "high",
+      category: "bot",
     });
     expect(result.reasons).toContain("script_ua");
   });
 
-  it("classifies configured hosting ASNs as medium confidence bot traffic", () => {
+  it("classifies verified bot categories as bot traffic", () => {
+    const result = classifyCollectBotTraffic({
+      request: request(
+        {
+          "user-agent": CHROME_UA,
+          origin: "https://example.com",
+        },
+        { verifiedBotCategory: "Search Engine Crawler" },
+      ),
+      payload,
+      origin: "https://example.com",
+    });
+
+    expect(result).toMatchObject({
+      category: "bot",
+    });
+    expect(result.reasons).toContain("cf_verified_bot_category");
+  });
+
+  it("classifies configured hosting ASNs as suspected bot traffic", () => {
     const result = classifyCollectBotTraffic({
       request: request(
         {
@@ -105,8 +122,7 @@ describe("bot protection", () => {
     });
 
     expect(result).toMatchObject({
-      isBot: true,
-      confidence: "medium",
+      category: "suspected_bot",
     });
     expect(result.reasons).toContain("hosting_asn");
     expect(vi.mocked(classifyASN)).toHaveBeenCalledWith(13335);
@@ -131,8 +147,7 @@ describe("bot protection", () => {
     });
 
     expect(result).toEqual({
-      isBot: false,
-      confidence: "low",
+      category: "normal",
       reasons: [],
     });
   });
@@ -155,13 +170,12 @@ describe("bot protection", () => {
     });
 
     expect(result).toEqual({
-      isBot: false,
-      confidence: "low",
+      category: "normal",
       reasons: ["network_service_asn"],
     });
   });
 
-  it("classifies network-service ASNs with missing browser provenance as medium confidence", () => {
+  it("classifies network-service ASNs with missing browser provenance as suspected bot traffic", () => {
     const result = classifyCollectBotTraffic({
       request: request(
         {
@@ -177,8 +191,7 @@ describe("bot protection", () => {
     });
 
     expect(result).toMatchObject({
-      isBot: true,
-      confidence: "medium",
+      category: "suspected_bot",
     });
     expect(result.reasons).toEqual([
       "network_service_asn",
@@ -219,13 +232,11 @@ describe("bot protection", () => {
     });
 
     expect(transit).toEqual({
-      isBot: false,
-      confidence: "low",
+      category: "normal",
       reasons: ["transit_asn"],
     });
     expect(access).toEqual({
-      isBot: false,
-      confidence: "low",
+      category: "normal",
       reasons: ["access_asn"],
     });
   });
@@ -242,19 +253,18 @@ describe("bot protection", () => {
     });
 
     expect(result).toEqual({
-      isBot: false,
-      confidence: "low",
+      category: "normal",
       reasons: [],
     });
   });
 
-  it("writes rich bot analytics points with site index and metadata", () => {
+  it("writes rich request observation points with site index and metadata", () => {
     const writeDataPoint = vi.fn();
     const env = {
-      BOT_ANALYTICS: { writeDataPoint },
+      REQUEST_ANALYTICS: { writeDataPoint },
     } as unknown as Env;
 
-    writeBotAnalyticsEvent(env, {
+    writeRequestAnalyticsPoint(env, {
       request: request(
         {
           "user-agent": "curl/8.14.1",
@@ -279,31 +289,30 @@ describe("bot protection", () => {
       origin: "https://example.com",
       traceId: "trace-1",
       receivedAt: 1_800_000_000_000,
-      classification: {
-        isBot: true,
-        confidence: "high",
-        reasons: ["script_ua"],
-      },
+      category: "bot",
+      disposition: "blocked",
+      reasons: ["script_ua"],
     });
 
     expect(writeDataPoint).toHaveBeenCalledTimes(1);
     const point = writeDataPoint.mock.calls[0]?.[0];
     expect(point).toMatchObject({
       indexes: ["site-1"],
-      doubles: [
+      doubles: expect.arrayContaining([
         1_800_000_000_000,
+        1_800_000_000_000,
+        expect.any(Number),
         137409,
         35.6895,
         139.69171,
         0,
         "curl/8.14.1".length,
-      ],
+      ]),
     });
     expect(point?.blobs).toEqual(
       expect.arrayContaining([
-        "site-1",
         "pageview",
-        "high",
+        "bot",
         "script_ua",
         "203.0.113.10",
         "curl/8.14.1",
@@ -314,26 +323,24 @@ describe("bot protection", () => {
     );
   });
 
-  it("drops bot analytics points when Analytics Engine is disabled", () => {
+  it("drops request observation points when Analytics Engine is disabled", () => {
     const writeDataPoint = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const env = {
-      BOT_ANALYTICS: { writeDataPoint },
+      REQUEST_ANALYTICS: { writeDataPoint },
       INSIGHTFLARE_ANALYTICS_ENGINE_DISABLED: "1",
     } as unknown as Env;
 
-    writeBotAnalyticsEvent(env, {
+    writeRequestAnalyticsPoint(env, {
       request: request({ "user-agent": "curl/8.14.1" }),
       payload,
       siteId: "site-1",
       origin: "https://example.com",
       traceId: "trace-1",
       receivedAt: 1_800_000_000_000,
-      classification: {
-        isBot: true,
-        confidence: "high",
-        reasons: ["script_ua"],
-      },
+      category: "bot",
+      disposition: "blocked",
+      reasons: ["script_ua"],
     });
 
     expect(writeDataPoint).not.toHaveBeenCalled();

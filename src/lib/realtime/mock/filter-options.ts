@@ -102,6 +102,7 @@ import {
   GLOBAL_COUNTRY_LONG_TAIL,
   GLOBAL_REFERRER_LONG_TAIL,
 } from "@/lib/realtime/mock/dimension-pools";
+import { demoBadRequest } from "@/lib/realtime/mock/envelope";
 import { createDemoCustomEventFacts } from "@/lib/realtime/mock/events-helpers";
 import {
   aggregateDimensionRowsFromVisits,
@@ -368,10 +369,10 @@ export function generateDemoFilterValues(
   siteId: string,
   params: Record<string, string | number>,
   audience:
-    | "private-dashboard"
-    | "public-share"
-    | "api-v1" = "private-dashboard",
-): Record<string, unknown> {
+    "private-dashboard" | "public-share" | "api-v1" = "private-dashboard",
+):
+  | (ReturnType<typeof demoBadRequest> & { data?: unknown })
+  | (Record<string, unknown> & { data?: unknown }) {
   const field = normalizeDemoFilterValue(params.filterKey);
   const definition = field ? analyticsFilterDefinition(field) : undefined;
   if (
@@ -380,7 +381,7 @@ export function generateDemoFilterValues(
     definition.source === "payload" ||
     !definition.audiences.has(audience)
   ) {
-    return { ok: false, data: [] };
+    return demoBadRequest("Invalid filter field");
   }
 
   const limit = parseDemoLimit(params.limit, 50, 1, 500);
@@ -406,7 +407,7 @@ export function generateDemoFilterValues(
           value: event.eventName,
         })),
         search,
-        limit,
+        Math.max(500, filtered.visits.length),
       ),
     };
   }
@@ -421,7 +422,7 @@ export function generateDemoFilterValues(
           return session ? [{ value: session[key] }] : [];
         }),
         search,
-        limit,
+        Math.max(500, filtered.sessions.size),
       ),
     };
   }
@@ -433,7 +434,7 @@ export function generateDemoFilterValues(
       data: filterValuesFromCandidates(
         utmValues.map((value) => ({ value })),
         search,
-        limit,
+        Math.max(500, utmValues.length),
       ),
     };
   }
@@ -452,7 +453,7 @@ export function generateDemoFilterValues(
         };
       }),
       search,
-      limit,
+      Math.max(500, filtered.visits.length),
     ),
   };
 }

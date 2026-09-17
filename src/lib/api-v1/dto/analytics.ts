@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 import { analyticsFilterDefinition } from "@/lib/edge/analytics/contract/filter-registry";
+import type { FilterScopePreference } from "@/lib/edge/analytics/contract/scoped-filter";
+import { FILTER_DSL_MAX_LENGTH } from "@/lib/filter-contract";
 
 const rfc3339 = z.string().datetime({ offset: true }).max(64);
 const timeZone = z.string().min(1).max(80);
@@ -109,6 +111,10 @@ export const AnalyticsTimeRangeInputDtoSchema = z.discriminatedUnion("kind", [
   PresetTimeRangeDtoSchema,
 ]);
 
+export const FilterScopePreferenceDtoSchema = z
+  .enum(["auto", "event", "session", "visitor"])
+  .optional() satisfies z.ZodType<FilterScopePreference | undefined>;
+
 /**
  * A comparison dataset intentionally cannot select its own reporting zone.
  * Explicit comparison carries one zone at the top level so both datasets use
@@ -136,16 +142,35 @@ export const InlineQueryFilterDtoSchema = z
   })
   .strict();
 
+const dslExpression = z
+  .string()
+  .min(1)
+  .max(FILTER_DSL_MAX_LENGTH)
+  .refine((expression) => expression.trim().length > 0, {
+    message: "DSL expression must contain a non-whitespace character.",
+  });
+
+export const DslQueryFilterDtoSchema = z
+  .object({
+    type: z.literal("dsl"),
+    expression: dslExpression,
+  })
+  .strict();
+
 export const SavedFilterReferenceDtoSchema = z
   .object({ type: z.literal("saved"), id: z.string().min(1).max(256) })
   .strict();
 
 export const SiteQueryFilterDtoSchema = z.discriminatedUnion("type", [
   InlineQueryFilterDtoSchema,
+  DslQueryFilterDtoSchema,
   SavedFilterReferenceDtoSchema,
 ]);
 
-export const TeamQueryFilterDtoSchema = InlineQueryFilterDtoSchema;
+export const TeamQueryFilterDtoSchema = z.discriminatedUnion("type", [
+  InlineQueryFilterDtoSchema,
+  DslQueryFilterDtoSchema,
+]);
 
 const overviewMetricsSchema = z
   .array(
@@ -238,6 +263,7 @@ const comparisonRequestV2 = <
     .object({
       version: ComparisonVersionDtoSchema,
       timeZone,
+      scope: FilterScopePreferenceDtoSchema,
       current,
       reference,
     })
@@ -305,6 +331,7 @@ export const SiteAnalyticsQueryBaseDtoSchema = z
   .object({
     timeRange: AnalyticsTimeRangeInputDtoSchema,
     filter: SiteQueryFilterDtoSchema.nullable().optional(),
+    scope: FilterScopePreferenceDtoSchema,
   })
   .strict();
 
@@ -312,6 +339,7 @@ export const TeamAnalyticsQueryBaseDtoSchema = z
   .object({
     timeRange: AnalyticsTimeRangeInputDtoSchema,
     filter: TeamQueryFilterDtoSchema.nullable().optional(),
+    scope: FilterScopePreferenceDtoSchema,
   })
   .strict();
 
@@ -343,6 +371,13 @@ export const TeamBreakdownQueryDtoSchema =
 /** A team-site composite is deliberately distinct from a generic breakdown. */
 export const TeamSitesQueryDtoSchema = TeamAnalyticsQueryBaseDtoSchema.extend({
   interval: z.enum(["minute", "hour", "day", "week", "month"]).optional(),
+  page: z
+    .object({
+      limit: z.number().int().min(1).max(100).default(20),
+      cursor: z.string().min(1).max(12_288).nullable().optional(),
+    })
+    .strict()
+    .default({ limit: 20 }),
 }).strict();
 
 export const SiteBreakdownQueryDtoSchema =
@@ -359,14 +394,29 @@ export const SiteCrossBreakdownQueryDtoSchema =
   }).strict();
 
 export const SitePagesQueryDtoSchema = SiteAnalyticsQueryBaseDtoSchema.extend({
-  limit: z.number().int().min(1).max(200).default(20),
+  page: z
+    .object({
+      limit: z.number().int().min(1).max(200).default(20),
+      cursor: z.string().min(1).max(12_288).nullable().optional(),
+    })
+    .strict()
+    .default({ limit: 20 }),
   includeDetails: z.boolean().default(false),
 }).strict();
 
 export const SiteReferrersQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
-    limit: z.number().int().min(1).max(200).default(20),
+    sort: z.enum(["views", "visitors"]).default("views"),
+    direction: z.enum(["asc", "desc"]).default("desc"),
+    page: z
+      .object({
+        limit: z.number().int().min(1).max(200).default(20),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
+      .strict()
+      .default({ limit: 20 }),
     includeFullUrl: z.boolean().default(false),
+    search: z.string().trim().min(1).max(256).optional(),
   }).strict();
 
 export const SiteChannelsQueryDtoSchema =
@@ -388,7 +438,10 @@ export const SiteFilterValuesQueryDtoSchema =
     field: filterValueField,
     search: z.string().max(256).optional(),
     page: z
-      .object({ limit: z.number().int().min(1).max(200).default(50) })
+      .object({
+        limit: z.number().int().min(1).max(200).default(50),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
       .strict()
       .default({ limit: 50 }),
   }).strict();
@@ -403,6 +456,16 @@ export const SiteRetentionCohortsQueryDtoSchema =
 export const SiteFunnelAnalysisQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     funnelId: z.string().min(1).max(512),
+  }).strict();
+
+export const SiteGoalSummaryQueryDtoSchema =
+  SiteAnalyticsQueryBaseDtoSchema.extend({
+    goalId: z.string().min(1).max(512),
+  }).strict();
+
+export const SiteGoalTimeseriesQueryDtoSchema =
+  SiteGoalSummaryQueryDtoSchema.extend({
+    interval: z.enum(["minute", "hour", "day", "week", "month"]),
   }).strict();
 
 export const SitePerformanceSummaryQueryDtoSchema =
@@ -433,7 +496,7 @@ export const SiteEventsTimeseriesQueryDtoSchema =
 export const SiteEventsSearchQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     search: z.string().min(1).max(160).optional(),
-    eventName: z.string().min(1).max(120).optional(),
+    eventName: z.string().trim().min(1).max(120).optional(),
     sort: z
       .object({
         field: z.enum(["occurredAt", "eventName", "pathname"]),
@@ -468,29 +531,35 @@ export const SiteEventTypesQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     search: z.string().min(1).max(160).optional(),
     page: z
-      .object({ limit: z.number().int().min(1).max(200).default(20) })
+      .object({
+        limit: z.number().int().min(1).max(200).default(20),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
       .strict()
       .default({ limit: 20 }),
   }).strict();
 
 export const SiteEventTypeDetailQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
-    eventName: z.string().min(1).max(120),
+    eventName: z.string().trim().min(1).max(120),
     interval: z.enum(["minute", "hour", "day", "week", "month"]).default("day"),
   }).strict();
 
 export const SiteEventFieldsQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
-    eventName: z.string().min(1).max(120),
+    eventName: z.string().trim().min(1).max(120),
     page: z
-      .object({ limit: z.number().int().min(1).max(200).default(100) })
+      .object({
+        limit: z.number().int().min(1).max(200).default(100),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
       .strict()
       .default({ limit: 100 }),
   }).strict();
 
 export const SiteEventFieldValuesQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
-    eventName: z.string().min(1).max(120),
+    eventName: z.string().trim().min(1).max(120),
     fieldPath: z.string().min(1).max(240),
     fieldValueType: z.enum([
       "string",
@@ -502,7 +571,10 @@ export const SiteEventFieldValuesQueryDtoSchema =
     ]),
     search: z.string().max(256).optional(),
     page: z
-      .object({ limit: z.number().int().min(1).max(100).default(25) })
+      .object({
+        limit: z.number().int().min(1).max(100).default(25),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
       .strict()
       .default({ limit: 25 }),
   }).strict();
@@ -560,28 +632,35 @@ export const SiteSessionsSearchQueryDtoSchema =
       .default({ limit: 80 }),
   }).strict();
 
-const trajectoryLimit = z.number().int().min(1).max(500).default(100);
+const trajectoryPage = z
+  .object({
+    limit: z.number().int().min(1).max(500).default(100),
+    cursor: z.string().min(1).max(12_288).nullable().optional(),
+  })
+  .strict()
+  .default({ limit: 100 });
 
 export const SiteVisitorEventsQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     visitorId: z.string().min(1).max(512),
-    limit: trajectoryLimit,
+    page: trajectoryPage,
   }).strict();
 
 export const SiteVisitorSessionsQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     visitorId: z.string().min(1).max(512),
-    limit: trajectoryLimit,
+    page: trajectoryPage,
   }).strict();
 
 export const SiteSessionEventsQueryDtoSchema =
   SiteAnalyticsQueryBaseDtoSchema.extend({
     sessionId: z.string().min(1).max(512),
-    limit: trajectoryLimit,
+    page: trajectoryPage,
   }).strict();
 
 const SiteRealtimeQueryBaseDtoSchema = SiteAnalyticsQueryBaseDtoSchema.omit({
   filter: true,
+  scope: true,
 }).strict();
 const realtimeLimit = z.number().int().min(1).max(500).default(100);
 
@@ -631,9 +710,12 @@ export type SiteFunnelAnalysisQueryDto = z.infer<
   typeof SiteFunnelAnalysisQueryDtoSchema
 >;
 export type InlineQueryFilterDto = z.infer<typeof InlineQueryFilterDtoSchema>;
+export type DslQueryFilterDto = z.infer<typeof DslQueryFilterDtoSchema>;
 export type SavedFilterReferenceDto = z.infer<
   typeof SavedFilterReferenceDtoSchema
 >;
+export type SiteQueryFilterDto = z.infer<typeof SiteQueryFilterDtoSchema>;
+export type TeamQueryFilterDto = z.infer<typeof TeamQueryFilterDtoSchema>;
 export type SiteAnalyticsQueryBaseDto = z.infer<
   typeof SiteAnalyticsQueryBaseDtoSchema
 >;
@@ -650,6 +732,7 @@ export type TeamTimeseriesQueryDto = z.infer<
 >;
 export type TeamBreakdownQueryDto = z.infer<typeof TeamBreakdownQueryDtoSchema>;
 export type TeamSitesQueryDto = z.infer<typeof TeamSitesQueryDtoSchema>;
+export type TeamSitesQueryDtoInput = z.input<typeof TeamSitesQueryDtoSchema>;
 export type SiteBreakdownQueryDto = z.infer<typeof SiteBreakdownQueryDtoSchema>;
 export type SiteBreakdownQueryDtoInput = z.input<
   typeof SiteBreakdownQueryDtoSchema
@@ -684,6 +767,18 @@ export type SiteRetentionCohortsQueryDtoInput = z.input<
 >;
 export type SiteFunnelAnalysisQueryDtoInput = z.input<
   typeof SiteFunnelAnalysisQueryDtoSchema
+>;
+export type SiteGoalSummaryQueryDto = z.infer<
+  typeof SiteGoalSummaryQueryDtoSchema
+>;
+export type SiteGoalTimeseriesQueryDto = z.infer<
+  typeof SiteGoalTimeseriesQueryDtoSchema
+>;
+export type SiteGoalSummaryQueryDtoInput = z.input<
+  typeof SiteGoalSummaryQueryDtoSchema
+>;
+export type SiteGoalTimeseriesQueryDtoInput = z.input<
+  typeof SiteGoalTimeseriesQueryDtoSchema
 >;
 export type SitePerformanceSummaryQueryDto = z.infer<
   typeof SitePerformanceSummaryQueryDtoSchema

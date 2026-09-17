@@ -41,6 +41,10 @@ import {
 } from "@/lib/realtime/mock/admin";
 import { generateDemoPages } from "@/lib/realtime/mock/analytics";
 import {
+  buildDemoComparisonRows,
+  resolveDemoComparison,
+} from "@/lib/realtime/mock/comparison";
+import {
   buildCountryPool,
   buildReferrerPool,
   DEMO_CITIES_BY_COUNTRY,
@@ -236,7 +240,7 @@ export function generateDemoGeoPoints(
   siteId: string,
   params: Record<string, string | number>,
 ): Record<string, unknown> {
-  const limit = parseDemoLimit(params.limit, 5000, 50, 20_000);
+  const limit = parseDemoLimit(params.limit, 5000, 1, 20_000);
   const from = parseDemoNumber(
     params.from,
     Math.max(0, Date.now() - 24 * 3600 * 1000),
@@ -434,14 +438,40 @@ export function generateDemoOverviewPageTab(
   params: Record<string, string | number>,
   tab: "path" | "title" | "hostname" | "entry" | "exit",
 ): Record<string, unknown> {
-  const payload = generateDemoPages(siteId, params) as {
-    ok: boolean;
-    tabs?: Record<string, unknown>;
-  };
-  const data = Array.isArray(payload.tabs?.[tab]) ? payload.tabs?.[tab] : [];
+  const from = parseDemoNumber(params.from, 0);
+  const to = parseDemoNumber(params.to, Date.now());
+  const filters = parseDemoFilters(params);
+  const dataset = buildDemoFactDataset(siteId, from, to);
+  const filtered = applyDemoFilters(dataset, filters);
+  const tabs = collectPageDataAndTabs(
+    dataset,
+    filtered,
+    Math.max(1, filtered.visits.length),
+  ).tabs;
+  const data = tabs[tab] ?? [];
+  const comparison = resolveDemoComparison(params, filters);
+  const comparisonData = comparison
+    ? (() => {
+        const referenceDataset = buildDemoFactDataset(
+          siteId,
+          comparison.from,
+          comparison.to,
+        );
+        const referenceFiltered = applyDemoFilters(
+          referenceDataset,
+          comparison.filters,
+        );
+        const referenceTabs = collectPageDataAndTabs(
+          referenceDataset,
+          referenceFiltered,
+          Math.max(1, referenceFiltered.visits.length),
+        ).tabs;
+        return buildDemoComparisonRows(data, referenceTabs[tab] ?? [], params);
+      })()
+    : data;
   return {
-    ok: payload.ok,
-    data,
+    ok: true,
+    data: comparisonData,
   };
 }
 
@@ -456,29 +486,116 @@ export function generateDemoOverviewSourceTab(
   const filters = parseDemoFilters(params);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
+  const comparison = resolveDemoComparison(params, filters);
   if (tab === "channel") {
-    const rows = collectTrafficChannelRows(dataset, filtered, limit);
+    const rows = collectTrafficChannelRows(
+      dataset,
+      filtered,
+      Math.max(1, filtered.visits.length),
+    );
+    const comparisonRows = comparison
+      ? (() => {
+          const referenceDataset = buildDemoFactDataset(
+            siteId,
+            comparison.from,
+            comparison.to,
+          );
+          const referenceFiltered = applyDemoFilters(
+            referenceDataset,
+            comparison.filters,
+          );
+          return buildDemoComparisonRows(
+            rows.map((item) => ({
+              label: item.channel,
+              views: item.views,
+              sessions: item.sessions,
+              visitors: item.visitors,
+            })),
+            collectTrafficChannelRows(
+              referenceDataset,
+              referenceFiltered,
+              Math.max(1, referenceFiltered.visits.length),
+            ).map((item) => ({
+              label: item.channel,
+              views: item.views,
+              sessions: item.sessions,
+              visitors: item.visitors,
+            })),
+            params,
+          );
+        })()
+      : null;
     return {
       ok: true,
-      data: rows.map((item) => ({
-        label: item.channel,
-        views: item.views,
-        sessions: item.sessions,
-        visitors: item.visitors,
+      data: (comparisonRows ?? rows).map((item) => ({
+        label: String(
+          "label" in item ? (item.label ?? "") : (item.channel ?? ""),
+        ),
+        views: Number(item.views ?? 0),
+        sessions: Number(item.sessions ?? 0),
+        visitors: Number(item.visitors ?? 0),
+        ...("reference" in item && item.reference
+          ? { reference: item.reference }
+          : {}),
+        ...("change" in item && item.change ? { change: item.change } : {}),
       })),
     };
   }
-  const rows = collectReferrerRows(dataset, filtered, limit, {
-    includeFullUrl: tab === "link",
-    directValue: "",
-  });
+  const rows = collectReferrerRows(
+    dataset,
+    filtered,
+    Math.max(1, filtered.visits.length),
+    {
+      includeFullUrl: tab === "link",
+      directValue: "",
+    },
+  );
+  const comparisonRows = comparison
+    ? (() => {
+        const referenceDataset = buildDemoFactDataset(
+          siteId,
+          comparison.from,
+          comparison.to,
+        );
+        const referenceFiltered = applyDemoFilters(
+          referenceDataset,
+          comparison.filters,
+        );
+        return buildDemoComparisonRows(
+          rows.map((item) => ({
+            label: item.referrer,
+            views: item.views,
+            sessions: item.sessions,
+            visitors: item.visitors,
+          })),
+          collectReferrerRows(
+            referenceDataset,
+            referenceFiltered,
+            Math.max(1, referenceFiltered.visits.length),
+            { includeFullUrl: tab === "link", directValue: "" },
+          ).map((item) => ({
+            label: item.referrer,
+            views: item.views,
+            sessions: item.sessions,
+            visitors: item.visitors,
+          })),
+          params,
+        );
+      })()
+    : null;
   return {
     ok: true,
-    data: rows.map((item) => ({
-      label: String(item.referrer ?? ""),
+    data: (comparisonRows ?? rows).map((item) => ({
+      label: String(
+        "label" in item ? (item.label ?? "") : (item.referrer ?? ""),
+      ),
       views: Number(item.views ?? 0),
       sessions: Number(item.sessions ?? 0),
       visitors: Number(item.visitors ?? 0),
+      ...("reference" in item && item.reference
+        ? { reference: item.reference }
+        : {}),
+      ...("change" in item && item.change ? { change: item.change } : {}),
     })),
   };
 }
@@ -488,14 +605,40 @@ export function generateDemoOverviewClientTab(
   params: Record<string, string | number>,
   tab: "browser" | "osVersion" | "deviceType" | "language" | "screenSize",
 ): Record<string, unknown> {
-  const payload = generateDemoClientDimensionTabs(siteId, params) as {
-    ok: boolean;
-    tabs?: Record<string, unknown>;
-  };
-  const data = Array.isArray(payload.tabs?.[tab]) ? payload.tabs?.[tab] : [];
+  const from = parseDemoNumber(params.from, 0);
+  const to = parseDemoNumber(params.to, Date.now());
+  const filters = parseDemoFilters(params);
+  const dataset = buildDemoFactDataset(siteId, from, to);
+  const filtered = applyDemoFilters(dataset, filters);
+  const tabs = collectClientTabs(
+    dataset,
+    filtered,
+    Math.max(1, filtered.visits.length),
+  );
+  const data = tabs[tab] ?? [];
+  const comparison = resolveDemoComparison(params, filters);
+  const comparisonData = comparison
+    ? (() => {
+        const referenceDataset = buildDemoFactDataset(
+          siteId,
+          comparison.from,
+          comparison.to,
+        );
+        const referenceFiltered = applyDemoFilters(
+          referenceDataset,
+          comparison.filters,
+        );
+        const referenceTabs = collectClientTabs(
+          referenceDataset,
+          referenceFiltered,
+          Math.max(1, referenceFiltered.visits.length),
+        );
+        return buildDemoComparisonRows(data, referenceTabs[tab] ?? [], params);
+      })()
+    : data;
   return {
-    ok: payload.ok,
-    data,
+    ok: true,
+    data: comparisonData,
   };
 }
 
@@ -503,23 +646,47 @@ export function generateDemoOverviewGeoTab(
   siteId: string,
   params: Record<string, string | number>,
   tab:
-    | "country"
-    | "region"
-    | "city"
-    | "continent"
-    | "timezone"
-    | "organization",
+    "country" | "region" | "city" | "continent" | "timezone" | "organization",
 ): Record<string, unknown> {
-  const payload = generateDemoGeoDimensionTabs(siteId, params, {
-    ignoreGeo: tab === "country",
-  }) as {
-    ok: boolean;
-    tabs?: Record<string, unknown>;
-  };
-  const data = Array.isArray(payload.tabs?.[tab]) ? payload.tabs?.[tab] : [];
+  const from = parseDemoNumber(params.from, 0);
+  const to = parseDemoNumber(params.to, Date.now());
+  const dataset = buildDemoFactDataset(siteId, from, to);
+  const rawFilters = parseDemoFilters(params);
+  const filters =
+    tab === "country" ? withoutDemoGeoFilter(rawFilters) : rawFilters;
+  const tabs = collectGeoTabs(
+    dataset,
+    applyDemoFilters(dataset, filters),
+    Math.max(1, dataset.visits.length),
+  );
+  const data = tabs[tab] ?? [];
+  const comparison = resolveDemoComparison(params, rawFilters);
+  const comparisonData = comparison
+    ? (() => {
+        const referenceDataset = buildDemoFactDataset(
+          siteId,
+          comparison.from,
+          comparison.to,
+        );
+        const referenceFilters =
+          tab === "country"
+            ? withoutDemoGeoFilter(comparison.filters)
+            : comparison.filters;
+        const referenceFiltered = applyDemoFilters(
+          referenceDataset,
+          referenceFilters,
+        );
+        const referenceTabs = collectGeoTabs(
+          referenceDataset,
+          referenceFiltered,
+          Math.max(1, referenceFiltered.visits.length),
+        );
+        return buildDemoComparisonRows(data, referenceTabs[tab] ?? [], params);
+      })()
+    : data;
   return {
-    ok: payload.ok,
-    data,
+    ok: true,
+    data: comparisonData,
   };
 }
 

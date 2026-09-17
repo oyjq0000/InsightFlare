@@ -9,9 +9,9 @@ import { LabelWithOptionalIcon } from "@/components/dashboard/referrer-utils";
 import {
   TabbedDataTableCard,
   type TabbedDataTableColumn,
+  type TabbedDataTableLoader,
   type TabbedDataTableRowAdapter,
   type TabbedDataTableRowBase,
-  type TabbedDataTableSortState,
   type TabbedDataTableTab,
 } from "@/components/dashboard/tabbed-data-table-card";
 import { numberFormat } from "@/lib/dashboard/format";
@@ -62,6 +62,9 @@ export interface AsyncDimensionBreakdownRow extends TabbedDataTableRowBase {
   labelAppearance?: AsyncDimensionBreakdownLabelAppearance;
 }
 
+export type AsyncDimensionBreakdownLoader<T extends string> =
+  TabbedDataTableLoader<T, AsyncDimensionBreakdownRow, string>;
+
 export interface AsyncDimensionBreakdownTab<
   T extends string = string,
 > extends TabbedDataTableTab<T> {
@@ -72,12 +75,9 @@ interface AsyncDimensionBreakdownCardProps<T extends string> {
   locale: Locale;
   messages: AppMessages;
   tabs: NonEmptyArray<AsyncDimensionBreakdownTab<T>>;
-  loadRows?: (
-    tab: T,
-    signal?: AbortSignal,
-  ) => Promise<AsyncDimensionBreakdownRow[]>;
-  rowsByTab?: Partial<Record<T, readonly AsyncDimensionBreakdownRow[] | null>>;
-  loadingByTab?: Partial<Record<T, boolean>>;
+  value?: T;
+  onValueChange?: (value: T) => void;
+  loader: TabbedDataTableLoader<T, AsyncDimensionBreakdownRow, SortKey>;
   requestKey: string;
   className?: string;
   showVisitors?: boolean;
@@ -210,9 +210,9 @@ export const AsyncDimensionBreakdownCard = memo(
     locale,
     messages,
     tabs,
-    loadRows,
-    rowsByTab,
-    loadingByTab,
+    value,
+    onValueChange,
+    loader,
     requestKey,
     className,
     showVisitors = true,
@@ -238,24 +238,6 @@ export const AsyncDimensionBreakdownCard = memo(
         getClassName: () => "hover:brightness-95",
       }),
       [locale, resolvedEmptyLabel],
-    );
-    const compareRows = useCallback(
-      (
-        left: AsyncDimensionBreakdownRow,
-        right: AsyncDimensionBreakdownRow,
-        { sort }: { sort: TabbedDataTableSortState<SortKey> },
-      ) => {
-        const primary =
-          (left[sort.key] - right[sort.key]) *
-          (sort.direction === "asc" ? 1 : -1);
-        if (primary !== 0) return primary;
-        if (right.views !== left.views) return right.views - left.views;
-        if (right.visitors !== left.visitors) {
-          return right.visitors - left.visitors;
-        }
-        return left.label.localeCompare(right.label);
-      },
-      [],
     );
     const labelColumnLabel = useCallback(
       (tab: TabbedDataTableTab<T>) => tab.columnLabel ?? tab.label,
@@ -318,15 +300,17 @@ export const AsyncDimensionBreakdownCard = memo(
     return (
       <TabbedDataTableCard<T, AsyncDimensionBreakdownRow, SortKey>
         tabs={tabs}
+        value={value}
+        onValueChange={onValueChange}
         columns={columns}
         requestKey={requestKey}
-        rowsByTab={rowsByTab}
-        loadingByTab={loadingByTab}
-        loadRows={loadRows}
+        loader={loader}
         normalizeRows={normalizeRows}
         rowAdapter={rowAdapter}
-        compareRows={compareRows}
         labelColumnLabel={labelColumnLabel}
+        sortActionLabel={(label) =>
+          formatI18nTemplate(messages.common.sortBy, { label })
+        }
         loadingLabel={messages.common.loading}
         emptyLabel={resolvedEmptyLabel}
         className={className}

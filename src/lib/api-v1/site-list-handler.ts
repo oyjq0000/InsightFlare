@@ -5,6 +5,7 @@ import {
   AnalysisDefinitionReadCancelledError,
   type AnalysisDefinitionReader,
 } from "@/lib/api-v1/analysis-definition-reader";
+import { parseApiV1FilterDsl } from "@/lib/api-v1/analytics-overview";
 import {
   type SiteAnalyticsQueryBaseDto,
   type SiteChannelsQueryDto,
@@ -64,13 +65,20 @@ import {
   type SiteVisitorsSearchQueryDto,
   SiteVisitorsSearchQueryDtoSchema,
 } from "@/lib/api-v1/dto/analytics";
-import { apiV1ErrorRegistry } from "@/lib/api-v1/errors";
+import {
+  type ApiV1ErrorIssue,
+  apiV1ErrorRegistry,
+  fromInputIssues,
+  fromRequestBodyError,
+  fromZodIssues,
+} from "@/lib/api-v1/errors";
 import { createApiV1QueryApplicationAdapter } from "@/lib/api-v1/query-application";
 import { readBoundedJson } from "@/lib/api-v1/request-budget";
 import { resolveApiV1TimeRange } from "@/lib/api-v1/time-range";
 import type { AnalyticsOperationId } from "@/lib/edge/analytics/application/operation-registry";
 import type { AnalyticsProviderRegistry } from "@/lib/edge/analytics/application/provider-registry";
 import {
+  attachSavedFilterScopePreference,
   type FilterDocument,
   isReportingTimeZone,
   parseApiV1FilterDocument,
@@ -93,13 +101,17 @@ export type SiteListReader<
   Input extends {
     readonly timeRange: SiteAnalyticsQueryBaseDto["timeRange"];
     readonly filter?: SiteAnalyticsQueryBaseDto["filter"];
+    readonly scope?: SiteAnalyticsQueryBaseDto["scope"];
   },
   Result,
 > = (input: SiteListReaderInput & Input) => Promise<Result>;
 
 export type SitePagesReader = SiteListReader<
   SitePagesQueryDto,
-  { readonly items: readonly unknown[] }
+  {
+    readonly items: readonly unknown[];
+    readonly pagination: unknown;
+  }
 >;
 export type SiteChannelsReader = SiteListReader<
   SiteChannelsQueryDto,
@@ -107,14 +119,17 @@ export type SiteChannelsReader = SiteListReader<
 >;
 export type SiteReferrersReader = SiteListReader<
   SiteReferrersQueryDto,
-  { readonly items: readonly unknown[] }
+  {
+    readonly items: readonly unknown[];
+    readonly pagination: unknown;
+  }
 >;
 export type SiteFilterValuesReader = SiteListReader<
   SiteFilterValuesQueryDto,
   {
     readonly field: string;
     readonly items: readonly unknown[];
-    readonly page: unknown;
+    readonly pagination: unknown;
   }
 >;
 export type SiteRetentionReader = SiteListReader<
@@ -154,7 +169,7 @@ export type SiteEventsTimeseriesReader = SiteListReader<
 >;
 export type SiteEventsSearchReader = SiteListReader<
   SiteEventsSearchQueryDto,
-  { readonly items: readonly unknown[]; readonly page: unknown }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteEventDetailReader = SiteListReader<
   SiteEventDetailQueryDto,
@@ -173,7 +188,10 @@ export type SiteJourneyEventDetailReader = SiteListReader<
 >;
 export type SiteEventTypesReader = SiteListReader<
   SiteEventTypesQueryDto,
-  { readonly items: readonly unknown[]; readonly page: unknown }
+  {
+    readonly items: readonly unknown[];
+    readonly pagination: unknown;
+  }
 >;
 export type SiteEventTypeDetailReader = SiteListReader<
   SiteEventTypeDetailQueryDto,
@@ -183,15 +201,14 @@ export type SiteEventTypeDetailReader = SiteListReader<
     readonly trend: unknown;
     readonly breakdowns: unknown;
     readonly cards: unknown;
-    readonly fields: readonly unknown[];
   }
 >;
 export type SiteEventFieldsReader = SiteListReader<
   SiteEventFieldsQueryDto,
   {
     readonly eventName: string;
-    readonly fields: readonly unknown[];
-    readonly page: unknown;
+    readonly items: readonly unknown[];
+    readonly pagination: unknown;
   }
 >;
 export type SiteEventFieldValuesReader = SiteListReader<
@@ -201,7 +218,7 @@ export type SiteEventFieldValuesReader = SiteListReader<
     readonly fieldPath: string;
     readonly fieldValueType: string;
     readonly items: readonly unknown[];
-    readonly page: unknown;
+    readonly pagination: unknown;
   }
 >;
 export type SiteVisitorDetailReader = SiteListReader<
@@ -209,8 +226,6 @@ export type SiteVisitorDetailReader = SiteListReader<
   {
     readonly visitor: unknown;
     readonly metrics: unknown;
-    readonly sessions: readonly unknown[];
-    readonly events: readonly unknown[];
     readonly visitedPages: readonly unknown[];
     readonly eventDistribution: readonly unknown[];
     readonly activity: readonly unknown[];
@@ -222,7 +237,6 @@ export type SiteSessionDetailReader = SiteListReader<
   {
     readonly session: unknown;
     readonly locationPoints: readonly unknown[];
-    readonly events: readonly unknown[];
     readonly visitedPages: readonly unknown[];
     readonly eventDistribution: readonly unknown[];
     readonly performance: unknown;
@@ -230,23 +244,23 @@ export type SiteSessionDetailReader = SiteListReader<
 >;
 export type SiteVisitorsSearchReader = SiteListReader<
   SiteVisitorsSearchQueryDto,
-  { readonly items: readonly unknown[]; readonly page: unknown }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteSessionsSearchReader = SiteListReader<
   SiteSessionsSearchQueryDto,
-  { readonly items: readonly unknown[]; readonly page: unknown }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteVisitorEventsReader = SiteListReader<
   SiteVisitorEventsQueryDto,
-  { readonly items: readonly unknown[] }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteVisitorSessionsReader = SiteListReader<
   SiteVisitorSessionsQueryDto,
-  { readonly items: readonly unknown[] }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteSessionEventsReader = SiteListReader<
   SiteSessionEventsQueryDto,
-  { readonly items: readonly unknown[] }
+  { readonly items: readonly unknown[]; readonly pagination: unknown }
 >;
 export type SiteRealtimeSnapshotReader = SiteListReader<
   SiteRealtimeSnapshotQueryDto,
@@ -285,7 +299,10 @@ function response(
   });
 }
 
-function errorResponse(code: keyof typeof apiV1ErrorRegistry): Response {
+function errorResponse(
+  code: keyof typeof apiV1ErrorRegistry,
+  issues?: readonly ApiV1ErrorIssue[],
+): Response {
   const requestId = crypto.randomUUID();
   const definition = apiV1ErrorRegistry[code];
   return response(
@@ -295,6 +312,7 @@ function errorResponse(code: keyof typeof apiV1ErrorRegistry): Response {
         code,
         message: definition.message,
         retryable: definition.retryable,
+        ...(issues && issues.length > 0 ? { issues } : {}),
       },
       meta: { requestId },
     },
@@ -346,7 +364,21 @@ async function resolveFilter(
     if (!definitions) return null;
     return definitions
       .resolveTeamVisibleSavedFilter({ siteId, id: input.filter.id, signal })
-      .then((resolved) => resolved?.document ?? null);
+      .then((resolved) =>
+        resolved
+          ? attachSavedFilterScopePreference(
+              resolved.document,
+              resolved.scopePreference ?? "auto",
+            )
+          : null,
+      );
+  }
+  if (input.filter.type === "dsl") {
+    try {
+      return parseApiV1FilterDsl(input.filter.expression);
+    } catch {
+      return null;
+    }
   }
   try {
     return parseApiV1FilterDocument({
@@ -374,6 +406,7 @@ async function handlePlannedSiteList<
   Input extends {
     readonly timeRange: SiteAnalyticsQueryBaseDto["timeRange"];
     readonly filter?: SiteAnalyticsQueryBaseDto["filter"];
+    readonly scope?: SiteAnalyticsQueryBaseDto["scope"];
   },
   Result,
 >(
@@ -408,9 +441,16 @@ async function handlePlannedSiteList<
 
   let input: Input;
   try {
-    input = schema.parse(await readBody(request));
-  } catch {
-    return errorResponse("validation_failed");
+    const parsed = schema.safeParse(await readBody(request));
+    if (!parsed.success) {
+      return errorResponse(
+        "validation_failed",
+        fromZodIssues(parsed.error.issues),
+      );
+    }
+    input = parsed.data;
+  } catch (error) {
+    return errorResponse("validation_failed", fromRequestBodyError(error));
   }
   if (!principal.scopes.includes("analytics:read")) {
     return errorResponse("missing_scope");
@@ -443,7 +483,10 @@ async function handlePlannedSiteList<
     endExclusiveMs <= startMs ||
     !isReportingTimeZone(timeZone)
   ) {
-    return errorResponse("validation_failed");
+    return errorResponse(
+      "validation_failed",
+      fromInputIssues([{ path: "timeRange", code: "invalid_time_range" }]),
+    );
   }
   let filters: FilterDocument | null;
   try {
@@ -462,6 +505,9 @@ async function handlePlannedSiteList<
       input.filter?.type === "saved"
         ? "resource_not_found"
         : "validation_failed",
+      input.filter?.type === "saved"
+        ? undefined
+        : fromInputIssues([{ path: "filter", code: "invalid_filter" }]),
     );
   }
   if (execution.signal?.aborted) return cancelledResponse();
@@ -484,6 +530,7 @@ async function handlePlannedSiteList<
       endExclusiveMs,
       timeZone,
       filters,
+      scopePreference: input.scope ?? "auto",
     };
     const serviceResult = await createApiV1QueryApplicationAdapter().execute<
       typeof query,
@@ -493,6 +540,7 @@ async function handlePlannedSiteList<
         operation,
         context: siteQueryContext(siteId, "api-v1"),
         query,
+        rawRequest: input,
         providerRegistry,
       },
       {
@@ -519,6 +567,15 @@ async function handlePlannedSiteList<
       if (serviceResult.error.kind === "deadline-exceeded") {
         return errorResponse("deadline_exceeded");
       }
+      if (serviceResult.error.kind === "invalid-input") {
+        return errorResponse(
+          "validation_failed",
+          fromInputIssues(serviceResult.error.issues),
+        );
+      }
+      if (serviceResult.error.kind === "invalid-cursor") {
+        return errorResponse("invalid_cursor");
+      }
       return errorResponse("unsupported_query");
     }
     const data = serviceResult.value;
@@ -537,6 +594,9 @@ async function handlePlannedSiteList<
           },
           source: responseMeta.source ?? "raw",
           accuracy: responseMeta.accuracy ?? "exact",
+          ...(serviceResult.meta?.filterScope
+            ? { filterScope: serviceResult.meta.filterScope }
+            : {}),
         },
       },
       requestId,

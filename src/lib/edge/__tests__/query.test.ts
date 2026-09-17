@@ -170,6 +170,7 @@ function createEnv(options: MockEnvOptions = {}) {
   );
   const env = {
     DB: { prepare } as unknown as D1Database,
+    DAILY_SALT_SECRET: "test-pagination-secret",
   } as Env;
   return { env, prepare, statements };
 }
@@ -251,6 +252,19 @@ async function publicQuery(
 
 const windowParams = `from=${from}&to=${to}`;
 
+function expectPublicPayloadWithoutIdentity(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) expectPublicPayloadWithoutIdentity(item);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    expect(key).not.toBe("userId");
+    expect(key).not.toBe("userName");
+    expectPublicPayloadWithoutIdentity(child);
+  }
+}
+
 function privatePath(pathname: string, params = "") {
   const suffix = params ? `&${params}` : "";
   return `/api/private/${pathname}?siteId=site-1&${windowParams}${suffix}`;
@@ -283,10 +297,12 @@ const overviewRows = [
 function overviewMatch(): SqlMatch {
   let index = 0;
   return {
-    match: includesAll(
-      "COALESCE((SELECT count(*) FROM session_rollup WHERE visit_count = 1), 0) AS bounces",
-      "FROM filtered_visits",
-    ),
+    match: (sql) =>
+      sql.includes(
+        "COALESCE((SELECT count(*) FROM session_rollup WHERE visit_count = 1), 0) AS bounces",
+      ) &&
+      (sql.includes("FROM filtered_visits") ||
+        sql.includes("FROM scope_final_visits")),
     first: undefined,
     run: undefined,
     get all() {
@@ -1182,6 +1198,17 @@ describe("edge query handlers", () => {
     expect(statements[0].bind).toHaveBeenCalledWith("site-1");
   });
 
+  it("marks sites resolved for system administrators as manageable", async () => {
+    const { env } = createEnv({
+      matches: [firstMatch(["FROM sites", "WHERE id=? LIMIT 1"], siteRow)],
+    });
+    const edgeRequest = request(privatePath("overview"));
+
+    await expect(
+      resolvePrivateSite(edgeRequest, env, new URL(edgeRequest.url)),
+    ).resolves.toEqual({ ...siteRow, canManage: true });
+  });
+
   it("uses team membership lookup for non-admin users", async () => {
     requireSessionMock.mockResolvedValue(userSession);
     const { env, statements } = createEnv({
@@ -1260,8 +1287,10 @@ describe("edge query handlers", () => {
     expect(aggregateStatement?.bindings).toEqual(
       expect.arrayContaining(["us", "example.com"]),
     );
+    expect(aggregateStatement?.sql).toContain("scope_matching_visits AS");
+    expect(aggregateStatement?.sql).toContain("scope_matching_events AS");
     expect(aggregateStatement?.sql).toContain(
-      "LOWER(TRIM(COALESCE(visit_source.referrer_host, ''))) = ''",
+      "LOWER(TRIM(COALESCE(v.referrer_host, ''))) = ''",
     );
   });
 
@@ -1329,7 +1358,7 @@ describe("edge query handlers", () => {
     const dimensionPayload: any = await dimension.json();
     const optionsPayload: any = await options.json();
     expect(dimensionPayload).toMatchObject({ ok: true });
-    expect(dimensionPayload.data).toEqual(
+    expect(dimensionPayload.data.items).toEqual(
       expect.arrayContaining([
         {
           value: "/pricing",
@@ -1340,15 +1369,26 @@ describe("edge query handlers", () => {
         },
       ]),
     );
+    expect(dimensionPayload.data.pagination).toMatchObject({
+      limit: 200,
+      returned: expect.any(Number),
+      hasMore: expect.any(Boolean),
+    });
+    expect(
+      dimensionPayload.data.pagination.nextCursor === null ||
+        typeof dimensionPayload.data.pagination.nextCursor === "string",
+    ).toBe(true);
     expect(optionsPayload).toMatchObject({ ok: true, field: "referrer.url" });
     expect(optionsPayload.data).toEqual(
-      expect.arrayContaining([
-        {
-          value: "https://news.example/post",
-          label: "https://news.example/post",
-          occurrences: 6,
-        },
-      ]),
+      expect.objectContaining({
+        items: expect.arrayContaining([
+          {
+            value: "https://news.example/post",
+            label: "https://news.example/post",
+            occurrences: 6,
+          },
+        ]),
+      }),
     );
     expect(invalidOptions.status).toBe(400);
     expect(await invalidOptions.json()).toMatchObject({
@@ -1358,7 +1398,7 @@ describe("edge query handlers", () => {
     const dimensionStatement = statements.find((statement) =>
       statement.sql.includes("dimension_rollup AS"),
     );
-    expect(dimensionStatement?.bindings.at(-1)).toBe(200);
+    expect(dimensionStatement?.bindings.at(-1)).toBe(201);
   });
 
   it("shapes events summary, trend, records, type detail, fields, field values, and record detail", async () => {
@@ -1374,7 +1414,7 @@ describe("edge query handlers", () => {
     const records = await privateQuery(
       privatePath(
         "events-records",
-        "page=1&pageSize=1&sortBy=pathname&sortDir=asc&search=signup",
+        "limit=1&sortBy=pathname&sortDir=asc&search=signup",
       ),
       env,
     );
@@ -1422,15 +1462,17 @@ describe("edge query handlers", () => {
     const trendPayload: any = await trend.json();
     expect(trendPayload).toMatchObject({
       ok: true,
-      interval: "hour",
-      series: [
-        expect.objectContaining({
-          eventName: "Signup",
-          key: "signup",
-        }),
-      ],
+      data: {
+        interval: "hour",
+        series: [
+          expect.objectContaining({
+            eventName: "Signup",
+            key: "signup",
+          }),
+        ],
+      },
     });
-    expect(trendPayload.data).toEqual(
+    expect(trendPayload.data.data).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           bucket: 0,
@@ -1440,18 +1482,20 @@ describe("edge query handlers", () => {
     );
     expect(await records.json()).toMatchObject({
       ok: true,
-      data: [
-        expect.objectContaining({
-          eventId: "evt-1",
-          eventName: "Signup",
-          pathname: "/signup",
-        }),
-      ],
-      meta: {
-        pageSize: 1,
-        returned: 1,
-        hasMore: true,
-        nextCursor: expect.any(String),
+      data: {
+        items: [
+          expect.objectContaining({
+            eventId: "evt-1",
+            eventName: "Signup",
+            pathname: "/signup",
+          }),
+        ],
+        pagination: {
+          limit: 1,
+          returned: 1,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
     expect(await detail.json()).toMatchObject({
@@ -1462,36 +1506,33 @@ describe("edge query handlers", () => {
         avgEventsPerSession: 2.4,
         shareOfAllEvents: 1,
       },
-      fields: [
-        {
-          path: "/plan",
-          valueType: "string",
-          exampleValue: "pro",
-        },
-      ],
     });
     expect(await fields.json()).toMatchObject({
       ok: true,
       eventName: "Signup",
-      fields: [
-        {
-          path: "/plan",
-          valueType: "string",
-          exampleValue: "pro",
-        },
-      ],
+      data: {
+        items: [
+          {
+            path: "/plan",
+            valueType: "string",
+            exampleValue: "pro",
+          },
+        ],
+      },
     });
     expect(await values.json()).toMatchObject({
       ok: true,
       fieldPath: "/plan",
       fieldValueType: "string",
-      data: [
-        {
-          value: "pro",
-          events: 2,
-          occurrences: 3,
-        },
-      ],
+      data: {
+        items: [
+          {
+            value: "pro",
+            events: 2,
+            occurrences: 3,
+          },
+        ],
+      },
     });
     expect(await recordDetail.json()).toMatchObject({
       ok: true,
@@ -1640,17 +1681,17 @@ describe("edge query handlers", () => {
     expect(await numberValues.json()).toMatchObject({
       ok: true,
       fieldValueType: "number",
-      data: [{ value: 42.5 }],
+      data: { items: [{ value: 42.5 }], pagination: expect.any(Object) },
     });
     expect(await booleanValues.json()).toMatchObject({
       ok: true,
       fieldValueType: "boolean",
-      data: [{ value: true }],
+      data: { items: [{ value: true }], pagination: expect.any(Object) },
     });
     expect(await nullValues.json()).toMatchObject({
       ok: true,
       fieldValueType: "null",
-      data: [{ value: null }],
+      data: { items: [{ value: null }], pagination: expect.any(Object) },
     });
     expect(invalidType.status).toBe(400);
     expect(await invalidType.json()).toMatchObject({
@@ -1667,15 +1708,12 @@ describe("edge query handlers", () => {
     const visitors = await privateQuery(
       privatePath(
         "visitors",
-        "page=1&pageSize=1&sortBy=firstSeenAt&sortDir=asc&search=visitor",
+        "limit=1&sortBy=firstSeenAt&sortDir=asc&search=visitor",
       ),
       env,
     );
     const sessions = await privateQuery(
-      privatePath(
-        "sessions",
-        "page=1&pageSize=1&sortBy=durationMs&sortDir=asc",
-      ),
+      privatePath("sessions", "limit=1&sortBy=durationMs&sortDir=asc"),
       env,
     );
     const retention = await privateQuery(
@@ -1683,42 +1721,47 @@ describe("edge query handlers", () => {
       env,
     );
     const pageDashboard = await privateQuery(
-      privatePath("pages-dashboard", "page=1&pageSize=2&interval=hour"),
+      privatePath("pages-dashboard", "limit=2&interval=hour"),
       env,
     );
 
     expect(await visitors.json()).toMatchObject({
       ok: true,
-      data: [
-        {
-          visitorId: "visitor-1",
-          sessions: 2,
-          referrerHost: "news.example",
-          screenWidth: 1440,
+      data: {
+        items: [
+          {
+            visitorId: "visitor-1",
+            sessions: 2,
+            referrerHost: "news.example",
+            screenWidth: 1440,
+          },
+        ],
+        pagination: {
+          limit: 1,
+          returned: 1,
+          hasMore: false,
         },
-      ],
-      meta: {
-        pageSize: 1,
-        returned: 1,
-        hasMore: false,
       },
     });
     expect(await sessions.json()).toMatchObject({
       ok: true,
-      data: [
-        {
-          sessionId: "session-1",
-          durationMs: 10_000,
-          performance: {
-            ttfb: 12.346,
-            cls: 0.025,
+      data: {
+        items: [
+          {
+            sessionId: "session-1",
+            durationMs: 10_000,
+            performance: {
+              ttfb: 12.346,
+              cls: 0.025,
+            },
           },
+        ],
+        pagination: {
+          limit: 1,
+          returned: 1,
+          hasMore: true,
+          nextCursor: expect.any(String),
         },
-      ],
-      meta: {
-        pageSize: 1,
-        hasMore: true,
-        nextCursor: expect.any(String),
       },
     });
     expect(await retention.json()).toMatchObject({
@@ -1737,29 +1780,30 @@ describe("edge query handlers", () => {
     expect(await pageDashboard.json()).toMatchObject({
       ok: true,
       interval: "hour",
-      data: [
-        expect.objectContaining({
-          pathname: "/pricing",
-          titles: ["Pricing", "Plans"],
-          metrics: {
-            views: 12,
-            visitors: 6,
-            sessions: 8,
-            bounceRate: 0.25,
-            pagesPerSession: 1.5,
-            avgDurationMs: 2000,
-          },
-        }),
-        expect.objectContaining({
-          pathname: "/docs",
-        }),
-      ],
-      meta: {
-        page: 1,
-        pageSize: 2,
-        returned: 2,
-        hasMore: true,
-        nextPage: 2,
+      data: {
+        items: [
+          expect.objectContaining({
+            pathname: "/pricing",
+            titles: ["Pricing", "Plans"],
+            metrics: {
+              views: 12,
+              visitors: 6,
+              sessions: 8,
+              bounceRate: 0.25,
+              pagesPerSession: 1.5,
+              avgDurationMs: 2000,
+            },
+          }),
+          expect.objectContaining({
+            pathname: "/docs",
+          }),
+        ],
+        pagination: {
+          limit: 2,
+          returned: 2,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
   });
@@ -2051,7 +2095,10 @@ describe("edge query handlers", () => {
     expect(await geoOptions.json()).toMatchObject({
       ok: true,
       field: "geo.country",
-      data: expect.any(Array),
+      data: {
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      },
     });
 
     const emptyTrend = await privateQuery(
@@ -2092,31 +2139,41 @@ describe("edge query handlers", () => {
     const sourceTabPayload: any = await sourceTab.json();
     expect(pageTabPayload).toMatchObject({ ok: true });
     expect(pageTabPayload.data).toEqual(
-      expect.arrayContaining([
-        { label: "/pricing", views: 1, sessions: 1, visitors: 1 },
-      ]),
+      expect.objectContaining({
+        items: expect.arrayContaining([
+          { label: "/pricing", views: 1, sessions: 1, visitors: 1 },
+        ]),
+      }),
     );
     expect(sourceTabPayload).toMatchObject({ ok: true });
     expect(sourceTabPayload.data).toEqual(
-      expect.arrayContaining([
-        { label: "news.example", views: 6, sessions: 4, visitors: 3 },
-      ]),
+      expect.objectContaining({
+        items: expect.arrayContaining([
+          { label: "news.example", views: 6, sessions: 4, visitors: 3 },
+        ]),
+      }),
     );
     expect(await clientTab.json()).toMatchObject({
       ok: true,
-      data: [{ label: "Chrome", views: 1, sessions: 1, visitors: 0 }],
+      data: {
+        items: [{ label: "Chrome", views: 1, sessions: 1, visitors: 1 }],
+        pagination: expect.any(Object),
+      },
     });
     expect(await geoTab.json()).toMatchObject({
       ok: true,
-      data: [
-        {
-          value: "US",
-          label: "US",
-          views: 1,
-          sessions: 1,
-          visitors: 1,
-        },
-      ],
+      data: {
+        items: [
+          {
+            value: "US",
+            label: "US",
+            views: 1,
+            sessions: 1,
+            visitors: 1,
+          },
+        ],
+        pagination: expect.any(Object),
+      },
     });
     expect(await geoPoints.json()).toMatchObject({
       ok: true,
@@ -2190,6 +2247,30 @@ describe("edge query handlers", () => {
       error: { message: "Team not found" },
     });
     expect(statements[0].bind).toHaveBeenCalledWith("user-1", "team-1");
+  });
+
+  it("rejects oversized team dashboard trends before constructing D1 trend SQL", async () => {
+    const { env, statements } = createEnv({
+      matches: [firstMatch(["SELECT id FROM teams"], { id: "team-1" })],
+    });
+
+    const response = await privateQuery(
+      `/api/private/team-dashboard?teamId=team-1&from=0&to=${to}&interval=day`,
+      env,
+    );
+
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "too_many_buckets",
+        message: "The requested trend contains too many buckets.",
+      },
+    });
+    // Team ACL resolution is still performed, but no site, rollup, or raw
+    // trend query is allowed to run after the range is rejected.
+    expect(statements).toHaveLength(1);
+    expect(statements[0].sql).toContain("SELECT id FROM teams");
   });
 
   it("routes team dashboard with team auth, site summaries, trends, and empty teams", async () => {
@@ -2281,6 +2362,70 @@ describe("edge query handlers", () => {
     });
   });
 
+  it("applies private team filters through the scoped dataset", async () => {
+    const { env, statements } = createEnv({
+      matches: [
+        firstMatch(["SELECT id FROM teams"], { id: "team-1" }),
+        allMatch(
+          ["FROM sites", "WHERE team_id = ?"],
+          [
+            {
+              id: "site-1",
+              teamId: "team-1",
+              name: "Main",
+              domain: "example.com",
+              publicEnabled: 1,
+              publicSlug: "main",
+              createdAt: 10,
+              updatedAt: 20,
+            },
+          ],
+        ),
+        allMatch(
+          ["FROM scope_final_visits", "GROUP BY siteId"],
+          [
+            {
+              siteId: "site-1",
+              views: 4,
+              sessions: 2,
+              visitors: 2,
+              bounces: 1,
+              totalDuration: 100,
+              durationViews: 2,
+            },
+          ],
+        ),
+        allMatch(
+          ["FROM scope_final_visits", "GROUP BY siteId, bucket"],
+          [{ siteId: "site-1", bucket: 0, views: 4, visitors: 2 }],
+        ),
+      ],
+    });
+
+    const response = await privateQuery(
+      `/api/private/team-dashboard?teamId=team-1&${windowParams}&filter[page.path]=/docs`,
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      data: {
+        sites: [{ id: "site-1", overview: { views: 4 } }],
+        trend: [{ sites: [{ siteId: "site-1", views: 4 }] }],
+      },
+    });
+    const scopedStatements = statements.filter((statement) =>
+      statement.sql.includes("FROM scope_final_visits"),
+    );
+    expect(scopedStatements).toHaveLength(3);
+    expect(
+      scopedStatements.every((statement) =>
+        statement.bindings.includes("/docs"),
+      ),
+    ).toBe(true);
+  });
+
   it("handles public query lookup, public privacy envelope, public-only route restrictions, and missing slugs", async () => {
     const { env, statements } = createEnv({
       matches: [...publicAuthMatches(), ...commonQueryMatches()],
@@ -2298,13 +2443,15 @@ describe("edge query handlers", () => {
 
     expect(overview.status).toBe(200);
     expect(overview.headers.get("access-control-allow-origin")).toBeNull();
-    expect(await overview.json()).toMatchObject({
+    const overviewPayload = await overview.json();
+    expect(overviewPayload).toMatchObject({
       ok: true,
       data: {
         views: 20,
         sessions: 8,
       },
     });
+    expectPublicPayloadWithoutIdentity(overviewPayload);
     expect(statements[0].bind).toHaveBeenCalledWith("public-slug");
     expect(privateOnly.status).toBe(404);
     expect(await privateOnly.json()).toMatchObject({
@@ -2382,13 +2529,83 @@ describe("edge query handlers", () => {
     expect(pages.status).toBe(200);
     expect(await pages.json()).toMatchObject({
       ok: true,
-      data: expect.any(Array),
+      data: {
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      },
     });
     expect(referrers.status).toBe(200);
     expect(await referrers.json()).toMatchObject({
       ok: true,
-      data: expect.any(Array),
+      data: {
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      },
     });
+  });
+
+  it("routes every public shared-query collection through its contract adapter", async () => {
+    const { env } = createEnv();
+    const paths = [
+      "overview",
+      "trend",
+      "pages",
+      "referrers",
+      "referrer-summary",
+      "pages-dashboard",
+      "retention",
+      "performance",
+      "event-types",
+      "filter-values",
+      "overview-geo-points",
+      "countries",
+      "utm-source",
+      "utm-medium",
+      "utm-campaign",
+      "utm-term",
+      "utm-content",
+      "browser-trend",
+      "browser-engine-trend",
+      "browser-version-breakdown",
+      "browser-cross-breakdown",
+      "browser-radar",
+      "referrer-radar",
+      "referrer-dimension-trend",
+      "referrer-channel-dimension-trend",
+      "client-dimension-trend",
+      "utm-dimension-trend",
+      "client-cross-breakdown",
+      "overview-page-path",
+      "overview-page-title",
+      "overview-page-hostname",
+      "overview-page-entry",
+      "overview-page-exit",
+      "overview-source-domain",
+      "overview-source-channel",
+      "overview-client-browser",
+      "overview-client-os-version",
+      "overview-client-device-type",
+      "overview-client-language",
+      "overview-client-screen-size",
+      "overview-geo-country",
+      "overview-geo-region",
+      "overview-geo-city",
+      "overview-geo-continent",
+      "overview-geo-timezone",
+      "overview-geo-organization",
+    ];
+    for (const pathname of paths) {
+      const url = new URL(
+        `https://edge.test/api/public-sites/public-slug/${pathname}?${windowParams}&filterKey=geo.country`,
+      );
+      const response = await executePublicQuery({
+        env,
+        siteId: "site-1",
+        pathname,
+        url,
+      });
+      expect(response).toBeInstanceOf(Response);
+    }
   });
 
   it("returns not found for unknown private paths after authorization", async () => {

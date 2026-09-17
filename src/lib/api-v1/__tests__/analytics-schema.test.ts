@@ -47,6 +47,41 @@ describe("typed analytics schema catalog", () => {
     });
     expect(schema.filters).toContain("page.path");
     expect(schema.operators).toContain("eq");
+    expect(schema.filterProtocol.fields).toContainEqual(
+      expect.objectContaining({
+        id: "session.views",
+        valueKind: "number",
+        group: "session",
+        nativeEntity: "session",
+        nullable: false,
+        suggestionMode: "none",
+      }),
+    );
+    expect(schema.filterProtocol.fields).toContainEqual(
+      expect.objectContaining({
+        id: "visitor.sessions",
+        group: "visitor",
+        nativeEntity: "visitor",
+      }),
+    );
+    expect(
+      schema.filterProtocol.fields.some((field) =>
+        Object.prototype.hasOwnProperty.call(field, "compilerStrategy"),
+      ),
+    ).toBe(false);
+    expect(schema.filterProtocol.json).toMatchObject({
+      documentVersion: 1,
+      operators: expect.arrayContaining(["eq", "startsWith"]),
+    });
+    expect(schema.filterProtocol.dsl).toMatchObject({
+      version: 1,
+      maxLength: 65_536,
+      operators: expect.arrayContaining(["eq", "startsWith"]),
+      examples: expect.arrayContaining(['page.path eq "/pricing"']),
+    });
+    expect(schema.filterProtocol.dsl.syntax.condition).toBe(
+      "<field> <operator> <value>",
+    );
     expect(AnalyticsSchemaDataSchema.safeParse(schema).success).toBe(true);
   });
 

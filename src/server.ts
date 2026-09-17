@@ -1,7 +1,7 @@
 import handler from "@tanstack/react-start/server-entry";
 
 import { initializeE2eClock } from "@/lib/edge/e2e-clock";
-import { runHourlyAggregation } from "@/lib/edge/hourly-rollup";
+import { sweepIngestAlarms } from "@/lib/edge/ingest-alarm-sweep";
 import { IngestDurableObject as BaseIngestDurableObject } from "@/lib/edge/ingest-do";
 import { instrumentEnv } from "@/lib/edge/observability-bindings";
 import {
@@ -9,12 +9,10 @@ import {
   errorLogData,
   runWithInvocationLogger,
 } from "@/lib/edge/observability-logger";
-import { getScheduledTaskDefinition } from "@/lib/edge/scheduled-task-registry";
-import { runScheduledTask } from "@/lib/edge/scheduled-task-runner";
+import { dispatchInternalScheduledTasks } from "@/lib/edge/scheduled-task-dispatcher";
 import type { Env } from "@/lib/edge/types";
 import apiApp from "@/lib/hono/app";
 import { shouldUseHono } from "@/lib/hono/path-match";
-import { runNotificationTick } from "@/lib/notifications/notification-task";
 import { localeCookie, resolvePageRequest } from "@/middleware";
 
 export interface AppServerContext {
@@ -37,6 +35,7 @@ function withPageHeaders(
   pathname: string,
   locale: string | null,
   demoMode: boolean,
+  e2eTestSiteURL?: string,
 ): Response {
   const headers = new Headers(response.headers);
   headers.set("x-pathname", pathname);
@@ -52,6 +51,14 @@ function withPageHeaders(
     "Permissions-Policy",
     "camera=(), microphone=(), geolocation=(), payment=()",
   );
+  const connectSources = ["'self'", "https:", "wss:"];
+  if (e2eTestSiteURL) {
+    try {
+      connectSources.push(new URL(e2eTestSiteURL).origin);
+    } catch {
+      // Keep the production CSP when the optional E2E URL is malformed.
+    }
+  }
   headers.set(
     "Content-Security-Policy",
     [
@@ -61,7 +68,7 @@ function withPageHeaders(
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      "connect-src 'self' https: wss:",
+      `connect-src ${connectSources.join(" ")}`,
       "worker-src 'self' blob:",
       "frame-src 'self' https:",
       "frame-ancestors 'none'",
@@ -128,6 +135,7 @@ export default {
             pathname,
             null,
             env.DEMO_MODE === "1",
+            env.INSIGHTFLARE_E2E_TEST_SITE_URL,
           );
           logger.setRequest({
             route: pageRouteForLog(pathname),
@@ -154,6 +162,7 @@ export default {
                 .pathname,
               decision.locale,
               env.DEMO_MODE === "1",
+              env.INSIGHTFLARE_E2E_TEST_SITE_URL,
             )
           : withPageHeaders(
               await logger.measure("page.handler", async () =>
@@ -164,6 +173,7 @@ export default {
               pathname,
               decision.locale,
               env.DEMO_MODE === "1",
+              env.INSIGHTFLARE_E2E_TEST_SITE_URL,
             );
         logger.setRequest({
           route: pageRouteForLog(pathname),
@@ -204,45 +214,15 @@ export default {
       logger.emit();
       return;
     }
-    const task = getScheduledTaskDefinition("visit_hourly_rollup");
-    const notificationTask = getScheduledTaskDefinition("notification_tick");
     ctx.waitUntil(
       runWithInvocationLogger(logger, () =>
         Promise.all([
-          runScheduledTask(
+          dispatchInternalScheduledTasks(
             instrumentedEnv,
-            {
-              key: task?.key || "visit_hourly_rollup",
-              name: task?.name || "Hourly visit aggregation",
-              triggerType: "cron",
-            },
             controller.scheduledTime,
-            ({ logger: taskLogger }) =>
-              logger.measure("scheduled.hourly_rollup", () =>
-                runHourlyAggregation(
-                  instrumentedEnv,
-                  controller.scheduledTime,
-                  {
-                    logger: taskLogger,
-                  },
-                ),
-              ),
             logger,
           ),
-          runScheduledTask(
-            instrumentedEnv,
-            {
-              key: notificationTask?.key || "notification_tick",
-              name: notificationTask?.name || "Notification dispatch",
-              triggerType: "cron",
-            },
-            controller.scheduledTime,
-            (taskContext) =>
-              logger.measure("scheduled.notification_tick", () =>
-                runNotificationTick(taskContext),
-              ),
-            logger,
-          ),
+          sweepIngestAlarms(instrumentedEnv, logger),
         ])
           .then(() => logger.info("scheduled.completed"))
           .catch((error) => {

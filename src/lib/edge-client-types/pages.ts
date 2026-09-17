@@ -1,12 +1,16 @@
+import type { PaginatedCollection } from "./pagination";
+
+export interface PageItem {
+  pathname: string;
+  query?: string;
+  hash?: string;
+  views: number;
+  sessions: number;
+}
+
 export interface PagesData {
   ok: boolean;
-  data: Array<{
-    pathname: string;
-    query?: string;
-    hash?: string;
-    views: number;
-    sessions: number;
-  }>;
+  data: PaginatedCollection<PageItem>;
   tabs?: {
     path: Array<{
       label: string;
@@ -69,12 +73,5 @@ export interface PagesDashboardItem {
 export interface PagesDashboardData {
   ok: boolean;
   interval: "minute" | "hour" | "day" | "week" | "month";
-  data: PagesDashboardItem[];
-  meta: {
-    page: number;
-    pageSize: number;
-    returned: number;
-    hasMore: boolean;
-    nextPage: number | null;
-  };
+  data: PaginatedCollection<PagesDashboardItem>;
 }

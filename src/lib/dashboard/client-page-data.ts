@@ -1,4 +1,5 @@
 import type {
+  DashboardListRequestOptions,
   PageCardTabsData,
   PrivateRequestParams,
 } from "@/lib/dashboard/client-data-types";
@@ -28,8 +29,8 @@ export async function fetchPagesDashboard(
   window: TimeWindow,
   filters?: FilterDocument,
   options?: {
-    page?: number;
-    pageSize?: number;
+    limit?: number;
+    cursor?: string | null;
     signal?: AbortSignal;
   },
 ): Promise<PagesDashboardData> {
@@ -42,8 +43,8 @@ export async function fetchPagesDashboard(
         to: window.to,
         timeZone: window.timeZone,
         interval: window.interval,
-        page: options?.page ?? 1,
-        pageSize: options?.pageSize ?? 12,
+        limit: options?.limit ?? 12,
+        ...(options?.cursor ? { cursor: options.cursor } : {}),
       },
       filters,
     ),
@@ -63,8 +64,7 @@ export async function fetchPagesShareTrend(
   const limit = Math.max(1, Math.min(options?.limit ?? 5, 12));
   const [payload, totalTrend] = await Promise.all([
     fetchPagesDashboard(siteId, window, filters, {
-      page: 1,
-      pageSize: limit,
+      limit,
       signal: options?.signal,
     }).catch((error) =>
       fallbackUnlessAborted(
@@ -73,13 +73,14 @@ export async function fetchPagesShareTrend(
           ({
             ok: true,
             interval: window.interval,
-            data: [],
-            meta: {
-              page: 1,
-              pageSize: limit,
-              returned: 0,
-              hasMore: false,
-              nextPage: null,
+            data: {
+              items: [],
+              pagination: {
+                limit,
+                returned: 0,
+                hasMore: false,
+                nextCursor: null,
+              },
             },
           }) satisfies PagesDashboardData,
       ),
@@ -90,7 +91,7 @@ export async function fetchPagesShareTrend(
     ),
   ]);
 
-  const series: BrowserTrendData["series"] = payload.data.map(
+  const series: BrowserTrendData["series"] = payload.data.items.map(
     (item, index) => ({
       key: `page_${index}`,
       label: item.pathname,
@@ -109,7 +110,7 @@ export async function fetchPagesShareTrend(
     }
   >();
 
-  for (const [index, item] of payload.data.entries()) {
+  for (const [index, item] of payload.data.items.entries()) {
     const seriesKey = `page_${index}`;
     for (const point of item.trend) {
       const timestampMs = Number(point.timestampMs ?? 0);
@@ -186,6 +187,7 @@ export async function fetchPageCardTabs(
   siteId: string,
   window: TimeWindow,
   filters?: FilterDocument,
+  options?: DashboardListRequestOptions,
 ): Promise<PageCardTabsData> {
   const payload = await fetchPrivateJson<PagesData>(
     "/api/private/pages",
@@ -195,10 +197,12 @@ export async function fetchPageCardTabs(
         from: window.from,
         to: window.to,
         timeZone: window.timeZone,
-        limit: 100,
+        limit: options?.limit ?? 100,
+        ...(options?.cursor ? { cursor: options.cursor } : {}),
       },
       filters,
     ) satisfies PrivateRequestParams,
+    { signal: options?.signal },
   );
   return payload.tabs ?? emptyPageCardTabs();
 }

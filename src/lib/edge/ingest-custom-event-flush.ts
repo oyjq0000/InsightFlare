@@ -11,15 +11,32 @@ import {
 import type { BufferedCustomEventRow, DictionaryKind } from "./ingest-types";
 import { clampString } from "./utils";
 
+interface FlushBufferFields {
+  bufferRevision: number;
+  flushDueAt: number | null;
+  nextDueAt: number | null;
+}
+
+type BufferedCustomEventFlushRow = BufferedCustomEventRow &
+  Partial<FlushBufferFields>;
+
+const FLUSH_RETRY_DELAYS_MS = [
+  60 * 1000,
+  2 * 60 * 1000,
+  4 * 60 * 1000,
+  8 * 60 * 1000,
+  15 * 60 * 1000,
+] as const;
+
 export async function flushCustomEventRowIndividually(
   context: IngestFlushContext,
-  row: BufferedCustomEventRow,
+  row: BufferedCustomEventFlushRow,
 ): Promise<boolean> {
   try {
     const sitePk = await resolveSitePk(context, row.siteId);
     if (!(await hasPersistedVisit(context, sitePk, row.visitId))) {
       context.observability?.warn("do.flush.custom_event_waiting_for_visit");
-      markCustomEventRowsFailed(context, [row], "waiting_for_visit");
+      markCustomEventRowsWaitingForVisit(context, [row]);
       return false;
     }
     const expanded = expandCustomEventDataJson(row.eventDataJson);
@@ -39,7 +56,6 @@ export async function flushCustomEventRowIndividually(
       ids,
       sitePk,
     );
-    recordFlushCounter(context, "d1Statements", statements.length);
     await context.env.DB.batch(statements);
     if (!(await hasPersistedCustomEvent(context, row.eventId))) {
       context.observability?.warn("do.flush.custom_event_insert_not_confirmed");
@@ -55,7 +71,6 @@ export async function flushCustomEventRowIndividually(
       400,
     );
     void message;
-    recordFlushCounter(context, "failedStatements");
     context.observability?.error("do.flush.custom_event_failed");
     markCustomEventRowsFailed(context, [row], message);
     return false;
@@ -64,13 +79,16 @@ export async function flushCustomEventRowIndividually(
 
 function markCustomEventRowsFlushed(
   context: IngestFlushContext,
-  rows: BufferedCustomEventRow[],
+  rows: BufferedCustomEventFlushRow[],
 ): void {
   if (rows.length === 0) return;
-  const ids = rows.map((row) => row.eventId);
+  const conditions = rows
+    .map(() => "(event_id = ? AND buffer_revision = ?)")
+    .join(" OR ");
+  const bindings = rows.flatMap((row) => [row.eventId, bufferRevisionOf(row)]);
   const updated = context.sqlRun(
-    `UPDATE buffered_custom_events SET dirty = 0, flush_attempts = 0, last_flush_error = NULL WHERE event_id IN (${ids.map(() => "?").join(",")})`,
-    ...ids,
+    `UPDATE buffered_custom_events SET dirty = 0, flush_attempts = 0, last_flush_error = NULL, flush_due_at = NULL, next_due_at = NULL WHERE ${conditions}`,
+    ...bindings,
   );
   void updated;
   deleteFlushedCustomEventRows(context, rows);
@@ -78,17 +96,77 @@ function markCustomEventRowsFlushed(
 
 function markCustomEventRowsFailed(
   context: IngestFlushContext,
-  rows: BufferedCustomEventRow[],
+  rows: BufferedCustomEventFlushRow[],
   errorMessage: string,
 ): void {
   if (rows.length === 0) return;
-  const ids = rows.map((row) => row.eventId);
-  const deleted = context.sqlRun(
-    `DELETE FROM buffered_custom_events WHERE event_id IN (${ids.map(() => "?").join(",")})`,
-    ...ids,
+  const now = Date.now();
+  for (const row of rows) {
+    const retryAt = now + retryDelayFor(row.flushAttempts);
+    const updated = context.sqlRun(
+      `UPDATE buffered_custom_events SET flush_attempts = ?, last_flush_error = ?, flush_due_at = ?, next_due_at = ? WHERE event_id = ? AND buffer_revision = ? AND flush_attempts = ? AND last_flush_error IS ?`,
+      row.flushAttempts + 1,
+      errorMessage,
+      retryAt,
+      nextDueAtAfterRetry(row, retryAt),
+      row.eventId,
+      bufferRevisionOf(row),
+      row.flushAttempts,
+      row.lastFlushError ?? null,
+    );
+    void updated;
+  }
+}
+
+function markCustomEventRowsWaitingForVisit(
+  context: IngestFlushContext,
+  rows: BufferedCustomEventFlushRow[],
+): void {
+  if (rows.length === 0) return;
+  const now = Date.now();
+  for (const row of rows) {
+    const retryAt = now + retryDelayFor(row.flushAttempts);
+    const updated = context.sqlRun(
+      `UPDATE buffered_custom_events SET flush_attempts = ?, last_flush_error = 'waiting_for_visit', flush_due_at = ?, next_due_at = ? WHERE event_id = ? AND buffer_revision = ? AND flush_attempts = ? AND last_flush_error IS ?`,
+      row.flushAttempts + 1,
+      retryAt,
+      nextDueAtAfterRetry(row, retryAt),
+      row.eventId,
+      bufferRevisionOf(row),
+      row.flushAttempts,
+      row.lastFlushError ?? null,
+    );
+    void updated;
+  }
+}
+
+function bufferRevisionOf(row: Partial<FlushBufferFields>): number {
+  return row.bufferRevision ?? 0;
+}
+
+function retryDelayFor(previousAttempts: number): number {
+  const attempt = Number.isFinite(previousAttempts)
+    ? Math.max(0, Math.floor(previousAttempts))
+    : 0;
+  return (
+    FLUSH_RETRY_DELAYS_MS[
+      Math.min(attempt, FLUSH_RETRY_DELAYS_MS.length - 1)
+    ] ?? FLUSH_RETRY_DELAYS_MS[0]
   );
-  void deleted;
-  void errorMessage;
+}
+
+function nextDueAtAfterRetry(
+  row: Partial<FlushBufferFields>,
+  retryAt: number,
+): number {
+  if (
+    row.nextDueAt === undefined ||
+    row.nextDueAt === null ||
+    row.nextDueAt === row.flushDueAt
+  ) {
+    return retryAt;
+  }
+  return Math.min(row.nextDueAt, retryAt);
 }
 
 function dictionarySql(kind: DictionaryKind): {
@@ -117,7 +195,6 @@ async function resolveDictionaryId(
   if (cached !== undefined) return cached;
 
   const spec = dictionarySql(kind);
-  recordFlushCounter(context, "d1Statements");
   await context.env.DB.prepare(
     `
       INSERT INTO ${spec.table} (site_id, site_pk, ${spec.column}, created_at, last_seen_at)
@@ -129,7 +206,6 @@ async function resolveDictionaryId(
     .bind(siteId, sitePk, value, seenAt, seenAt)
     .run();
 
-  recordFlushCounter(context, "d1Statements");
   const row = await context.env.DB.prepare(
     `
       SELECT id
@@ -203,7 +279,6 @@ async function hasPersistedVisit(
   sitePk: number,
   visitId: string,
 ): Promise<boolean> {
-  recordFlushCounter(context, "d1Statements");
   const persisted = await context.env.DB.prepare(
     `
       SELECT 1 AS ok
@@ -221,7 +296,6 @@ async function hasPersistedCustomEvent(
   context: IngestFlushContext,
   eventId: string,
 ): Promise<boolean> {
-  recordFlushCounter(context, "d1Statements");
   const persisted = await context.env.DB.prepare(
     `
       SELECT 1 AS ok
@@ -344,16 +418,21 @@ function prepareCustomEventStatements(
 
 function deleteFlushedCustomEventRows(
   context: IngestFlushContext,
-  rows: BufferedCustomEventRow[],
+  rows: BufferedCustomEventFlushRow[],
 ): void {
   const cutoffMs = Date.now() - FLUSHED_BUFFER_RETENTION_MS;
-  const ids = rows
-    .filter((row) => row.occurredAt < cutoffMs)
-    .map((row) => row.eventId);
-  if (ids.length === 0) return;
+  const eligibleRows = rows.filter((row) => row.occurredAt < cutoffMs);
+  if (eligibleRows.length === 0) return;
+  const conditions = eligibleRows
+    .map(() => "(event_id = ? AND buffer_revision = ?)")
+    .join(" OR ");
+  const bindings = eligibleRows.flatMap((row) => [
+    row.eventId,
+    bufferRevisionOf(row),
+  ]);
   const deleted = context.sqlRun(
-    `DELETE FROM buffered_custom_events WHERE event_id IN (${ids.map(() => "?").join(",")})`,
-    ...ids,
+    `DELETE FROM buffered_custom_events WHERE ${conditions}`,
+    ...bindings,
   );
   void deleted;
   void cutoffMs;

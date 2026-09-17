@@ -17,6 +17,9 @@ import {
 } from "@/lib/realtime/mock/utm-dimensions";
 import {
   generateDemoGeoPoints,
+  generateDemoOverviewClientTab,
+  generateDemoOverviewGeoTab,
+  generateDemoOverviewPageTab,
   generateDemoOverviewSourceTab,
 } from "@/lib/realtime/mock/utm-overview";
 
@@ -95,9 +98,9 @@ describe("mock UTM and fact branch coverage", () => {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
         limit: 8,
-      }) as { data: Array<{ value: string }> };
+      }) as { data: { items: Array<{ value: string }> } };
 
-      expect(result.data.map((row) => row.value)).toEqual(
+      expect(result.data.items.map((row) => row.value)).toEqual(
         expect.arrayContaining([expect.stringMatching(/^brand-example-/)]),
       );
     } finally {
@@ -139,19 +142,25 @@ describe("mock UTM and fact branch coverage", () => {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
         limit: 12,
-      }) as { data: Array<{ value: string; views: number; sessions: number }> };
-      const sourceValues = source.data.map((row) => row.value);
+      }) as {
+        data: {
+          items: Array<{ value: string; views: number; sessions: number }>;
+        };
+      };
+      const sourceValues = source.data.items.map((row) => row.value);
       expect(sourceValues).toContain("search");
       expect(sourceValues).not.toContain("(direct)");
       expect(sourceValues).not.toContain("zero");
-      expect(source.data.every((row) => row.views >= row.sessions)).toBe(true);
+      expect(source.data.items.every((row) => row.views >= row.sessions)).toBe(
+        true,
+      );
 
       const medium = generateDemoUtmDimension(profile.id, "medium", {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
         limit: 6,
-      }) as { data: Array<{ value: string }> };
-      expect(medium.data.map((row) => row.value)).toEqual(
+      }) as { data: { items: Array<{ value: string }> } };
+      expect(medium.data.items.map((row) => row.value)).toEqual(
         expect.arrayContaining([
           expect.stringMatching(
             /^(email|cpc|paid-social|organic-social|referral|affiliate|display|sponsored|community|influencer)$/,
@@ -163,8 +172,8 @@ describe("mock UTM and fact branch coverage", () => {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
         limit: 10,
-      }) as { data: Array<{ value: string }> };
-      expect(term.data.map((row) => row.value)).toEqual(
+      }) as { data: { items: Array<{ value: string }> } };
+      expect(term.data.items.map((row) => row.value)).toEqual(
         expect.arrayContaining([
           expect.stringMatching(
             /^(pricing|comparison|automation|guide|brand|template|free-trial|discount)$/,
@@ -176,8 +185,8 @@ describe("mock UTM and fact branch coverage", () => {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
         limit: 10,
-      }) as { data: Array<{ value: string }> };
-      expect(content.data.map((row) => row.value)).toEqual(
+      }) as { data: { items: Array<{ value: string }> } };
+      expect(content.data.items.map((row) => row.value)).toEqual(
         expect.arrayContaining([
           expect.stringMatching(
             /(-hero|-cta|hero-a|hero-b|pricing-card|email-1|email-2)$/,
@@ -197,7 +206,10 @@ describe("mock UTM and fact branch coverage", () => {
         from: BASE_TIME,
         to: BASE_TIME + 3_600_000,
       }),
-    ).toEqual({ ok: true, data: [] });
+    ).toMatchObject({
+      ok: true,
+      data: { items: [], pagination: expect.any(Object) },
+    });
     expect(
       generateDemoUtmTrend("demo-site-001", {
         dimension: "unknown",
@@ -294,6 +306,66 @@ describe("mock UTM and fact branch coverage", () => {
     expect(result.cityCounts).toEqual([]);
   });
 
+  it("aggregates geo points and drilldown buckets for matching coordinates", () => {
+    setFacts([
+      makeVisit({
+        visitId: "geo-1",
+        region: "US::CA::California",
+        regionCode: "CA",
+        regionName: "California",
+        city: "US::CA::California::San Francisco",
+        cityName: "San Francisco",
+        latitude: 37.77491,
+        longitude: -122.41941,
+      }),
+      makeVisit({
+        visitId: "geo-2",
+        sessionId: "s2",
+        visitorId: "u2",
+        region: "US::CA::California",
+        regionCode: "CA",
+        regionName: "California",
+        city: "US::CA::California::San Francisco",
+        cityName: "San Francisco",
+        latitude: 37.77492,
+        longitude: -122.41942,
+      }),
+    ]);
+
+    const pointResult = generateDemoGeoPoints("demo-site-001", {
+      from: BASE_TIME,
+      to: BASE_TIME + 3_600_000,
+      applyGeoFilter: "true",
+      "filter[geo.country]": "US",
+      "filter[geo.region]": "CA",
+      "filter[geo.city]": "San Francisco",
+    }) as {
+      data: Array<{ pointCount: number }>;
+      regionCounts: Array<{ value: string }>;
+      cityCounts: Array<{ value: string }>;
+    };
+
+    expect(pointResult.data).toEqual([
+      expect.objectContaining({ pointCount: 2 }),
+    ]);
+    expect(pointResult.regionCounts).toEqual([]);
+    expect(pointResult.cityCounts).toEqual([
+      expect.objectContaining({ value: "US::CA::California::San Francisco" }),
+    ]);
+
+    const regionResult = generateDemoGeoPoints("demo-site-001", {
+      from: BASE_TIME,
+      to: BASE_TIME + 3_600_000,
+      applyGeoFilter: "true",
+      "filter[geo.country]": "US",
+    }) as {
+      regionCounts: Array<{ value: string }>;
+    };
+    expect(regionResult.regionCounts).toEqual([
+      expect.objectContaining({ value: "US::CA::California" }),
+    ]);
+  });
+
   it("normalizes nullish referrer rows in overview source tabs", () => {
     setFacts([makeVisit()]);
     mockCollectReferrerRows.mockReturnValue([
@@ -333,6 +405,63 @@ describe("mock UTM and fact branch coverage", () => {
         { label: "organic_search", views: 1, sessions: 1, visitors: 1 },
         { label: "social", views: 1, sessions: 1, visitors: 1 },
       ],
+    });
+  });
+
+  it("generates comparison rows for source, client, and geo tabs", () => {
+    setFacts([
+      makeVisit({
+        referrerHost: "google.com",
+        browser: "Chrome",
+        country: "US",
+      }),
+    ]);
+    mockCollectReferrerRows.mockReturnValue([
+      { referrer: "google.com", views: 4, sessions: 3, visitors: 2 },
+    ]);
+
+    const params = {
+      from: BASE_TIME,
+      to: BASE_TIME + 3_600_000,
+      compare: "same",
+      "compareFilter[page.path]": "/home",
+      metric: "visitors",
+      sortBy: "change",
+      direction: "asc",
+      limit: 5,
+    } as const;
+
+    for (const tab of ["channel", "domain", "link"] as const) {
+      expect(
+        generateDemoOverviewSourceTab("demo-site-001", params, tab),
+      ).toMatchObject({
+        ok: true,
+        data: [expect.objectContaining({ reference: expect.any(Object) })],
+      });
+    }
+    expect(
+      generateDemoOverviewClientTab("demo-site-001", params, "browser"),
+    ).toMatchObject({
+      ok: true,
+      data: expect.arrayContaining([
+        expect.objectContaining({ reference: expect.any(Object) }),
+      ]),
+    });
+    expect(
+      generateDemoOverviewGeoTab("demo-site-001", params, "country"),
+    ).toMatchObject({
+      ok: true,
+      data: expect.arrayContaining([
+        expect.objectContaining({ reference: expect.any(Object) }),
+      ]),
+    });
+    expect(
+      generateDemoOverviewPageTab("demo-site-001", params, "path"),
+    ).toMatchObject({
+      ok: true,
+      data: expect.arrayContaining([
+        expect.objectContaining({ reference: expect.any(Object) }),
+      ]),
     });
   });
 });

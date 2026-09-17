@@ -1,8 +1,15 @@
+import { parseApiV1FilterDsl } from "@/lib/api-v1/analytics-overview";
 import {
   type TeamSitesQueryDto,
   TeamSitesQueryDtoSchema,
 } from "@/lib/api-v1/dto/analytics";
-import { apiV1ErrorRegistry } from "@/lib/api-v1/errors";
+import {
+  type ApiV1ErrorIssue,
+  apiV1ErrorRegistry,
+  fromInputIssues,
+  fromRequestBodyError,
+  fromZodIssues,
+} from "@/lib/api-v1/errors";
 import { createApiV1QueryApplicationAdapter } from "@/lib/api-v1/query-application";
 import { readBoundedJson } from "@/lib/api-v1/request-budget";
 import { resolveApiV1TimeRange } from "@/lib/api-v1/time-range";
@@ -25,6 +32,7 @@ export interface TeamSitesReaderInput {
   readonly endExclusiveMs: number;
   readonly timeZone: string;
   readonly interval?: TeamSitesQueryDto["interval"];
+  readonly page: TeamSitesQueryDto["page"];
   readonly filters: FilterDocument;
   readonly signal?: AbortSignal;
 }
@@ -49,7 +57,10 @@ function response(
   });
 }
 
-function errorResponse(code: keyof typeof apiV1ErrorRegistry) {
+function errorResponse(
+  code: keyof typeof apiV1ErrorRegistry,
+  issues?: readonly ApiV1ErrorIssue[],
+) {
   const requestId = crypto.randomUUID();
   const definition = apiV1ErrorRegistry[code];
   return response(
@@ -59,6 +70,7 @@ function errorResponse(code: keyof typeof apiV1ErrorRegistry) {
         code,
         message: definition.message,
         retryable: definition.retryable,
+        ...(issues && issues.length > 0 ? { issues } : {}),
       },
       meta: { requestId },
     },
@@ -101,6 +113,13 @@ async function readBody(request: Request): Promise<unknown> {
 
 function filter(input: TeamSitesQueryDto): FilterDocument | null {
   if (!input.filter) return { version: 1, root: null };
+  if (input.filter.type === "dsl") {
+    try {
+      return parseApiV1FilterDsl(input.filter.expression);
+    } catch {
+      return null;
+    }
+  }
   try {
     return parseApiV1FilterDocument({
       version: 1,
@@ -149,9 +168,16 @@ export async function handlePlannedTeamSites(
 
   let input: TeamSitesQueryDto;
   try {
-    input = TeamSitesQueryDtoSchema.parse(await readBody(request));
-  } catch {
-    return errorResponse("validation_failed");
+    const parsed = TeamSitesQueryDtoSchema.safeParse(await readBody(request));
+    if (!parsed.success) {
+      return errorResponse(
+        "validation_failed",
+        fromZodIssues(parsed.error.issues),
+      );
+    }
+    input = parsed.data;
+  } catch (error) {
+    return errorResponse("validation_failed", fromRequestBodyError(error));
   }
   const resolvedTimeRange = resolveApiV1TimeRange(
     input.timeRange,
@@ -168,10 +194,18 @@ export async function handlePlannedTeamSites(
     endExclusiveMs <= startMs ||
     !isReportingTimeZone(timeZone)
   ) {
-    return errorResponse("validation_failed");
+    return errorResponse(
+      "validation_failed",
+      fromInputIssues([{ path: "timeRange", code: "invalid_time_range" }]),
+    );
   }
   const filters = filter(input);
-  if (!filters) return errorResponse("validation_failed");
+  if (!filters) {
+    return errorResponse(
+      "validation_failed",
+      fromInputIssues([{ path: "filter", code: "invalid_filter" }]),
+    );
+  }
   try {
     const query = {
       teamId: principal.teamId,
@@ -181,7 +215,9 @@ export async function handlePlannedTeamSites(
       endExclusiveMs,
       timeZone,
       interval: input.interval,
+      page: input.page,
       filters,
+      scopePreference: input.scope ?? "auto",
     };
     const serviceResult = await createApiV1QueryApplicationAdapter().execute<
       TeamSitesReaderInput,
@@ -195,6 +231,7 @@ export async function handlePlannedTeamSites(
           principal.siteIds,
         ),
         query,
+        rawRequest: input,
         providerRegistry,
       },
       {
@@ -216,6 +253,8 @@ export async function handlePlannedTeamSites(
         return cancelledResponse();
       if (serviceResult.error.kind === "deadline-exceeded")
         return errorResponse("deadline_exceeded");
+      if (serviceResult.error.kind === "invalid-cursor")
+        return errorResponse("invalid_cursor");
       return errorResponse("unsupported_query");
     }
     const result = serviceResult.value;
@@ -231,7 +270,7 @@ export async function handlePlannedTeamSites(
       200,
       {
         data: {
-          sites: result.data.sites.map((site) => ({
+          items: result.data.items.map((site) => ({
             siteId: site.siteId,
             name: site.name,
             domain: site.domain,
@@ -280,6 +319,7 @@ export async function handlePlannedTeamSites(
                 ? null
                 : new Date(site.lastEventAtMs).toISOString(),
           })),
+          pagination: result.data.pagination,
         },
         meta: {
           requestId,
@@ -291,6 +331,9 @@ export async function handlePlannedTeamSites(
           },
           source: result.source,
           accuracy: result.approximateVisitors ? "approximate" : "exact",
+          ...(serviceResult.meta?.filterScope
+            ? { filterScope: serviceResult.meta.filterScope }
+            : {}),
         },
       },
       requestId,

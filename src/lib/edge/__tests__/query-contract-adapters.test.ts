@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { handleSimpleDimensionContract } from "@/lib/edge/analytics/composition/protocol/dimensions-contract-adapter";
 import {
   handleEventFieldValuesContract,
   handleEventRecordDetailContract,
@@ -14,6 +15,7 @@ import {
 import { handleFilterValuesContract } from "@/lib/edge/analytics/composition/protocol/filter-values-contract-adapter";
 import { handleFunnelAnalysisContract } from "@/lib/edge/analytics/composition/protocol/funnels-contract-adapter";
 import {
+  handleJourneyCollectionContract,
   handleJourneyEventDetailContract,
   handleSessionDetailContract,
   handleSessionsContract,
@@ -25,6 +27,7 @@ import {
   handlePagesContract,
   handlePagesDashboardContract,
   handleReferrersContract,
+  handleReferrerSummaryContract,
 } from "@/lib/edge/analytics/composition/protocol/pages-contract-adapter";
 import {
   handleBrowserVersionBreakdownContract,
@@ -46,7 +49,10 @@ function emptyEnv(): Env {
     all: async () => ({ results: [] }),
     first: async () => null,
   };
-  return { DB: { prepare: () => statement } } as unknown as Env;
+  return {
+    DB: { prepare: () => statement },
+    DAILY_SALT_SECRET: "contract-test-secret",
+  } as unknown as Env;
 }
 
 const env = emptyEnv();
@@ -55,6 +61,56 @@ const invalidWindow = new URL("https://edge.test/query?from=20&to=10");
 const context = undefined;
 
 describe("typed query adapter validation branches", () => {
+  it("validates and forwards comparison options for UTM dimensions", async () => {
+    const base = "https://edge.test/query?from=1767225600000&to=1767312000000";
+    const responses = await Promise.all([
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(`${base}&sort=invalid`),
+        "utm.source",
+      ),
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(`${base}&direction=invalid`),
+        "utm.source",
+      ),
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(`${base}&compare=invalid`),
+        "utm.source",
+      ),
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(`${base}&compare=same`),
+        "utm.medium",
+      ),
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(
+          `${base}&compare=previous&metric=sessions&sortBy=change&direction=asc&search=email`,
+        ),
+        "utm.source",
+      ),
+      handleSimpleDimensionContract(
+        env,
+        siteId,
+        new URL(
+          `${base}&compare=previous&metric=visitors&sortBy=reference&compareFilter%5Bpage.path%5D=%2Fpricing`,
+        ),
+        "utm.campaign",
+      ),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([
+      400, 400, 400, 200, 200, 200,
+    ]);
+  });
+
   it("enters event, journey, and funnel contract adapters before D1", async () => {
     const responses = await Promise.all([
       handleEventTypesContract(env, siteId, invalidWindow, context),
@@ -83,7 +139,7 @@ describe("typed query adapter validation branches", () => {
 
   it("executes valid event, journey, and funnel reader branches", async () => {
     const valid = new URL(
-      "https://edge.test/query?from=1767225600000&to=1767312000000&eventName=signup&fieldPath=plan&fieldValueType=string&cards=page.path&eventId=event-1&visitorId=visitor-1&sessionId=session-1&pageSize=5",
+      "https://edge.test/query?from=1767225600000&to=1767312000000&eventName=signup&fieldPath=plan&fieldValueType=string&cards=page.path&eventId=event-1&visitorId=visitor-1&sessionId=session-1&limit=5",
     );
     const responses = await Promise.all([
       handleEventTypesContract(env, siteId, valid),
@@ -96,18 +152,30 @@ describe("typed query adapter validation branches", () => {
       handleEventTypeDetailContract(env, siteId, valid, undefined, undefined, {
         includeContext: false,
         includeBreakdowns: false,
-        includeFields: false,
       }),
       handleEventRecordDetailContract(env, siteId, valid),
       handleVisitorsContract(env, siteId, valid),
       handleSessionsContract(env, siteId, valid),
+      handleVisitorsContract(
+        env,
+        siteId,
+        new URL(
+          `${valid}&analysisType=funnel&analysisId=funnel-1&analysisStepId=step-1&analysisOutcome=dropoff`,
+        ),
+      ),
       handleVisitorDetailContract(env, siteId, valid),
       handleSessionDetailContract(env, siteId, valid),
+      handleJourneyCollectionContract(
+        env,
+        siteId,
+        new URL(`${valid}&visitorId=visitor-1`),
+        "visitor-events",
+      ),
       handleJourneyEventDetailContract(env, siteId, valid),
       handleFunnelAnalysisContract(env, siteId, valid),
     ]);
 
-    expect(responses).toHaveLength(15);
+    expect(responses).toHaveLength(17);
     expect(responses.every((response) => response instanceof Response)).toBe(
       true,
     );
@@ -145,6 +213,54 @@ describe("typed query adapter validation branches", () => {
     expect(responses.map((response) => response.status)).toEqual(
       expect.arrayContaining([400, 404]),
     );
+  });
+
+  it("validates goal and funnel analysis list parameters", async () => {
+    const base = "https://edge.test/query?from=1767225600000&to=1767312000000";
+    const responses = await Promise.all([
+      handleVisitorsContract(env, siteId, new URL(`${base}&analysisType=goal`)),
+      handleSessionsContract(
+        env,
+        siteId,
+        new URL(`${base}&analysisId=funnel-1`),
+      ),
+      handleVisitorsContract(
+        env,
+        siteId,
+        new URL(
+          `${base}&analysisType=goal&analysisId=goal-1&analysisStepId=step-1`,
+        ),
+      ),
+      handleSessionsContract(
+        env,
+        siteId,
+        new URL(`${base}&analysisType=funnel&analysisId=funnel-1`),
+      ),
+      handleVisitorsContract(
+        env,
+        siteId,
+        new URL(`${base}&analysisType=unknown&analysisId=analysis-1`),
+      ),
+      handleVisitorsContract(
+        env,
+        siteId,
+        new URL(`${base}&analysisType=goal&analysisId=goal-1`),
+      ),
+      handleSessionsContract(
+        env,
+        siteId,
+        new URL(
+          `${base}&analysisType=funnel&analysisId=funnel-1&analysisStepId=step-1`,
+        ),
+      ),
+    ]);
+
+    expect(responses.slice(0, 5).map((response) => response.status)).toEqual([
+      400, 400, 400, 400, 400,
+    ]);
+    expect(
+      responses.slice(5).every((response) => response instanceof Response),
+    ).toBe(true);
   });
 
   it("covers filter, page, and technology contract option branches", async () => {
@@ -188,11 +304,7 @@ describe("typed query adapter validation branches", () => {
         8,
         false,
       ),
-      handlePagesDashboardContract(
-        env,
-        siteId,
-        new URL(`${base}&page=10000&pageSize=24`),
-      ),
+      handlePagesDashboardContract(env, siteId, new URL(`${base}&limit=24`)),
       handleBrowserVersionBreakdownContract(
         env,
         siteId,
@@ -217,6 +329,41 @@ describe("typed query adapter validation branches", () => {
       true,
     );
     expect(responses.some((response) => response.status === 400)).toBe(true);
+  });
+
+  it("covers paginated pages/referrers, summaries, and cursor validation", async () => {
+    const base = "https://edge.test/query?from=1767225600000&to=1767312000000";
+    const [pages, publicReferrers, summary, deepDashboard, invalidDashboard] =
+      await Promise.all([
+        handlePagesContract(
+          env,
+          siteId,
+          new URL(`${base}&details=false&cursor=opaque`),
+          true,
+        ),
+        handleReferrersContract(
+          env,
+          siteId,
+          new URL(
+            `${base}&fullUrl=true&search=google&sort=visitors&direction=asc`,
+          ),
+          8,
+          false,
+        ),
+        handleReferrerSummaryContract(env, siteId, new URL(`${base}&topN=20`)),
+        handlePagesDashboardContract(env, siteId, new URL(`${base}&limit=24`)),
+        handlePagesDashboardContract(
+          env,
+          siteId,
+          new URL(`${base}&limit=24&cursor=invalid`),
+        ),
+      ]);
+
+    expect(pages.status).toBe(400);
+    expect(publicReferrers.status).toBe(200);
+    expect(summary.status).toBe(200);
+    expect(deepDashboard.status).toBe(200);
+    expect(invalidDashboard.status).toBe(400);
   });
 
   it("does not expose private canonical fields from public filter-values", async () => {

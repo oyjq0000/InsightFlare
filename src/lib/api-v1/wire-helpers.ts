@@ -1,3 +1,4 @@
+import type { ApiV1ErrorIssue } from "@/lib/api-v1/errors";
 import { jsonResponse } from "@/lib/response";
 
 export const API_V1_VERSION = import.meta.env?.VITE_APP_VERSION || "1.0.0";
@@ -84,40 +85,13 @@ export function jsonList(
   return jsonSuccess(data, options);
 }
 
-export function jsonPaginated(
-  data: unknown[],
-  pagination: { limit: number; nextCursor: string | null; hasMore: boolean },
-  options: {
-    request?: Request;
-    status?: number;
-    meta?: Record<string, unknown>;
-    links?: Record<string, string>;
-    headers?: Record<string, string>;
-  } = {},
-): Response {
-  const requestId = serverRequestId(options.request);
-  return jsonResponse(
-    {
-      data,
-      pagination,
-      ...(options.links ? { links: options.links } : {}),
-      meta: {
-        ...(options.meta ?? {}),
-        generatedAt: generatedAt(),
-        requestId,
-      },
-    },
-    options.status ?? 200,
-    apiV1Headers(requestId, options.headers),
-  );
-}
-
 export function jsonError(
   code: string,
   message: string,
   status: number,
   details?: Record<string, unknown>,
   request?: Request,
+  issues?: readonly ApiV1ErrorIssue[],
 ): Response {
   const requestId = serverRequestId(request);
   return jsonResponse(
@@ -125,6 +99,7 @@ export function jsonError(
       error: {
         code,
         message,
+        ...(issues && issues.length > 0 ? { issues } : {}),
         ...(details ? { details } : {}),
       },
       meta: { requestId, generatedAt: generatedAt() },

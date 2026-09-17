@@ -11,6 +11,12 @@ import {
   dashboardFilterPresentation,
   withoutDashboardFilter,
 } from "@/lib/dashboard/filter-state";
+import type { QueryOperation } from "@/lib/edge/analytics/contract";
+import {
+  type FilterScope,
+  normalizeFilterScopePreference,
+  resolveFilterScope,
+} from "@/lib/edge/analytics/contract/scoped-filter";
 import {
   analyticsFilterRegistry,
   parseFilterParams,
@@ -52,10 +58,33 @@ export function parseDemoFilters(
   }
   const document = parseFilterParams(search, analyticsFilterRegistry);
   const presentation = dashboardFilterPresentation(document);
+  const requestedScope = normalizeFilterScopePreference(params.scope);
+  const explicitResolvedScope = normalizeDemoScope(params.resolvedScope);
+  const operation =
+    typeof params.operation === "string"
+      ? (params.operation as QueryOperation)
+      : undefined;
+  const scope =
+    explicitResolvedScope ??
+    (operation
+      ? (resolveFilterScope(operation, requestedScope) ?? undefined)
+      : requestedScope === "auto"
+        ? undefined
+        : requestedScope);
   return {
     filterDocument: document,
+    ...(scope ? { scope } : {}),
     ...presentation,
   };
+}
+
+function normalizeDemoScope(
+  value: string | number | undefined,
+): FilterScope | undefined {
+  if (value === "event" || value === "session" || value === "visitor") {
+    return value;
+  }
+  return undefined;
 }
 
 export function normalizeDemoSearch(
@@ -139,6 +168,24 @@ export function parseDemoLimit(
   min: number,
   max: number,
 ): number {
+  const parsed = Math.floor(parseDemoNumber(value, fallback));
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+/** Mirrors the real parseQueryLimit helper, including its minimum clamp. */
+export function parseDemoQueryLimit(
+  value: string | number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (
+    value === undefined ||
+    (typeof value === "string" && value.length === 0)
+  ) {
+    return fallback;
+  }
   const parsed = Math.floor(parseDemoNumber(value, fallback));
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));

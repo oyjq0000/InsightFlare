@@ -50,7 +50,15 @@ describe("D1 team query runtime", () => {
       approximateVisitors: false,
     });
     vi.mocked(readTeamSites).mockResolvedValue({
-      data: { sites: [] },
+      data: {
+        items: [],
+        pagination: {
+          limit: 20,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
       source: "raw",
       approximateVisitors: false,
     });
@@ -89,7 +97,15 @@ describe("D1 team query runtime", () => {
       data: { interval: "day" },
     });
     expect(sites.ok && sites.data).toEqual({
-      data: { sites: [] },
+      data: {
+        items: [],
+        pagination: {
+          limit: 20,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
       source: "raw",
       approximateVisitors: false,
     });
@@ -146,6 +162,8 @@ describe("D1 team query runtime", () => {
       teamId: "",
       allowedSiteIds: undefined,
       interval: undefined,
+      page: undefined,
+      audience: "api-v1",
       window: {
         startMs: 100,
         endExclusiveMs: 200,

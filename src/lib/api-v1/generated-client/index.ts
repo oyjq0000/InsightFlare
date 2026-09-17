@@ -2,11 +2,24 @@
 import type { ZodType } from "zod";
 
 import {
-  CreateFunnelInputSchema,
+  CreateFunnelBodySchema,
+  CreateGoalBodySchema,
   CreateSiteInputSchema,
   type FunnelResource,
+  type FunnelResourcePage,
+  FunnelResourcePageSchema,
   FunnelResourceSchema,
   GetTeamVisibleSavedFilterInputSchema,
+  type GoalResource,
+  type GoalResourcePage,
+  GoalResourcePageSchema,
+  GoalResourceSchema,
+  type ListFunnelsInput,
+  ListFunnelsInputSchema,
+  type ListGoalsInput,
+  ListGoalsInputSchema,
+  type ListSitesInput,
+  ListSitesInputSchema,
   type ListTeamVisibleSavedFiltersInput,
   ListTeamVisibleSavedFiltersInputSchema,
   type PrivacySettings,
@@ -16,12 +29,15 @@ import {
   type SharingSettings,
   SharingSettingsSchema,
   type SiteResource,
+  type SiteResourcePage,
+  SiteResourcePageSchema,
   SiteResourceSchema,
   type TrackingScript,
   TrackingScriptSchema,
   type TrackingSettings,
   TrackingSettingsSchema,
   UpdateFunnelBodySchema,
+  UpdateGoalBodySchema,
   UpdatePrivacySettingsBodySchema,
   UpdateSharingSettingsBodySchema,
   UpdateSiteBodySchema,
@@ -74,6 +90,10 @@ import {
   SiteFilterValuesQueryDtoSchema,
   type SiteFunnelAnalysisQueryDtoInput,
   SiteFunnelAnalysisQueryDtoSchema,
+  type SiteGoalSummaryQueryDtoInput,
+  SiteGoalSummaryQueryDtoSchema,
+  type SiteGoalTimeseriesQueryDtoInput,
+  SiteGoalTimeseriesQueryDtoSchema,
   type SiteJourneyEventDetailQueryDtoInput,
   SiteJourneyEventDetailQueryDtoSchema,
   type SiteOverviewQueryDto,
@@ -122,7 +142,7 @@ import {
   TeamComparisonQueryDtoSchema,
   type TeamOverviewQueryDto,
   TeamOverviewQueryDtoSchema,
-  type TeamSitesQueryDto,
+  type TeamSitesQueryDtoInput,
   TeamSitesQueryDtoSchema,
   type TeamTimeseriesQueryDto,
   TeamTimeseriesQueryDtoSchema,
@@ -166,6 +186,10 @@ import {
   AnalyticsFilterValuesResponseSchema,
   type AnalyticsFunnelAnalysisData,
   AnalyticsFunnelAnalysisResponseSchema,
+  type AnalyticsGoalSummaryData,
+  AnalyticsGoalSummaryResponseSchema,
+  type AnalyticsGoalTimeseriesData,
+  AnalyticsGoalTimeseriesResponseSchema,
   type AnalyticsJourneyEventDetailData,
   AnalyticsJourneyEventDetailResponseSchema,
   type AnalyticsJourneyEventsData,
@@ -217,7 +241,9 @@ import {
   TypedBatchResponseSchema,
 } from "@/lib/api-v1/wire";
 
-const CreateFunnelBodySchema = CreateFunnelInputSchema.omit({ siteId: true });
+type ResourcePageInput = {
+  readonly page?: Partial<ListSitesInput["page"]>;
+};
 
 export interface ApiV1GeneratedClientConfig {
   readonly baseUrl: string;
@@ -247,6 +273,7 @@ export interface ApiV1GeneratedFailure {
     readonly issues?: readonly {
       readonly path: string;
       readonly code: string;
+      readonly message: string;
     }[];
   };
   readonly meta: Record<string, unknown>;
@@ -254,8 +281,7 @@ export interface ApiV1GeneratedFailure {
 }
 
 export type ApiV1GeneratedResult<T> =
-  | ApiV1GeneratedSuccess<T>
-  | ApiV1GeneratedFailure;
+  ApiV1GeneratedSuccess<T> | ApiV1GeneratedFailure;
 
 export class ApiV1GeneratedTransportError extends Error {
   constructor(message: string) {
@@ -444,8 +470,9 @@ export interface ApiV1GeneratedClient {
     options?: ApiV1GeneratedRequestOptions,
   ): Promise<ApiV1GeneratedResult<TeamUsageData>>;
   listSites(
+    input?: ResourcePageInput,
     options?: ApiV1GeneratedRequestOptions,
-  ): Promise<ApiV1GeneratedResult<readonly SiteResource[]>>;
+  ): Promise<ApiV1GeneratedResult<SiteResourcePage>>;
   createSite(
     input: Parameters<typeof CreateSiteInputSchema.parse>[0],
     options?: ApiV1GeneratedRequestOptions,
@@ -496,8 +523,9 @@ export interface ApiV1GeneratedClient {
   ): Promise<ApiV1GeneratedResult<TrackingScript>>;
   listFunnels(
     siteId: string,
+    input?: { readonly page?: Partial<ListFunnelsInput["page"]> },
     options?: ApiV1GeneratedRequestOptions,
-  ): Promise<ApiV1GeneratedResult<readonly FunnelResource[]>>;
+  ): Promise<ApiV1GeneratedResult<FunnelResourcePage>>;
   createFunnel(
     siteId: string,
     input: Parameters<typeof CreateFunnelBodySchema.parse>[0],
@@ -517,6 +545,32 @@ export interface ApiV1GeneratedClient {
   deleteFunnel(
     siteId: string,
     funnelId: string,
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<undefined>>;
+  listGoals(
+    siteId: string,
+    input?: { readonly page?: Partial<ListGoalsInput["page"]> },
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<GoalResourcePage>>;
+  createGoal(
+    siteId: string,
+    input: Parameters<typeof CreateGoalBodySchema.parse>[0],
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<GoalResource>>;
+  getGoal(
+    siteId: string,
+    goalId: string,
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<GoalResource>>;
+  updateGoal(
+    siteId: string,
+    goalId: string,
+    input: Parameters<typeof UpdateGoalBodySchema.parse>[0],
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<GoalResource>>;
+  deleteGoal(
+    siteId: string,
+    goalId: string,
     options?: ApiV1GeneratedRequestOptions,
   ): Promise<ApiV1GeneratedResult<undefined>>;
   siteAnalyticsSchema(
@@ -597,6 +651,16 @@ export interface ApiV1GeneratedClient {
     input: SiteFunnelAnalysisQueryDtoInput,
     options?: ApiV1GeneratedRequestOptions,
   ): Promise<ApiV1GeneratedResult<AnalyticsFunnelAnalysisData>>;
+  siteAnalyticsGoalSummary(
+    siteId: string,
+    input: SiteGoalSummaryQueryDtoInput,
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<AnalyticsGoalSummaryData>>;
+  siteAnalyticsGoalTimeseries(
+    siteId: string,
+    input: SiteGoalTimeseriesQueryDtoInput,
+    options?: ApiV1GeneratedRequestOptions,
+  ): Promise<ApiV1GeneratedResult<AnalyticsGoalTimeseriesData>>;
   siteAnalyticsPerformanceSummary(
     siteId: string,
     input: SitePerformanceSummaryQueryDtoInput,
@@ -722,7 +786,7 @@ export interface ApiV1GeneratedClient {
     options?: ApiV1GeneratedRequestOptions,
   ): Promise<ApiV1GeneratedResult<AnalyticsTimeseriesData>>;
   teamAnalyticsSites(
-    input: TeamSitesQueryDto,
+    input: TeamSitesQueryDtoInput,
     options?: ApiV1GeneratedRequestOptions,
   ): Promise<ApiV1GeneratedResult<TeamAnalyticsSitesData>>;
   teamAnalyticsBreakdown(
@@ -806,11 +870,17 @@ export function createApiV1GeneratedClient(
         signal: options?.signal,
       });
     },
-    listSites(options) {
+    listSites(input, options) {
+      const parsed = ListSitesInputSchema.parse(input ?? {});
+      const query = new URLSearchParams();
+      if (parsed.page.limit !== 100)
+        query.set("limit", String(parsed.page.limit));
+      if (parsed.page.cursor) query.set("cursor", parsed.page.cursor);
+      const suffix = query.toString() ? `?${query.toString()}` : "";
       return request(transport, {
-        path: apiV1GeneratedRoutePath("sites.list"),
+        path: apiV1GeneratedRoutePath("sites.list") + suffix,
         method: apiV1GeneratedRouteMethod("sites.list"),
-        responseSchema: apiV1SuccessEnvelopeSchema(SiteResourceSchema.array()),
+        responseSchema: apiV1SuccessEnvelopeSchema(SiteResourcePageSchema),
         signal: options?.signal,
       });
     },
@@ -925,13 +995,21 @@ export function createApiV1GeneratedClient(
         signal: options?.signal,
       });
     },
-    listFunnels(siteId, options) {
+    listFunnels(siteId, input, options) {
+      const parsed = ListFunnelsInputSchema.parse({
+        siteId,
+        ...(input ?? {}),
+      });
+      const query = new URLSearchParams();
+      if (parsed.page.limit !== 100)
+        query.set("limit", String(parsed.page.limit));
+      if (parsed.page.cursor) query.set("cursor", parsed.page.cursor);
+      const suffix = query.toString() ? `?${query.toString()}` : "";
       return request(transport, {
-        path: apiV1GeneratedRoutePath("funnels.list", { siteId: siteId }),
+        path:
+          apiV1GeneratedRoutePath("funnels.list", { siteId: siteId }) + suffix,
         method: apiV1GeneratedRouteMethod("funnels.list"),
-        responseSchema: apiV1SuccessEnvelopeSchema(
-          FunnelResourceSchema.array(),
-        ),
+        responseSchema: apiV1SuccessEnvelopeSchema(FunnelResourcePageSchema),
         signal: options?.signal,
       });
     },
@@ -976,6 +1054,68 @@ export function createApiV1GeneratedClient(
           funnelId: funnelId,
         }),
         method: apiV1GeneratedRouteMethod("funnels.delete"),
+        signal: options?.signal,
+      });
+    },
+    listGoals(siteId, input, options) {
+      const parsed = ListGoalsInputSchema.parse({
+        siteId,
+        ...(input ?? {}),
+      });
+      const query = new URLSearchParams();
+      if (parsed.page.limit !== 50)
+        query.set("limit", String(parsed.page.limit));
+      if (parsed.page.cursor) query.set("cursor", parsed.page.cursor);
+      const suffix = query.toString() ? `?${query.toString()}` : "";
+      return request(transport, {
+        path:
+          apiV1GeneratedRoutePath("goals.list", { siteId: siteId }) + suffix,
+        method: apiV1GeneratedRouteMethod("goals.list"),
+        responseSchema: apiV1SuccessEnvelopeSchema(GoalResourcePageSchema),
+        signal: options?.signal,
+      });
+    },
+    createGoal(siteId, input, options) {
+      const parsed = CreateGoalBodySchema.parse(input);
+      return request(transport, {
+        path: apiV1GeneratedRoutePath("goals.create", { siteId: siteId }),
+        method: apiV1GeneratedRouteMethod("goals.create"),
+        body: parsed,
+        responseSchema: apiV1SuccessEnvelopeSchema(GoalResourceSchema),
+        signal: options?.signal,
+      });
+    },
+    getGoal(siteId, goalId, options) {
+      return request(transport, {
+        path: apiV1GeneratedRoutePath("goals.get", {
+          siteId: siteId,
+          goalId: goalId,
+        }),
+        method: apiV1GeneratedRouteMethod("goals.get"),
+        responseSchema: apiV1SuccessEnvelopeSchema(GoalResourceSchema),
+        signal: options?.signal,
+      });
+    },
+    updateGoal(siteId, goalId, input, options) {
+      const parsed = UpdateGoalBodySchema.parse(input);
+      return request(transport, {
+        path: apiV1GeneratedRoutePath("goals.update", {
+          siteId: siteId,
+          goalId: goalId,
+        }),
+        method: apiV1GeneratedRouteMethod("goals.update"),
+        body: parsed,
+        responseSchema: apiV1SuccessEnvelopeSchema(GoalResourceSchema),
+        signal: options?.signal,
+      });
+    },
+    deleteGoal(siteId, goalId, options) {
+      return requestNoContent(transport, {
+        path: apiV1GeneratedRoutePath("goals.delete", {
+          siteId: siteId,
+          goalId: goalId,
+        }),
+        method: apiV1GeneratedRouteMethod("goals.delete"),
         signal: options?.signal,
       });
     },
@@ -1162,6 +1302,30 @@ export function createApiV1GeneratedClient(
         method: apiV1GeneratedRouteMethod("site.analytics.funnelAnalysis"),
         body: parsed,
         responseSchema: AnalyticsFunnelAnalysisResponseSchema,
+        signal: options?.signal,
+      });
+    },
+    siteAnalyticsGoalSummary(siteId, input, options) {
+      const parsed = SiteGoalSummaryQueryDtoSchema.parse(input);
+      return request(transport, {
+        path: apiV1GeneratedRoutePath("site.analytics.goalSummary", {
+          siteId: siteId,
+        }),
+        method: apiV1GeneratedRouteMethod("site.analytics.goalSummary"),
+        body: parsed,
+        responseSchema: AnalyticsGoalSummaryResponseSchema,
+        signal: options?.signal,
+      });
+    },
+    siteAnalyticsGoalTimeseries(siteId, input, options) {
+      const parsed = SiteGoalTimeseriesQueryDtoSchema.parse(input);
+      return request(transport, {
+        path: apiV1GeneratedRoutePath("site.analytics.goalTimeseries", {
+          siteId: siteId,
+        }),
+        method: apiV1GeneratedRouteMethod("site.analytics.goalTimeseries"),
+        body: parsed,
+        responseSchema: AnalyticsGoalTimeseriesResponseSchema,
         signal: options?.signal,
       });
     },
@@ -1496,8 +1660,9 @@ export function createApiV1GeneratedClient(
         ...(input ?? {}),
       });
       const query = new URLSearchParams();
-      if (parsed.limit !== 100) query.set("limit", String(parsed.limit));
-      if (parsed.cursor) query.set("cursor", parsed.cursor);
+      if (parsed.page.limit !== 100)
+        query.set("limit", String(parsed.page.limit));
+      if (parsed.page.cursor) query.set("cursor", parsed.page.cursor);
       const suffix = query.toString() ? `?${query.toString()}` : "";
       return request(transport, {
         path:

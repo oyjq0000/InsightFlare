@@ -1,8 +1,10 @@
 import "@tanstack/react-start/server-only";
 
 import type {
+  FilterDocument,
   Interval,
   QueryWindow,
+  TeamSiteRow,
 } from "@/lib/edge/analytics/providers/d1/internal/core";
 import { resolvePrivateTeamForSession } from "@/lib/edge/analytics/providers/d1/internal/core";
 import type { D1ReadDiagnostics } from "@/lib/edge/analytics/providers/d1/internal/diagnostics";
@@ -34,7 +36,9 @@ export interface ReadTeamDashboardInput {
   readonly teamId: string;
   readonly window: QueryWindow;
   readonly interval: Interval;
+  readonly filters?: FilterDocument;
   readonly allowedSiteIds?: readonly string[];
+  readonly preloadedSites?: readonly TeamSiteRow[];
   readonly diagnostics?: D1ReadDiagnostics;
 }
 
@@ -97,6 +101,32 @@ export async function readTeamDashboard(
       await import("../../mock/team-dashboard-demo");
     return readDemoTeamDashboard(input);
   }
+  if (input.preloadedSites !== undefined) {
+    return queryTeamDashboardForTeam(
+      input.env,
+      input.teamId,
+      input.window,
+      input.interval,
+      input.allowedSiteIds ? [...input.allowedSiteIds] : undefined,
+      input.diagnostics,
+      input.preloadedSites,
+      input.filters,
+    );
+  }
+
+  if (input.filters !== undefined) {
+    return queryTeamDashboardForTeam(
+      input.env,
+      input.teamId,
+      input.window,
+      input.interval,
+      input.allowedSiteIds ? [...input.allowedSiteIds] : undefined,
+      input.diagnostics,
+      undefined,
+      input.filters,
+    );
+  }
+
   return queryTeamDashboardForTeam(
     input.env,
     input.teamId,

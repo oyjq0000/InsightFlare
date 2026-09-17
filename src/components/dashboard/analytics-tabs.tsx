@@ -23,6 +23,7 @@ import {
   RiShareForwardLine,
   RiShieldCheckLine,
   RiSpeedUpLine,
+  RiTargetLine,
   RiUser3Line,
 } from "@remixicon/react";
 import { motion } from "motion/react";
@@ -33,9 +34,10 @@ import {
   prepareNativeScrollbarHost,
   useNativeScrollbars,
 } from "@/components/ui/overlay-scrollbar";
+import { useLiveSearchParams } from "@/lib/client-history";
 import { serializeDashboardSearchParams } from "@/lib/dashboard/filter-state";
 import Link from "@/lib/router";
-import { usePathname, useSearchParams } from "@/lib/router";
+import { usePathname } from "@/lib/router";
 import { cn } from "@/lib/utils";
 
 type AnalyticsTabKey =
@@ -47,6 +49,7 @@ type AnalyticsTabKey =
   | "campaigns"
   | "events"
   | "funnels"
+  | "goals"
   | "visitors"
   | "retention"
   | "geo"
@@ -96,6 +99,7 @@ function getAnalyticsSectionIcon(key: AnalyticsTabKey) {
   if (key === "campaigns") return RiMegaphoneLine;
   if (key === "events") return RiFlashlightLine;
   if (key === "funnels") return RiFilter2Line;
+  if (key === "goals") return RiTargetLine;
   if (key === "visitors") return RiUser3Line;
   if (key === "retention") return RiRepeatLine;
   if (key === "geo") return RiMapPin2Line;
@@ -136,9 +140,12 @@ function globalNavigationSearchParams(
   for (const [key, value] of searchParams) {
     if (
       key.startsWith("filter[") ||
+      key === "compare" ||
+      key.startsWith("compareFilter[") ||
       key === "range" ||
       key === "interval" ||
-      key === "timeZone"
+      key === "timeZone" ||
+      key === "scope"
     ) {
       next.append(key, value);
     }
@@ -150,7 +157,7 @@ export const AnalyticsTabs = memo(function AnalyticsTabs({
   items,
 }: AnalyticsTabsProps) {
   const pathname = usePathname();
-  const searchParams = useSearchParams();
+  const searchParams = useLiveSearchParams();
   const normalizedPathname = normalizePathname(pathname || "");
   const scrollHostRef = useRef<HTMLDivElement | null>(null);
   const scrollbarRef = useRef<ReturnType<typeof OverlayScrollbars> | null>(
@@ -218,8 +225,7 @@ export const AnalyticsTabs = memo(function AnalyticsTabs({
       const current =
         container ??
         (scrollbarRef.current?.elements().viewport as
-          | HTMLDivElement
-          | undefined) ??
+          HTMLDivElement | undefined) ??
         scrollHostRef.current;
       if (!current) {
         applyMaskVisibility(false, false);

@@ -8,7 +8,12 @@ import {
   handleSiteComparisonBreakdown,
 } from "@/lib/api-v1/comparison-handler";
 import { SitePerformanceBreakdownDimensionSchema } from "@/lib/api-v1/dto/analytics";
+import { fromZodIssues } from "@/lib/api-v1/errors";
 import { handlePlannedSiteFunnelAnalysis } from "@/lib/api-v1/funnel-analysis-handler";
+import {
+  handlePlannedSiteGoalSummary,
+  handlePlannedSiteGoalTimeseries,
+} from "@/lib/api-v1/goal-analysis-handler";
 import { handlePlannedSiteOverview } from "@/lib/api-v1/overview-handler";
 import { handlePlannedSavedFilters } from "@/lib/api-v1/saved-filters-handler";
 import { handlePlannedSiteBreakdown } from "@/lib/api-v1/site-breakdown-handler";
@@ -252,6 +257,32 @@ export function registerV1SiteAnalyticsRoutes(
       { signal: c.req.raw.signal, capturedAtMs: Date.now() },
     );
   });
+  routes.post("/sites/:siteId/analytics/goals/summary", (c) => {
+    const siteId = c.req.param("siteId");
+    if (!siteId) return deps.resourceNotFound(c);
+    return handlePlannedSiteGoalSummary(
+      c.env,
+      c.req.raw,
+      deps.resolvePrincipal(c),
+      siteId,
+      providerRegistry(c, "site.analytics.goalSummary"),
+      createAnalysisDefinitionReader(c.env, deps.resolvePrincipal(c)),
+      { signal: c.req.raw.signal, capturedAtMs: Date.now() },
+    );
+  });
+  routes.post("/sites/:siteId/analytics/goals/timeseries", (c) => {
+    const siteId = c.req.param("siteId");
+    if (!siteId) return deps.resourceNotFound(c);
+    return handlePlannedSiteGoalTimeseries(
+      c.env,
+      c.req.raw,
+      deps.resolvePrincipal(c),
+      siteId,
+      providerRegistry(c, "site.analytics.goalTimeseries"),
+      createAnalysisDefinitionReader(c.env, deps.resolvePrincipal(c)),
+      { signal: c.req.raw.signal, capturedAtMs: Date.now() },
+    );
+  });
   routes.post("/sites/:siteId/analytics/performance/summary", (c) => {
     const siteId = c.req.param("siteId");
     if (!siteId) return deps.resourceNotFound(c);
@@ -295,6 +326,7 @@ export function registerV1SiteAnalyticsRoutes(
               SitePerformanceBreakdownDimensionSchema.options,
           },
           c.req.raw,
+          fromZodIssues(parsedDimension.error.issues),
         );
       }
       return handlePlannedSitePerformanceBreakdown(

@@ -9,15 +9,23 @@ import {
 import { pickDemoGeoContext } from "@/lib/realtime/mock/dimension-pickers";
 
 type WindowMinutes = 60 | 1440 | 10080 | 43200;
+type DemoNormalEventKind =
+  "pageview" | "leave" | "visibility" | "custom_event" | "identify";
 
-interface DemoBotEvent {
+type DemoRequestCategory = "normal" | "suspected_bot" | "bot" | "custom_block";
+type DemoRequestDisposition = "included" | "blocked";
+
+interface DemoRequestEvent {
   timestamp: string;
   receivedAt: number;
+  eventAt: number;
+  edgeLatencyMs: number | null;
   siteId: string;
   siteName: string;
   siteDomain: string;
-  kind: string;
-  confidence: string;
+  kind: string | DemoNormalEventKind;
+  category: DemoRequestCategory;
+  disposition: DemoRequestDisposition;
   reasons: string[];
   ip: string;
   userAgent: string;
@@ -34,40 +42,18 @@ interface DemoBotEvent {
   verifiedBotCategory: string;
   rayId: string;
   traceId: string;
+  requestMethod: string;
+  httpProtocol: string;
   metadataJson: string;
   latitude: number | null;
   longitude: number | null;
   botScore: number | null;
   userAgentLength: number;
+  sampleWeight: number;
 }
 
-interface DemoNormalEvent {
-  timestamp: string;
-  receivedAt: number;
-  eventAt: number;
-  edgeLatencyMs: number;
-  siteId: string;
-  siteName: string;
-  siteDomain: string;
-  kind: string;
-  origin: string;
-  hostname: string;
-  pathname: string;
-  country: string;
-  region: string;
-  city: string;
-  continent: string;
-  colo: string;
-  asn: number;
-  asOrganization: string;
-  rayId: string;
-  traceId: string;
-  requestMethod: string;
-  metadataJson: string;
-  latitude: number | null;
-  longitude: number | null;
-  userAgentLength: number;
-}
+type DemoBotEvent = DemoRequestEvent;
+type DemoNormalEvent = DemoRequestEvent;
 
 interface DemoMapPoint {
   latitude: number;
@@ -81,13 +67,25 @@ interface DemoTrendPoint {
   count: number;
   baselineCount: number;
   botRatio: number;
-  abnormalCount: number;
   normalCount: number;
+  suspectedBotCount: number;
+  botCount: number;
+  customBlockedCount: number;
+  includedCount: number;
+  blockedCount: number;
   totalCount: number;
-  abnormalRatio: number;
+  blockedRatio: number;
   normalRatio: number;
   pageviews: number;
   customEvents: number;
+  pageviewCount: number;
+  leaveCount: number;
+  visibilityCount: number;
+  customEventCount: number;
+  identifyCount: number;
+  weightedRequestCount: number;
+  latencyWeightedSumMs: number;
+  latencySampleWeight: number;
   avgLatencyMs: number | null;
   p50LatencyMs: number | null;
   p75LatencyMs: number | null;
@@ -99,6 +97,14 @@ interface DemoRequestObservationData {
   ok: true;
   configured: boolean;
   generatedAt: number;
+  sampling: {
+    provider: "cloudflare_analytics_engine";
+    mode: "automatic";
+    observedSampled: boolean;
+    aggregatesWeighted: boolean;
+    detailsAreSampled: boolean;
+    distinctAreApproximate: boolean;
+  };
   window: {
     minutes: number;
     from: number;
@@ -106,10 +112,12 @@ interface DemoRequestObservationData {
   };
   summary: {
     total: number;
-    baselineRequests: number;
-    botRequestRatio: number;
-    highConfidence: number;
-    mediumConfidence: number;
+    normalRequests: number;
+    suspectedBotRequests: number;
+    botRequests: number;
+    customBlockedRequests: number;
+    includedRequests: number;
+    blockedRequests: number;
     affectedSites: number;
     uniqueAsns: number;
     uniqueCountries: number;
@@ -117,14 +125,22 @@ interface DemoRequestObservationData {
   mapPoints: DemoMapPoint[];
   trend: DemoTrendPoint[];
   reasons: Array<{ reason: string; count: number }>;
+  countries: Array<{ country: string; count: number }>;
   asns: Array<{ asn: number; asOrganization: string; count: number }>;
-  events: DemoBotEvent[];
-  normalEvents: DemoNormalEvent[];
+  events: DemoRequestEvent[];
+  normalEvents: DemoRequestEvent[];
+  blockedEvents: DemoRequestEvent[];
+  includedEvents: DemoRequestEvent[];
   overview: {
     totalRequests: number;
+    includedRequests: number;
+    blockedRequests: number;
     normalRequests: number;
-    abnormalRequests: number;
-    abnormalRequestRatio: number;
+    suspectedBotRequests: number;
+    botRequests: number;
+    customBlockedRequests: number;
+    botRequestRatio: number;
+    blockedRequestRatio: number;
     normalRequestRatio: number;
     pageviews: number;
     customEvents: number;
@@ -134,20 +150,37 @@ interface DemoRequestObservationData {
     p95LatencyMs: number | null;
     p99LatencyMs: number | null;
   };
-  abnormal: {
+  blocked: {
     summary: DemoRequestObservationData["summary"] & {
       total: number;
       ratio: number;
+      pageviews: number;
+      customEvents: number;
+      avgLatencyMs: number | null;
+      p50LatencyMs: number | null;
+      p75LatencyMs: number | null;
+      p95LatencyMs: number | null;
+      p99LatencyMs: number | null;
     };
     mapPoints: DemoMapPoint[];
-    events: DemoBotEvent[];
+    events: DemoRequestEvent[];
+    hasMore: boolean;
+    nextCursor: { timestamp: string; receivedAt: number } | null;
     reasons: Array<{ reason: string; count: number }>;
+    countries: Array<{ country: string; count: number }>;
     asns: Array<{ asn: number; asOrganization: string; count: number }>;
+    dimensions: { network: Record<string, unknown[]> };
   };
-  normal: {
+  included: {
     summary: {
       total: number;
       ratio: number;
+      normalRequests: number;
+      suspectedBotRequests: number;
+      botRequests: number;
+      customBlockedRequests: number;
+      includedRequests: number;
+      blockedRequests: number;
       pageviews: number;
       customEvents: number;
       affectedSites: number;
@@ -160,7 +193,10 @@ interface DemoRequestObservationData {
       p99LatencyMs: number | null;
     };
     mapPoints: DemoMapPoint[];
-    events: DemoNormalEvent[];
+    events: DemoRequestEvent[];
+    hasMore: boolean;
+    nextCursor: { timestamp: string; receivedAt: number } | null;
+    dimensions: { network: Record<string, unknown[]> };
   };
 }
 
@@ -174,6 +210,49 @@ const BOT_REASON_WEIGHTS = [
   { label: "origin_hostname_mismatch", weight: 7 },
   { label: "ua_too_long", weight: 5 },
 ] as const;
+
+const CUSTOM_BLOCK_REASON_WEIGHTS = [
+  { label: "blocked_domains", weight: 18 },
+  { label: "blocked_paths", weight: 18 },
+  { label: "blocked_query_parameters", weight: 12 },
+  { label: "blocked_referrers", weight: 10 },
+  { label: "blocked_user_agents", weight: 14 },
+  { label: "blocked_ips", weight: 12 },
+  { label: "blocked_asns", weight: 9 },
+  { label: "blocked_countries", weight: 5 },
+  { label: "blocked_regions", weight: 2 },
+] as const;
+
+const NORMAL_EVENT_KIND_WEIGHTS = [
+  { label: "pageview", weight: 48 },
+  { label: "leave", weight: 12 },
+  { label: "visibility", weight: 18 },
+  { label: "custom_event", weight: 18 },
+  { label: "identify", weight: 4 },
+] as const;
+
+const NORMAL_EVENT_KINDS = [
+  "pageview",
+  "leave",
+  "visibility",
+  "custom_event",
+  "identify",
+] as const;
+
+const NORMAL_EVENT_COUNT_KEYS: Record<
+  DemoNormalEventKind,
+  | "pageviewCount"
+  | "leaveCount"
+  | "visibilityCount"
+  | "customEventCount"
+  | "identifyCount"
+> = {
+  pageview: "pageviewCount",
+  leave: "leaveCount",
+  visibility: "visibilityCount",
+  custom_event: "customEventCount",
+  identify: "identifyCount",
+};
 
 const BOT_ASNS = [
   { asn: 15169, organization: "Google LLC", weight: 16 },
@@ -203,7 +282,7 @@ const NORMAL_ASNS = [
   { asn: 1221, organization: "Telstra Pty Ltd", weight: 6 },
 ] as const;
 
-const DEMO_ABNORMAL_COUNTRY_WEIGHTS = [
+const DEMO_BLOCKED_COUNTRY_WEIGHTS = [
   { label: "US", weight: 18 },
   { label: "DE", weight: 14 },
   { label: "NL", weight: 12 },
@@ -358,6 +437,23 @@ function pickDemoTrafficCountry(
 }
 
 function pickReasons(rng: () => number): string[] {
+  if (rng() < 0.16) {
+    const reasons = new Set([
+      "custom_block",
+      weightedPickLabel(rng, [...CUSTOM_BLOCK_REASON_WEIGHTS], "blocked_paths"),
+    ]);
+    if (rng() < 0.18) {
+      reasons.add(
+        weightedPickLabel(
+          rng,
+          [...CUSTOM_BLOCK_REASON_WEIGHTS],
+          "blocked_domains",
+        ),
+      );
+    }
+    return [...reasons];
+  }
+
   const first = weightedPickLabel(rng, [...BOT_REASON_WEIGHTS], "ua_isbot");
   const reasons = new Set([first]);
   if (rng() < 0.42) {
@@ -384,16 +480,68 @@ function randomIpv4(rng: () => number): string {
   ].join(".");
 }
 
+function emptyTrendPoint() {
+  return {
+    count: 0,
+    baselineCount: 0,
+    botRatio: 0,
+    normalCount: 0,
+    suspectedBotCount: 0,
+    botCount: 0,
+    customBlockedCount: 0,
+    includedCount: 0,
+    blockedCount: 0,
+    totalCount: 0,
+    blockedRatio: 0,
+    normalRatio: 0,
+    pageviews: 0,
+    customEvents: 0,
+    pageviewCount: 0,
+    leaveCount: 0,
+    visibilityCount: 0,
+    customEventCount: 0,
+    identifyCount: 0,
+    weightedRequestCount: 0,
+    latencyWeightedSumMs: 0,
+    latencySampleWeight: 0,
+    avgLatencyMs: null,
+    p50LatencyMs: null,
+    p75LatencyMs: null,
+    p95LatencyMs: null,
+    p99LatencyMs: null,
+    latencySamples: [] as Array<{ value: number; weight: number }>,
+  };
+}
+
+function weightedPercentile(
+  samples: Array<{ value: number; weight: number }>,
+  percentileValue: number,
+): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((left, right) => left.value - right.value);
+  const totalWeight = sorted.reduce((sum, sample) => sum + sample.weight, 0);
+  if (totalWeight <= 0) return null;
+  const target = Math.max(1, Math.ceil(totalWeight * percentileValue));
+  let weight = 0;
+  for (const sample of sorted) {
+    weight += sample.weight;
+    if (weight >= target) return sample.value;
+  }
+  return sorted[sorted.length - 1].value;
+}
+
 function aggregateEvents(
-  events: DemoBotEvent[],
+  events: DemoRequestEvent[],
   minutes: number,
   generatedAt = Date.now(),
+  includeIncludedMapPoints = false,
 ) {
   const from = generatedAt - minutes * 60 * 1000;
   const bucketMs = bucketSizeMs(minutes);
   const coordinatePrecision = mapCoordinatePrecision(minutes);
-  const trend = new Map<number, Omit<DemoTrendPoint, "timestampMs">>();
+  const trend = new Map<number, ReturnType<typeof emptyTrendPoint>>();
   const reasons = new Map<string, number>();
+  const countries = new Map<string, number>();
   const asns = new Map<
     number,
     { asn: number; asOrganization: string; count: number }
@@ -409,64 +557,66 @@ function aggregateEvents(
   >();
 
   for (let bucket = from; bucket <= generatedAt; bucket += bucketMs) {
-    trend.set(Math.floor(bucket / bucketMs) * bucketMs, {
-      count: 0,
-      baselineCount: 0,
-      botRatio: 0,
-      abnormalCount: 0,
-      normalCount: 0,
-      totalCount: 0,
-      abnormalRatio: 0,
-      normalRatio: 0,
-      pageviews: 0,
-      customEvents: 0,
-      avgLatencyMs: null,
-      p50LatencyMs: null,
-      p75LatencyMs: null,
-      p95LatencyMs: null,
-      p99LatencyMs: null,
-    });
+    trend.set(Math.floor(bucket / bucketMs) * bucketMs, emptyTrendPoint());
   }
 
   for (const event of events) {
     const bucket = Math.floor(event.receivedAt / bucketMs) * bucketMs;
-    const point = trend.get(bucket) ?? {
-      count: 0,
-      baselineCount: 0,
-      botRatio: 0,
-      abnormalCount: 0,
-      normalCount: 0,
-      totalCount: 0,
-      abnormalRatio: 0,
-      normalRatio: 0,
-      pageviews: 0,
-      customEvents: 0,
-      avgLatencyMs: null,
-      p50LatencyMs: null,
-      p75LatencyMs: null,
-      p95LatencyMs: null,
-      p99LatencyMs: null,
-    };
-    point.count += 1;
-    point.abnormalCount += 1;
+    const point = trend.get(bucket) ?? emptyTrendPoint();
+    const weight = Math.max(1, Math.trunc(event.sampleWeight));
+    point.count += weight;
+    point.weightedRequestCount += weight;
+    point.totalCount += weight;
+    if (event.category === "normal") {
+      point.normalCount += weight;
+      point.baselineCount += weight;
+    }
+    if (event.category === "suspected_bot") point.suspectedBotCount += weight;
+    if (event.category === "bot") point.botCount += weight;
+    if (event.category === "custom_block") point.customBlockedCount += weight;
+    if (event.disposition === "included") point.includedCount += weight;
+    else point.blockedCount += weight;
+    const eventKind = event.kind as DemoNormalEventKind;
+    const countKey = NORMAL_EVENT_COUNT_KEYS[eventKind];
+    if (countKey) point[countKey] += weight;
+    if (event.kind === "pageview") point.pageviews += weight;
+    if (event.kind === "custom_event") point.customEvents += weight;
+    if (
+      Number.isFinite(event.edgeLatencyMs) &&
+      event.edgeLatencyMs !== null &&
+      event.edgeLatencyMs >= 0
+    ) {
+      point.latencyWeightedSumMs += event.edgeLatencyMs * weight;
+      point.latencySampleWeight += weight;
+      point.latencySamples.push({ value: event.edgeLatencyMs, weight });
+    }
     trend.set(bucket, point);
 
-    for (const reason of event.reasons) {
-      reasons.set(reason, (reasons.get(reason) || 0) + 1);
-    }
+    if (event.disposition === "blocked") {
+      for (const reason of event.reasons) {
+        reasons.set(reason, (reasons.get(reason) || 0) + weight);
+      }
+      countries.set(
+        event.country,
+        (countries.get(event.country) || 0) + weight,
+      );
 
-    const asn = asns.get(event.asn);
-    if (asn) {
-      asn.count += 1;
-    } else {
-      asns.set(event.asn, {
-        asn: event.asn,
-        asOrganization: event.asOrganization,
-        count: 1,
-      });
+      const asn = asns.get(event.asn);
+      if (asn) {
+        asn.count += weight;
+      } else {
+        asns.set(event.asn, {
+          asn: event.asn,
+          asOrganization: event.asOrganization,
+          count: weight,
+        });
+      }
     }
-
-    if (event.latitude !== null && event.longitude !== null) {
+    if (
+      event.latitude !== null &&
+      event.longitude !== null &&
+      (event.disposition === "blocked" || includeIncludedMapPoints)
+    ) {
       const lat =
         Math.round(event.latitude * coordinatePrecision) / coordinatePrecision;
       const lon =
@@ -474,13 +624,13 @@ function aggregateEvents(
       const key = `${event.country}:${lat}:${lon}`;
       const current = mapPoints.get(key);
       if (current) {
-        current.pointCount += 1;
+        current.pointCount += weight;
       } else {
         mapPoints.set(key, {
           latitude: lat,
           longitude: lon,
           country: event.country,
-          pointCount: 1,
+          pointCount: weight,
         });
       }
     }
@@ -492,122 +642,47 @@ function aggregateEvents(
   return {
     trend: [...trend.entries()]
       .sort((left, right) => left[0] - right[0])
-      .map(([timestampMs, point]) => ({ timestampMs, ...point })),
+      .map(([timestampMs, point]) => {
+        const avgLatencyMs =
+          point.latencySampleWeight > 0
+            ? point.latencyWeightedSumMs / point.latencySampleWeight
+            : null;
+        return {
+          timestampMs,
+          ...(() => {
+            const { latencySamples: _latencySamples, ...serializablePoint } =
+              point;
+            return serializablePoint;
+          })(),
+          totalCount: point.includedCount + point.blockedCount,
+          botRatio:
+            point.includedCount + point.blockedCount > 0
+              ? point.botCount / (point.includedCount + point.blockedCount)
+              : 0,
+          blockedRatio:
+            point.includedCount + point.blockedCount > 0
+              ? point.blockedCount / (point.includedCount + point.blockedCount)
+              : 0,
+          normalRatio:
+            point.includedCount + point.blockedCount > 0
+              ? point.normalCount / (point.includedCount + point.blockedCount)
+              : 0,
+          avgLatencyMs,
+          p50LatencyMs: weightedPercentile(point.latencySamples, 0.5),
+          p75LatencyMs: weightedPercentile(point.latencySamples, 0.75),
+          p95LatencyMs: weightedPercentile(point.latencySamples, 0.95),
+          p99LatencyMs: weightedPercentile(point.latencySamples, 0.99),
+        };
+      }),
     reasons: sortCounts(
       [...reasons.entries()].map(([reason, count]) => ({ reason, count })),
+    ),
+    countries: sortCounts(
+      [...countries.entries()].map(([country, count]) => ({ country, count })),
     ),
     asns: sortCounts([...asns.values()]),
     mapPoints: [...mapPoints.values()],
   };
-}
-
-function aggregateNormalEvents(
-  events: DemoNormalEvent[],
-  minutes: number,
-  generatedAt = Date.now(),
-) {
-  const from = generatedAt - minutes * 60 * 1000;
-  const bucketMs = bucketSizeMs(minutes);
-  const coordinatePrecision = mapCoordinatePrecision(minutes);
-  const trend = new Map<
-    number,
-    {
-      count: number;
-      pageviews: number;
-      customEvents: number;
-      latencyValues: number[];
-    }
-  >();
-  const mapPoints = new Map<string, DemoMapPoint>();
-
-  for (let bucket = from; bucket <= generatedAt; bucket += bucketMs) {
-    trend.set(Math.floor(bucket / bucketMs) * bucketMs, {
-      count: 0,
-      pageviews: 0,
-      customEvents: 0,
-      latencyValues: [],
-    });
-  }
-
-  for (const event of events) {
-    const bucket = Math.floor(event.receivedAt / bucketMs) * bucketMs;
-    const point = trend.get(bucket) ?? {
-      count: 0,
-      pageviews: 0,
-      customEvents: 0,
-      latencyValues: [],
-    };
-    point.count += 1;
-    if (event.kind === "custom_event") point.customEvents += 1;
-    else point.pageviews += 1;
-    if (Number.isFinite(event.edgeLatencyMs) && event.edgeLatencyMs >= 0) {
-      point.latencyValues.push(event.edgeLatencyMs);
-    }
-    trend.set(bucket, point);
-
-    if (event.latitude !== null && event.longitude !== null) {
-      const lat =
-        Math.round(event.latitude * coordinatePrecision) / coordinatePrecision;
-      const lon =
-        Math.round(event.longitude * coordinatePrecision) / coordinatePrecision;
-      const key = `${event.country}:${lat}:${lon}`;
-      const current = mapPoints.get(key);
-      if (current) {
-        current.pointCount += 1;
-      } else {
-        mapPoints.set(key, {
-          latitude: lat,
-          longitude: lon,
-          country: event.country,
-          pointCount: 1,
-        });
-      }
-    }
-  }
-
-  return {
-    trend: [...trend.entries()]
-      .sort((left, right) => left[0] - right[0])
-      .map(([timestampMs, point]) => {
-        const sortedLatency = [...point.latencyValues].sort(
-          (left, right) => left - right,
-        );
-        const avgLatencyMs =
-          sortedLatency.length > 0
-            ? sortedLatency.reduce((sum, value) => sum + value, 0) /
-              sortedLatency.length
-            : null;
-        const p50LatencyMs = percentile(sortedLatency, 0.5);
-        const p75LatencyMs = percentile(sortedLatency, 0.75);
-        const p95LatencyMs = percentile(sortedLatency, 0.95);
-        const p99LatencyMs = percentile(sortedLatency, 0.99);
-        return {
-          timestampMs,
-          count: point.count,
-          pageviews: point.pageviews,
-          customEvents: point.customEvents,
-          avgLatencyMs,
-          p50LatencyMs,
-          p75LatencyMs,
-          p95LatencyMs,
-          p99LatencyMs,
-        };
-      }),
-    mapPoints: [...mapPoints.values()],
-  };
-}
-
-function percentile(
-  sortedValues: number[],
-  percentileValue: number,
-): number | null {
-  if (sortedValues.length === 0) return null;
-  return sortedValues[
-    Math.min(
-      sortedValues.length - 1,
-      Math.ceil(sortedValues.length * percentileValue) - 1,
-    )
-  ];
 }
 
 export function generateDemoRequestObservationData(
@@ -634,7 +709,7 @@ export function generateDemoRequestObservationData(
     const country = pickDemoTrafficCountry(
       rng,
       site.topCountries,
-      DEMO_ABNORMAL_COUNTRY_WEIGHTS,
+      DEMO_BLOCKED_COUNTRY_WEIGHTS,
       "US",
     );
     const geo = pickDemoGeoContext(rng, country);
@@ -644,27 +719,41 @@ export function generateDemoRequestObservationData(
       generatedAt - Math.floor(Math.pow(rng(), 1.35) * minutes * 60 * 1000);
     const pathname = sPick(rng, site.paths) || "/";
     const userAgent = sPick(rng, BOT_USER_AGENTS);
-    const confidence =
-      rng() < 0.12
-        ? "low"
-        : reasons.includes("ua_isbot") ||
-            reasons.includes("script_ua") ||
-            reasons.includes("cf_bot_score_low")
-          ? "high"
-          : "medium";
+    const category: Exclude<DemoRequestCategory, "normal"> =
+      index === 0
+        ? "suspected_bot"
+        : index === 1
+          ? "bot"
+          : index === 2
+            ? "custom_block"
+            : reasons.includes("custom_block")
+              ? "custom_block"
+              : reasons.includes("ua_isbot") ||
+                  reasons.includes("script_ua") ||
+                  reasons.includes("cf_bot_score_low") ||
+                  index % 5 === 0
+                ? "bot"
+                : "suspected_bot";
     const rayId = `${sInt(rng, 100000, 999999).toString(16)}${index.toString(16)}demo`;
     const traceId = `demo-bot-${index.toString(36).padStart(4, "0")}`;
+    const sampleWeight = index % 17 === 0 ? 4 : index % 5 === 0 ? 2 : 1;
 
     events.push({
       timestamp: new Date(receivedAt).toISOString(),
       receivedAt,
+      eventAt: receivedAt,
+      edgeLatencyMs: null,
       siteId: site.id,
       siteName: site.name,
       siteDomain: site.domain,
       kind: "collect",
-      confidence,
+      category,
+      disposition:
+        category === "bot" || category === "custom_block"
+          ? "blocked"
+          : "included",
       reasons,
-      ip: randomIpv4(rng),
+      ip: category === "bot" ? randomIpv4(rng) : "",
       userAgent,
       origin: `https://${site.domain}`,
       hostname: site.domain,
@@ -681,6 +770,8 @@ export function generateDemoRequestObservationData(
         : "",
       rayId,
       traceId,
+      requestMethod: "POST",
+      httpProtocol: "h2",
       metadataJson: JSON.stringify({
         rayId,
         requestUrl: `https://${site.domain}${pathname}`,
@@ -702,8 +793,9 @@ export function generateDemoRequestObservationData(
       }),
       latitude: geo.latitude,
       longitude: geo.longitude,
-      botScore: confidence === "high" ? sInt(rng, 1, 28) : sInt(rng, 30, 54),
+      botScore: category === "bot" ? sInt(rng, 1, 19) : sInt(rng, 20, 54),
       userAgentLength: userAgent.length,
+      sampleWeight,
     });
   }
 
@@ -715,9 +807,13 @@ export function generateDemoRequestObservationData(
   };
   const botRequestRatio =
     ratioByWindow[minutes] + Math.round(rng() * 20) / 1000;
+  const botLikeSampleCount = events.reduce(
+    (sum, event) => sum + event.sampleWeight,
+    0,
+  );
   const baselineRequests = Math.max(
     events.length,
-    Math.round((events.length / botRequestRatio) * (1 - botRequestRatio)),
+    Math.round((botLikeSampleCount / botRequestRatio) * (1 - botRequestRatio)),
   );
 
   for (let index = 0; index < baselineRequests; index += 1) {
@@ -734,9 +830,16 @@ export function generateDemoRequestObservationData(
       generatedAt - Math.floor(Math.pow(rng(), 1.08) * minutes * 60 * 1000);
     const eventAt = receivedAt - sInt(rng, 8, 95);
     const pathname = sPick(rng, site.paths) || "/";
-    const isCustomEvent = rng() < 0.18;
+    const kind = (
+      index < NORMAL_EVENT_KINDS.length
+        ? NORMAL_EVENT_KINDS[index]
+        : weightedPickLabel(rng, [...NORMAL_EVENT_KIND_WEIGHTS], "pageview")
+    ) as DemoNormalEventKind;
+    const isCustomEvent = kind === "custom_event";
+    const isVisibility = kind === "visibility";
     const edgeLatencyMs =
       Math.round((18 + rng() * 44 + (isCustomEvent ? 8 : 0)) * 10) / 10;
+    const sampleWeight = index % 19 === 0 ? 3 : index % 7 === 0 ? 2 : 1;
 
     normalEvents.push({
       timestamp: new Date(receivedAt).toISOString(),
@@ -746,7 +849,14 @@ export function generateDemoRequestObservationData(
       siteId: site.id,
       siteName: site.name,
       siteDomain: site.domain,
-      kind: isCustomEvent ? "custom_event" : "pageview",
+      kind,
+      category: "normal",
+      disposition: "included",
+      reasons: [],
+      ip: "",
+      userAgent: "Mozilla/5.0 (demo browser)",
+      verifiedBotCategory: "",
+      botScore: null,
       origin: `https://${site.domain}`,
       hostname: site.domain,
       pathname,
@@ -759,7 +869,8 @@ export function generateDemoRequestObservationData(
       asOrganization: asn.organization,
       rayId: `${sInt(rng, 100000, 999999).toString(16)}${index.toString(16)}ok`,
       traceId: `demo-normal-${index.toString(36).padStart(5, "0")}`,
-      requestMethod: isCustomEvent ? "POST" : "GET",
+      requestMethod: "POST",
+      httpProtocol: "h2",
       metadataJson: JSON.stringify({
         eventId: `demo-event-${index.toString(36).padStart(5, "0")}`,
         visitId: `demo-visit-${(index % 24).toString(36).padStart(3, "0")}`,
@@ -770,7 +881,11 @@ export function generateDemoRequestObservationData(
         hasVisitorId: true,
         hasUserId: index % 3 === 0,
         eventName: isCustomEvent ? `demo_event_${index % 5}` : "",
-        visibilityState: isCustomEvent ? "visible" : "",
+        visibilityState: isVisibility
+          ? index % 2 === 0
+            ? "visible"
+            : "hidden"
+          : "",
         secFetchSite: "same-origin",
         secFetchMode: "cors",
         secFetchDest: "empty",
@@ -779,161 +894,192 @@ export function generateDemoRequestObservationData(
       latitude: geo.latitude,
       longitude: geo.longitude,
       userAgentLength: sInt(rng, 72, 156),
+      sampleWeight,
     });
   }
 
-  events.sort(
+  const allEvents = [...events, ...normalEvents].sort(
     (left, right) =>
       right.receivedAt - left.receivedAt ||
       left.traceId.localeCompare(right.traceId),
   );
-  normalEvents.sort(
-    (left, right) =>
-      right.receivedAt - left.receivedAt ||
-      left.traceId.localeCompare(right.traceId),
+  const blockedEvents = allEvents.filter(
+    (event) => event.disposition === "blocked",
   );
-
-  const aggregates = aggregateEvents(events, minutes, generatedAt);
-  const normalAggregates = aggregateNormalEvents(
-    normalEvents,
+  const includedEvents = allEvents.filter(
+    (event) => event.disposition === "included",
+  );
+  const aggregates = aggregateEvents(allEvents, minutes, generatedAt);
+  const blockedAggregates = aggregateEvents(
+    blockedEvents,
     minutes,
     generatedAt,
   );
-  const affectedSites = new Set(events.map((event) => event.siteId));
-  const uniqueAsns = new Set(events.map((event) => event.asn));
-  const uniqueCountries = new Set(events.map((event) => event.country));
-  const normalAffectedSites = new Set(
-    normalEvents.map((event) => event.siteId),
+  const includedAggregates = aggregateEvents(
+    includedEvents,
+    minutes,
+    generatedAt,
+    true,
   );
-  const normalUniqueAsns = new Set(normalEvents.map((event) => event.asn));
-  const normalUniqueCountries = new Set(
-    normalEvents.map((event) => event.country),
-  );
-  const normalTrendByBucket = new Map(
-    normalAggregates.trend.map((point) => [point.timestampMs, point]),
-  );
-  const trend = aggregates.trend.map((point) => {
-    const normalPoint = normalTrendByBucket.get(point.timestampMs);
-    const normalCount = normalPoint?.count ?? 0;
-    const abnormalCount = point.count;
-    const totalCount = normalCount + abnormalCount;
-    return {
-      ...point,
-      baselineCount: normalCount,
-      normalCount,
-      abnormalCount,
-      totalCount,
-      botRatio: totalCount > 0 ? abnormalCount / totalCount : 0,
-      abnormalRatio: totalCount > 0 ? abnormalCount / totalCount : 0,
-      normalRatio: totalCount > 0 ? normalCount / totalCount : 0,
-      pageviews: normalPoint?.pageviews ?? 0,
-      customEvents: normalPoint?.customEvents ?? 0,
-      avgLatencyMs: normalPoint?.avgLatencyMs ?? null,
-      p50LatencyMs:
-        normalPoint?.p50LatencyMs ?? normalPoint?.avgLatencyMs ?? null,
-      p75LatencyMs:
-        normalPoint?.p75LatencyMs ?? normalPoint?.p95LatencyMs ?? null,
-      p95LatencyMs: normalPoint?.p95LatencyMs ?? null,
-      p99LatencyMs:
-        normalPoint?.p99LatencyMs ?? normalPoint?.p95LatencyMs ?? null,
+
+  const weightedCount = (source: DemoRequestEvent[]) =>
+    source.reduce((sum, event) => sum + event.sampleWeight, 0);
+  const categoryCount = (
+    source: DemoRequestEvent[],
+    category: DemoRequestCategory,
+  ) =>
+    source
+      .filter((event) => event.category === category)
+      .reduce((sum, event) => sum + event.sampleWeight, 0);
+  const partitionSummary = (source: DemoRequestEvent[]) => {
+    const total = weightedCount(source);
+    const latencySamples = source
+      .filter(
+        (event) =>
+          Number.isFinite(event.edgeLatencyMs) &&
+          event.edgeLatencyMs !== null &&
+          event.edgeLatencyMs >= 0,
+      )
+      .map((event) => ({
+        value: event.edgeLatencyMs as number,
+        weight: event.sampleWeight,
+      }));
+    const latencySampleWeight = latencySamples.reduce(
+      (sum, sample) => sum + sample.weight,
+      0,
+    );
+    const latencyWeightedSumMs = latencySamples.reduce(
+      (sum, sample) => sum + sample.value * sample.weight,
+      0,
+    );
+    const summary = {
+      total,
+      normalRequests: categoryCount(source, "normal"),
+      suspectedBotRequests: categoryCount(source, "suspected_bot"),
+      botRequests: categoryCount(source, "bot"),
+      customBlockedRequests: categoryCount(source, "custom_block"),
+      includedRequests: weightedCount(
+        source.filter((event) => event.disposition === "included"),
+      ),
+      blockedRequests: weightedCount(
+        source.filter((event) => event.disposition === "blocked"),
+      ),
+      affectedSites: new Set(source.map((event) => event.siteId)).size,
+      uniqueAsns: new Set(source.map((event) => event.asn)).size,
+      uniqueCountries: new Set(source.map((event) => event.country)).size,
+      ratio: 0,
+      pageviews: source
+        .filter((event) => event.kind === "pageview")
+        .reduce((sum, event) => sum + event.sampleWeight, 0),
+      customEvents: source
+        .filter((event) => event.kind === "custom_event")
+        .reduce((sum, event) => sum + event.sampleWeight, 0),
+      avgLatencyMs:
+        latencySampleWeight > 0
+          ? latencyWeightedSumMs / latencySampleWeight
+          : null,
+      p50LatencyMs: weightedPercentile(latencySamples, 0.5),
+      p75LatencyMs: weightedPercentile(latencySamples, 0.75),
+      p95LatencyMs: weightedPercentile(latencySamples, 0.95),
+      p99LatencyMs: weightedPercentile(latencySamples, 0.99),
     };
-  });
-  const pageviews = normalEvents.filter(
-    (event) => event.kind === "pageview",
-  ).length;
-  const customEvents = normalEvents.filter(
-    (event) => event.kind === "custom_event",
-  ).length;
-  const latencyValues = normalEvents
-    .map((event) => event.edgeLatencyMs)
-    .filter((value) => Number.isFinite(value) && value >= 0)
-    .sort((left, right) => left - right);
-  const avgLatencyMs =
-    latencyValues.length > 0
-      ? latencyValues.reduce((sum, value) => sum + value, 0) /
-        latencyValues.length
-      : null;
-  const p50LatencyMs = percentile(latencyValues, 0.5);
-  const p75LatencyMs = percentile(latencyValues, 0.75);
-  const p95LatencyMs = percentile(latencyValues, 0.95);
-  const p99LatencyMs = percentile(latencyValues, 0.99);
-  const totalRequests = baselineRequests + events.length;
-  const abnormalRequestRatio =
-    totalRequests > 0 ? events.length / totalRequests : 0;
-  const normalRequestRatio =
-    totalRequests > 0 ? baselineRequests / totalRequests : 0;
+    return summary;
+  };
+  const totalRequests = weightedCount(allEvents);
+  const includedRequests = weightedCount(includedEvents);
+  const blockedRequests = weightedCount(blockedEvents);
   const summary = {
-    total: events.length,
-    baselineRequests,
-    botRequestRatio: abnormalRequestRatio,
-    highConfidence: events.filter((event) => event.confidence === "high")
-      .length,
-    mediumConfidence: events.filter((event) => event.confidence === "medium")
-      .length,
-    affectedSites: affectedSites.size,
-    uniqueAsns: uniqueAsns.size,
-    uniqueCountries: uniqueCountries.size,
+    total: totalRequests,
+    normalRequests: categoryCount(allEvents, "normal"),
+    suspectedBotRequests: categoryCount(allEvents, "suspected_bot"),
+    botRequests: categoryCount(allEvents, "bot"),
+    customBlockedRequests: categoryCount(allEvents, "custom_block"),
+    includedRequests,
+    blockedRequests,
+    affectedSites: new Set(allEvents.map((event) => event.siteId)).size,
+    uniqueAsns: new Set(allEvents.map((event) => event.asn)).size,
+    uniqueCountries: new Set(allEvents.map((event) => event.country)).size,
   };
-  const normalSummary = {
-    total: baselineRequests,
-    ratio: normalRequestRatio,
-    pageviews,
-    customEvents,
-    affectedSites: normalAffectedSites.size,
-    uniqueAsns: normalUniqueAsns.size,
-    uniqueCountries: normalUniqueCountries.size,
-    avgLatencyMs,
-    p50LatencyMs,
-    p75LatencyMs,
-    p95LatencyMs,
-    p99LatencyMs,
-  };
+  const blockedSummary = partitionSummary(blockedEvents);
+  blockedSummary.ratio =
+    totalRequests > 0 ? blockedRequests / totalRequests : 0;
+  const includedSummary = partitionSummary(includedEvents);
+  includedSummary.ratio =
+    totalRequests > 0 ? includedRequests / totalRequests : 0;
 
   return {
     ok: true,
     configured: true,
     generatedAt,
-    window: {
-      minutes,
-      from,
-      to: generatedAt,
+    window: { minutes, from, to: generatedAt },
+    sampling: {
+      provider: "cloudflare_analytics_engine" as const,
+      mode: "automatic" as const,
+      observedSampled: allEvents.some((event) => event.sampleWeight > 1),
+      aggregatesWeighted: true,
+      detailsAreSampled: true,
+      distinctAreApproximate: true,
     },
     summary,
-    events,
-    normalEvents,
-    trend,
-    reasons: aggregates.reasons,
-    asns: aggregates.asns,
-    mapPoints: aggregates.mapPoints,
+    events: blockedEvents,
+    normalEvents: normalEvents.sort(
+      (left, right) =>
+        right.receivedAt - left.receivedAt ||
+        left.traceId.localeCompare(right.traceId),
+    ),
+    blockedEvents,
+    includedEvents,
+    trend: aggregates.trend,
+    reasons: blockedAggregates.reasons,
+    countries: blockedAggregates.countries,
+    asns: blockedAggregates.asns,
+    mapPoints: blockedAggregates.mapPoints,
     overview: {
       totalRequests,
-      normalRequests: baselineRequests,
-      abnormalRequests: events.length,
-      abnormalRequestRatio,
-      normalRequestRatio,
-      pageviews,
-      customEvents,
-      avgLatencyMs,
-      p50LatencyMs,
-      p75LatencyMs,
-      p95LatencyMs,
-      p99LatencyMs,
+      includedRequests,
+      blockedRequests,
+      normalRequests: summary.normalRequests,
+      suspectedBotRequests: summary.suspectedBotRequests,
+      botRequests: summary.botRequests,
+      customBlockedRequests: summary.customBlockedRequests,
+      botRequestRatio:
+        totalRequests > 0 ? summary.botRequests / totalRequests : 0,
+      blockedRequestRatio:
+        totalRequests > 0 ? blockedRequests / totalRequests : 0,
+      normalRequestRatio:
+        totalRequests > 0 ? summary.normalRequests / totalRequests : 0,
+      pageviews:
+        summary.total > 0
+          ? aggregates.trend.reduce((sum, point) => sum + point.pageviews, 0)
+          : 0,
+      customEvents:
+        summary.total > 0
+          ? aggregates.trend.reduce((sum, point) => sum + point.customEvents, 0)
+          : 0,
+      avgLatencyMs: includedSummary.avgLatencyMs,
+      p50LatencyMs: includedSummary.p50LatencyMs,
+      p75LatencyMs: includedSummary.p75LatencyMs,
+      p95LatencyMs: includedSummary.p95LatencyMs,
+      p99LatencyMs: includedSummary.p99LatencyMs,
     },
-    abnormal: {
-      summary: {
-        ...summary,
-        total: events.length,
-        ratio: abnormalRequestRatio,
-      },
-      mapPoints: aggregates.mapPoints,
-      events,
-      reasons: aggregates.reasons,
-      asns: aggregates.asns,
+    blocked: {
+      summary: blockedSummary,
+      mapPoints: blockedAggregates.mapPoints,
+      events: blockedEvents,
+      hasMore: false,
+      nextCursor: null,
+      reasons: blockedAggregates.reasons,
+      countries: blockedAggregates.countries,
+      asns: blockedAggregates.asns,
+      dimensions: { network: {} },
     },
-    normal: {
-      summary: normalSummary,
-      mapPoints: normalAggregates.mapPoints,
-      events: normalEvents.slice(0, 500),
+    included: {
+      summary: includedSummary,
+      mapPoints: includedAggregates.mapPoints,
+      events: includedEvents,
+      hasMore: false,
+      nextCursor: null,
+      dimensions: { network: {} },
     },
   };
 }

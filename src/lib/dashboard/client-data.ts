@@ -15,7 +15,9 @@ export {
 } from "./client-browser-data";
 export {
   createFunnel,
+  createGoal,
   deleteFunnel,
+  deleteGoal,
   fetchEventRecordDetail,
   fetchEventsRecords,
   fetchEventsSummary,
@@ -26,20 +28,30 @@ export {
   fetchEventTypeFieldValues,
   fetchFunnelDetail,
   fetchFunnels,
+  fetchGoalDefinition,
+  fetchGoals,
+  fetchGoalSummary,
+  fetchGoalTimeseries,
   fetchJourneyEventDetail,
   fetchOverview,
   fetchPages,
   fetchPerformance,
   fetchRetention,
   fetchSessionDetail,
+  fetchSessionEvents,
   fetchSessions,
   fetchTrend,
   fetchVisitorDetail,
+  fetchVisitorEvents,
   fetchVisitors,
+  fetchVisitorSessions,
+  updateFunnel,
+  updateGoal,
 } from "./client-core-data";
 export type {
   DashboardFilterOptionData,
   DashboardFilterOptionKey,
+  DashboardListRequestOptions,
   EventRecordSortKey,
   FetchPrivateJsonOptions,
   OverviewClientDimensionTab,
@@ -49,6 +61,7 @@ export type {
   OverviewGeoTabRows,
   OverviewPageCardTab,
   OverviewSourceCardTab,
+  OverviewTabCollection,
   OverviewTabRows,
   PageCardTabsData,
   PagesDashboardRow,
@@ -62,6 +75,7 @@ export type {
 } from "./client-data-types";
 export {
   fetchOverviewGeoDimensionTab,
+  fetchOverviewGeoDimensionTabPage,
   fetchOverviewGeoPoints,
 } from "./client-geo-data";
 export {
@@ -72,6 +86,7 @@ export {
 export {
   fetchReferrerRadar,
   fetchReferrers,
+  fetchReferrerSummary,
   fetchReferrerTrend,
   fetchUtmDimension,
   fetchUtmTrend,
@@ -91,6 +106,7 @@ export {
   normalizeOverviewRows,
   toQueryString,
   withFilters,
+  withPagination,
 } from "./client-utils";
 export {
   createSavedFilter,

@@ -117,8 +117,8 @@ describe("mock/events coverage", () => {
     }) as any;
 
     expect(result.ok).toBe(true);
-    expect(result.interval).toBe("hour");
-    expect(result.series).toEqual([
+    expect(result.data.interval).toBe("hour");
+    expect(result.data.series).toEqual([
       expect.objectContaining({
         key: "alpha",
         eventName: "alpha",
@@ -131,11 +131,17 @@ describe("mock/events coverage", () => {
         isOther: true,
       }),
     ]);
-    expect(result.data.map((point: any) => point.totalEvents)).toEqual([
+    expect(result.data.data.map((point: any) => point.totalEvents)).toEqual([
       1, 2, 0,
     ]);
-    expect(result.data[0].eventsBySeries).toMatchObject({ alpha: 1, other: 0 });
-    expect(result.data[1].eventsBySeries).toMatchObject({ alpha: 1, other: 1 });
+    expect(result.data.data[0].eventsBySeries).toMatchObject({
+      alpha: 1,
+      other: 0,
+    });
+    expect(result.data.data[1].eventsBySeries).toMatchObject({
+      alpha: 1,
+      other: 1,
+    });
   });
 
   it("returns empty trend series and zeroed buckets when no events match", () => {
@@ -164,8 +170,8 @@ describe("mock/events coverage", () => {
     }) as any;
 
     expect(result.ok).toBe(true);
-    expect(result.series).toEqual([]);
-    expect(result.data).toEqual([
+    expect(result.data.series).toEqual([]);
+    expect(result.data.data).toEqual([
       { bucket: 0, timestampMs: 0, totalEvents: 0, eventsBySeries: {} },
       {
         bucket: 1,
@@ -216,16 +222,16 @@ describe("mock/events coverage", () => {
       search: "pricing",
       sortBy: "pathname",
       sortDir: "asc",
-      pageSize: 1,
+      limit: 1,
     }) as any;
 
-    expect(result.meta).toEqual({
-      pageSize: 1,
+    expect(result.data.pagination).toEqual({
+      limit: 1,
       returned: 1,
       hasMore: false,
       nextCursor: null,
     });
-    expect(result.data).toEqual([
+    expect(result.data.items).toEqual([
       expect.objectContaining({
         eventId: "newer:signup",
         eventName: "signup",
@@ -258,18 +264,18 @@ describe("mock/events coverage", () => {
     const result = generateDemoEventsRecords("site", {
       from: 0,
       to: 10_000,
-      pageSize: 2,
+      limit: 2,
       sortBy: "occurredAt",
       sortDir: "desc",
     }) as any;
 
-    expect(result.meta).toEqual({
-      pageSize: 2,
+    expect(result.data.pagination).toEqual({
+      limit: 2,
       returned: 2,
       hasMore: true,
-      nextCursor: "2",
+      nextCursor: expect.any(String),
     });
-    expect(result.data.map((row: any) => row.eventId)).toEqual([
+    expect(result.data.items.map((row: any) => row.eventId)).toEqual([
       "third:signup",
       "second:signup",
     ]);
@@ -277,19 +283,19 @@ describe("mock/events coverage", () => {
     const nextPage = generateDemoEventsRecords("site", {
       from: 0,
       to: 10_000,
-      cursor: result.meta.nextCursor,
-      pageSize: 2,
+      cursor: result.data.pagination.nextCursor,
+      limit: 2,
       sortBy: "occurredAt",
       sortDir: "desc",
     }) as any;
 
-    expect(nextPage.meta).toEqual({
-      pageSize: 2,
+    expect(nextPage.data.pagination).toEqual({
+      limit: 2,
       returned: 1,
       hasMore: false,
       nextCursor: null,
     });
-    expect(nextPage.data.map((row: any) => row.eventId)).toEqual([
+    expect(nextPage.data.items.map((row: any) => row.eventId)).toEqual([
       "first:signup",
     ]);
   });
@@ -318,17 +324,18 @@ describe("mock/events coverage", () => {
         to: 10_000,
         eventName: "signup",
         search: "checkout",
-        cursor: "20",
-        pageSize: 20,
+        limit: 20,
       }),
     ).toEqual({
       ok: true,
-      data: [],
-      meta: {
-        pageSize: 20,
-        returned: 0,
-        hasMore: false,
-        nextCursor: null,
+      data: {
+        items: [],
+        pagination: {
+          limit: 20,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
       },
     });
   });
@@ -393,11 +400,6 @@ describe("mock/events coverage", () => {
         path: [{ label: "/signup", views: 2, sessions: 7, visitors: 11 }],
       },
     });
-    expect(result.fields).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: "/plan", valueType: "string" }),
-      ]),
-    );
   });
 
   it("returns empty event type detail fallbacks for a missing event name", () => {
@@ -442,7 +444,6 @@ describe("mock/events coverage", () => {
     expect(result.cards.source.domain).toEqual([]);
     expect(result.cards.client.browser).toEqual([]);
     expect(result.cards.geo.country).toEqual([]);
-    expect(result.fields).toEqual([]);
   });
 
   it("returns field values across event types when no event name is provided", () => {
@@ -464,7 +465,7 @@ describe("mock/events coverage", () => {
       fieldPath: "/plan",
       fieldValueType: "string",
     });
-    expect(allEventTypes.data.length).toBeGreaterThan(0);
+    expect(allEventTypes.data.items.length).toBeGreaterThan(0);
 
     const result = generateDemoEventTypeFieldValues("site", {
       eventName: "signup",
@@ -473,8 +474,8 @@ describe("mock/events coverage", () => {
       limit: 5,
     }) as any;
     expect(result.ok).toBe(true);
-    expect(result.data.length).toBeGreaterThan(0);
-    expect(result.data[0]).toEqual(
+    expect(result.data.items.length).toBeGreaterThan(0);
+    expect(result.data.items[0]).toEqual(
       expect.objectContaining({
         value: expect.any(String),
         events: expect.any(Number),
@@ -497,7 +498,15 @@ describe("mock/events coverage", () => {
       ok: true,
       fieldPath: "",
       fieldValueType: "string",
-      data: [],
+      data: {
+        items: [],
+        pagination: {
+          limit: 25,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
     });
     expect(
       generateDemoEventTypeFieldValues("site", {
@@ -509,7 +518,15 @@ describe("mock/events coverage", () => {
       ok: true,
       fieldPath: "/plan",
       fieldValueType: "",
-      data: [],
+      data: {
+        items: [],
+        pagination: {
+          limit: 25,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
     });
     expect(mockApplyDemoFilters).not.toHaveBeenCalled();
   });
@@ -533,11 +550,19 @@ describe("mock/events coverage", () => {
       ok: true,
       fieldPath: "/plan",
       fieldValueType: "number",
-      data: [],
+      data: {
+        items: [],
+        pagination: {
+          limit: 25,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
     });
   });
 
-  it("returns a requested record detail and falls back to the first event", () => {
+  it("returns a requested record detail and keeps unknown IDs empty", () => {
     const visits = [
       makeVisit({ visitId: "first", eventType: "signup", startedAt: 1_000 }),
       makeVisit({
@@ -571,12 +596,7 @@ describe("mock/events coverage", () => {
         to: 10_000,
         eventId: "missing",
       }),
-    ).toMatchObject({
-      ok: true,
-      data: {
-        event: { eventId: "second:purchase", eventName: "purchase" },
-      },
-    });
+    ).toEqual({ ok: true, data: null });
   });
 
   it("returns null record detail when the dataset has no custom events", () => {
@@ -609,7 +629,7 @@ describe("mock/events coverage", () => {
       to: 10_000,
     }) as any;
 
-    expect(result.data).toEqual([
+    expect(result.data.items).toEqual([
       expect.objectContaining({
         eventId: "linux-event:download",
         region: "DE::BE::Berlin",

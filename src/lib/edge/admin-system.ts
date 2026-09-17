@@ -313,7 +313,11 @@ export async function handleSystemPerformanceAdmin(
   const totalEvents = toFiniteNumber(summaryRow?.totalEvents);
   const delayedEvents = toFiniteNumber(summaryRow?.delayedEvents);
   const futureSkewedEvents = toFiniteNumber(summaryRow?.futureSkewedEvents);
-  const latestCreatedAtSec = toNullableNumber(summaryRow?.latestCreatedAtSec);
+  const latestCreatedAtSec =
+    summaryRow?.latestCreatedAtSec === null ||
+    summaryRow?.latestCreatedAtSec === undefined
+      ? null
+      : toNullableNumber(summaryRow.latestCreatedAtSec);
   const latestCreatedAt =
     latestCreatedAtSec === null ? null : latestCreatedAtSec * 1000;
   const data: SystemPerformanceData = {
@@ -445,8 +449,7 @@ async function fetchDoDiagnostic(
       };
     }
     const payload = (await response.json()) as
-      | DoDiagnosticPayload
-      | { ok: false; error?: string };
+      DoDiagnosticPayload | { ok: false; error?: string };
     if ("ok" in payload && payload.ok === true) {
       return {
         ...baseEntry,
@@ -647,7 +650,7 @@ export async function handleE2eFlushAdmin(
     .first<{ id: string }>();
   if (!site) return nf("Site not found", undefined, req);
   const stub = env.INGEST_DO.get(env.INGEST_DO.idFromName(siteId));
-  const response = await stub.fetch("https://ingest.internal/flush", {
+  const response = await stub.fetch("https://ingest.internal/flush?force=1", {
     method: "POST",
   });
   if (!response.ok)

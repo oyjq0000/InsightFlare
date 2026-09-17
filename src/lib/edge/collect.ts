@@ -1,11 +1,15 @@
 import {
-  classifyCollectBotTraffic,
-  writeBotAnalyticsEvent,
-} from "@/lib/edge/bot-protection";
+  BLOCKING_FIELD_IDS,
+  type BlockingFieldId,
+  type BlockingRequestContext,
+  matchBlockingRules,
+  parseBlockingRules,
+} from "@/lib/blocking-rules";
+import { writeRequestAnalyticsPoint } from "@/lib/edge/analytics-engine/request-writer";
+import { classifyCollectBotTraffic } from "@/lib/edge/bot-protection";
 import { normalizeTrackerUaClientHints } from "@/lib/edge/client-hints";
 import { requestIp, verifyCollectToken } from "@/lib/edge/collect-token";
 import { expandCustomEventData } from "@/lib/edge/custom-event-json";
-import { writeNormalAnalyticsEvent } from "@/lib/edge/request-analytics";
 import {
   normalizeSiteSettingsKey,
   readSiteTrackingConfig,
@@ -21,7 +25,7 @@ import type { TrackerPayloadKind } from "@/lib/edge/types";
 import { jsonCloneRecord } from "@/lib/edge/utils";
 import { assertContentSize, BODY_SIZE_LIMITS } from "@/lib/form-helpers";
 import { jsonResponse } from "@/lib/response";
-import type { SiteTrackingConfig } from "@/lib/site-settings";
+import { normalizeSiteScriptSettings } from "@/lib/site-settings";
 
 import type { InvocationLogger } from "./observability-logger";
 
@@ -38,6 +42,29 @@ const SUPPORTED_KINDS = new Set<TrackerPayloadKind>([
   "custom_event",
   "identify",
 ]);
+
+const CUSTOM_BLOCK_REASON_BY_FIELD: Readonly<Record<BlockingFieldId, string>> =
+  {
+    domains: "blocked_domains",
+    paths: "blocked_paths",
+    queryParameters: "blocked_query_parameters",
+    referrers: "blocked_referrers",
+    userAgents: "blocked_user_agents",
+    ips: "blocked_ips",
+    asns: "blocked_asns",
+    countries: "blocked_countries",
+    regions: "blocked_regions",
+  };
+
+function customBlockReasons(fields: readonly BlockingFieldId[]): string[] {
+  const fieldSet = new Set(fields);
+  return [
+    "custom_block",
+    ...BLOCKING_FIELD_IDS.filter((field) => fieldSet.has(field)).map(
+      (field) => CUSTOM_BLOCK_REASON_BY_FIELD[field],
+    ),
+  ];
+}
 
 function pickSiteIdFromPayload(
   payload: TrackerClientPayload,
@@ -104,16 +131,6 @@ function normalizePayloadPathname(input: unknown): string {
   return value.slice(0, 2048);
 }
 
-function matchesBlockedPath(pathname: string, blockedPaths: string[]): boolean {
-  for (const blockedPath of blockedPaths) {
-    if (!blockedPath) continue;
-    if (pathname === blockedPath || pathname.startsWith(`${blockedPath}/`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function serializeHeaders(request: Request): Record<string, string> {
   const headers: Record<string, string> = {};
   request.headers.forEach((value, key) => {
@@ -155,6 +172,69 @@ function parseOriginHostname(origin: string | null): string {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function workerMetadata(request: Request): {
+  readonly asn?: number;
+  readonly country?: string;
+  readonly region?: string;
+} {
+  const cf = (request as Request & { readonly cf?: unknown }).cf;
+  if (!isRecord(cf)) return {};
+  const country = typeof cf.country === "string" ? cf.country.trim() : "";
+  const regionCode =
+    typeof cf.regionCode === "string" ? cf.regionCode.trim() : "";
+  return {
+    ...(typeof cf.asn === "number" && Number.isSafeInteger(cf.asn)
+      ? { asn: cf.asn }
+      : {}),
+    ...(country ? { country } : {}),
+    ...(country && regionCode ? { region: `${country}-${regionCode}` } : {}),
+  };
+}
+
+function canCheckPath(
+  payload: TrackerClientPayload,
+  kind: TrackerPayloadKind,
+): boolean {
+  return (
+    kind === "pageview" ||
+    kind === "custom_event" ||
+    kind === "visibility" ||
+    (kind === "leave" && coerceTrimmedString(payload.pathname, 4096).length > 0)
+  );
+}
+
+function blockingContext(
+  request: Request,
+  payload: TrackerClientPayload,
+  normalizedPayload: TrackerClientPayload,
+  originHostname: string,
+  kind: TrackerPayloadKind,
+): BlockingRequestContext {
+  const metadata = workerMetadata(request);
+  const hostname = normalizeClientHostname(
+    normalizedPayload.hostname ?? payload.hostname,
+  );
+  return {
+    hostname: hostname || originHostname,
+    originHostname,
+    pathname: canCheckPath(payload, kind)
+      ? normalizedPayload.pathname
+      : undefined,
+    query: payload.query,
+    referrer:
+      request.headers.get("referer") ||
+      request.headers.get("referrer") ||
+      payload.referrerUrl,
+    userAgent: request.headers.get("user-agent"),
+    ip: requestIp(request),
+    ...metadata,
+  };
+}
+
 function toCorsHeaders(origin: string | null): Record<string, string> {
   if (!origin) {
     return {
@@ -176,6 +256,8 @@ type CollectionDecision =
       allowOrigin: string | null;
       siteId: string;
       payload: null;
+      normalizedPayload?: TrackerClientPayload;
+      blockedFields?: readonly BlockingFieldId[];
       reason: string;
       detail?: Record<string, unknown>;
     }
@@ -184,6 +266,7 @@ type CollectionDecision =
       allowOrigin: string | null;
       siteId: string;
       payload: TrackerClientPayload;
+      scriptSettings: ReturnType<typeof normalizeSiteScriptSettings>;
     };
 
 async function decideCollectionPolicy(
@@ -249,34 +332,10 @@ async function decideCollectionPolicy(
     };
   }
 
-  const hasWhitelist =
-    Array.isArray(settings.domainWhitelist) &&
-    settings.domainWhitelist.length > 0;
-  if (
-    hasWhitelist &&
-    !settings.allowedHostnames.some(
-      (hostname) => hostname.trim().toLowerCase() === originHostname,
-    )
-  ) {
-    return {
-      shouldForward: false,
-      allowOrigin: origin,
-      siteId,
-      payload: null,
-      reason: "origin_not_allowed",
-      detail: {
-        origin,
-        originHostname,
-        allowedHostnames: settings.allowedHostnames,
-      },
-    };
-  }
-
   const normalizedPayloadResult = normalizeForwardPayload(
     payload,
     siteId,
     kind,
-    settings,
   );
   if (!normalizedPayloadResult.payload) {
     return {
@@ -289,11 +348,61 @@ async function decideCollectionPolicy(
     };
   }
 
+  const parsedBlockingRules = parseBlockingRules(settings);
+  if (!parsedBlockingRules.ok) {
+    logger?.warn("collect.blocking_rules_invalid");
+  }
+  const legacyDomainRules = parsedBlockingRules.fields.domains;
+  if (
+    legacyDomainRules.sourceVersion === 1 &&
+    legacyDomainRules.rules.length > 0 &&
+    !originHostname
+  ) {
+    return {
+      shouldForward: false,
+      allowOrigin: origin,
+      siteId,
+      payload: null,
+      normalizedPayload: normalizedPayloadResult.payload,
+      blockedFields: ["domains"],
+      reason: "origin_not_allowed",
+      detail: { origin, originHostname },
+    };
+  }
+  const blocking = matchBlockingRules(
+    parsedBlockingRules,
+    blockingContext(
+      request,
+      payload,
+      normalizedPayloadResult.payload,
+      originHostname,
+      kind,
+    ),
+  );
+  if (!blocking.allowed) {
+    const firstBlock = blocking.blockedBy[0];
+    return {
+      shouldForward: false,
+      allowOrigin: origin,
+      siteId,
+      payload: null,
+      normalizedPayload: normalizedPayloadResult.payload,
+      blockedFields: firstBlock
+        ? BLOCKING_FIELD_IDS.filter((field) =>
+            blocking.blockedBy.some((match) => match.field === field),
+          )
+        : undefined,
+      reason: firstBlock ? `blocked_${firstBlock.field}` : "blocked_by_rule",
+      detail: firstBlock ? { match: firstBlock } : undefined,
+    };
+  }
+
   return {
     shouldForward: true,
     allowOrigin: origin,
     siteId,
     payload: normalizedPayloadResult.payload,
+    scriptSettings: normalizeSiteScriptSettings(settings),
   };
 }
 
@@ -301,7 +410,6 @@ function normalizeForwardPayload(
   payload: TrackerClientPayload,
   siteId: string,
   kind: TrackerPayloadKind,
-  settings: SiteTrackingConfig,
 ): {
   payload: TrackerClientPayload | null;
   reason: string;
@@ -324,27 +432,13 @@ function normalizeForwardPayload(
     delete normalizedPayload.uaClientHints;
   }
 
-  const canCheckPath =
-    kind === "pageview" ||
-    kind === "custom_event" ||
-    kind === "visibility" ||
-    (kind === "leave" &&
-      coerceTrimmedString(payload.pathname, 4096).length > 0);
-
-  if (canCheckPath) {
+  if (canCheckPath(payload, kind)) {
     const pathname = normalizePayloadPathname(payload.pathname);
     if (!pathname) {
       return {
         payload: null,
         reason: "invalid_pathname",
         detail: { pathname: String(payload.pathname || "") },
-      };
-    }
-    if (matchesBlockedPath(pathname, settings.pathBlacklist)) {
-      return {
-        payload: null,
-        reason: "blocked_pathname",
-        detail: { pathname },
       };
     }
     normalizedPayload.pathname = pathname;
@@ -465,30 +559,6 @@ export async function handleCollectRequest(
       logger?.warn(`collect.rejected.${verification.reason}`);
       return noContent(origin);
     }
-
-    const classification = classifyCollectBotTraffic({
-      request: requestWithCf,
-      payload,
-      origin,
-    });
-
-    if (classification.isBot) {
-      logger?.info("collect.bot_diverted");
-      writeBotAnalyticsEvent(
-        env,
-        {
-          request: requestWithCf,
-          payload,
-          siteId,
-          origin,
-          traceId: trace.id,
-          receivedAt: trace.acceptedAt,
-          classification,
-        },
-        logger,
-      );
-      return noContent(origin);
-    }
   }
 
   if (payload?.kind === "custom_event") {
@@ -505,7 +575,83 @@ export async function handleCollectRequest(
     ? await logger.measure("collect.policy", decide)
     : await decide();
   if (!decision.shouldForward) {
+    if (
+      decision.normalizedPayload &&
+      decision.blockedFields &&
+      decision.blockedFields.length > 0
+    ) {
+      logger?.info("collect.custom_blocked");
+      writeRequestAnalyticsPoint(
+        env,
+        {
+          request: requestWithCf,
+          payload: decision.normalizedPayload,
+          siteId: decision.siteId,
+          origin: decision.allowOrigin,
+          traceId: trace.id,
+          receivedAt: trace.acceptedAt,
+          category: "custom_block",
+          disposition: "blocked",
+          reasons: customBlockReasons(decision.blockedFields),
+        },
+        logger,
+      );
+    }
     logger?.warn(`collect.rejected.${decision.reason}`);
+    return noContent(decision.allowOrigin);
+  }
+
+  const classification = classifyCollectBotTraffic({
+    request: requestWithCf,
+    payload: decision.payload,
+    origin,
+  });
+
+  if (
+    classification.category === "bot" &&
+    decision.scriptSettings.botProtectionEnabled !== false
+  ) {
+    logger?.info("collect.bot_diverted");
+    writeRequestAnalyticsPoint(
+      env,
+      {
+        request: requestWithCf,
+        payload: decision.payload,
+        siteId: decision.siteId,
+        origin: decision.allowOrigin,
+        traceId: trace.id,
+        receivedAt: trace.acceptedAt,
+        category: "bot",
+        disposition: "blocked",
+        reasons: classification.reasons,
+      },
+      logger,
+    );
+    return noContent(decision.allowOrigin);
+  }
+
+  if (
+    classification.category === "suspected_bot" &&
+    decision.scriptSettings.hostingProxyBlockingEnabled === true &&
+    (classification.reasons.includes("hosting_asn") ||
+      classification.reasons.includes("network_service_asn"))
+  ) {
+    logger?.info("collect.bot_diverted");
+    writeRequestAnalyticsPoint(
+      env,
+      {
+        request: requestWithCf,
+        payload: decision.payload,
+        siteId: decision.siteId,
+        origin: decision.allowOrigin,
+        traceId: trace.id,
+        receivedAt: trace.acceptedAt,
+        category: "suspected_bot",
+        disposition: "blocked",
+        reasons: classification.reasons,
+      },
+      logger,
+    );
     return noContent(decision.allowOrigin);
   }
 
@@ -523,7 +669,7 @@ export async function handleCollectRequest(
 
   logger?.info("collect.forward_queued");
 
-  writeNormalAnalyticsEvent(
+  writeRequestAnalyticsPoint(
     env,
     {
       request: requestWithCf,
@@ -532,6 +678,9 @@ export async function handleCollectRequest(
       origin: decision.allowOrigin,
       traceId: trace.id,
       receivedAt: trace.acceptedAt,
+      category: classification.category,
+      disposition: "included",
+      reasons: classification.reasons,
     },
     logger,
   );

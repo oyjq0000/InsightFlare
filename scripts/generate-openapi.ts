@@ -1,8 +1,9 @@
 #!/usr/bin/env tsx
 
+import { createHash } from "node:crypto";
+
 import { readFileSync, renameSync, writeFileSync } from "fs";
 import { resolve } from "path";
-import { format, resolveConfig } from "prettier";
 import YAML from "yaml";
 
 import { createScriptLogger } from "./shared/logger";
@@ -24,13 +25,7 @@ function getAppVersion(): string {
 }
 
 type HttpMethod =
-  | "get"
-  | "post"
-  | "put"
-  | "patch"
-  | "delete"
-  | "options"
-  | "head";
+  "get" | "post" | "put" | "patch" | "delete" | "options" | "head";
 
 interface Operation {
   operationId: string;
@@ -139,14 +134,23 @@ function paginatedEnvelope(
   return {
     description,
     allOf: [
-      ref("PaginatedEnvelope"),
+      ref("SuccessEnvelope"),
       {
         type: "object",
         description,
+        required: ["data"],
         properties: {
           data: {
-            type: "array",
-            items: itemSchema,
+            type: "object",
+            required: ["items", "pagination"],
+            properties: {
+              items: {
+                type: "array",
+                items: itemSchema,
+              },
+              pagination: ref("PaginationMeta"),
+            },
+            additionalProperties: false,
           },
         },
       },
@@ -167,6 +171,349 @@ function schemaRefName(schema: unknown): string | null {
       .split("/")
       .at(-1) ?? null
   );
+}
+
+type SchemaVisitor = (schema: Record<string, unknown>) => void;
+
+const schemaChildKeys = new Set([
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "else",
+  "if",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+]);
+
+const schemaChildArrayKeys = new Set([
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "prefixItems",
+]);
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const schema = value as Record<string, unknown>;
+  return [
+    "$defs",
+    "$ref",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "const",
+    "enum",
+    "format",
+    "items",
+    "not",
+    "oneOf",
+    "pattern",
+    "properties",
+    "type",
+  ].some((key) => key in schema);
+}
+
+function visitSchemaChildren(
+  schema: Record<string, unknown>,
+  visitor: SchemaVisitor,
+): void {
+  for (const [key, value] of Object.entries(schema)) {
+    if (
+      key === "properties" ||
+      key === "$defs" ||
+      key === "patternProperties"
+    ) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      for (const child of Object.values(value)) {
+        if (isSchemaObject(child)) visitor(child);
+      }
+      continue;
+    }
+    if (schemaChildKeys.has(key)) {
+      if (isSchemaObject(value)) visitor(value);
+      continue;
+    }
+    if (schemaChildArrayKeys.has(key)) {
+      if (!Array.isArray(value)) continue;
+      for (const child of value) {
+        if (isSchemaObject(child)) visitor(child);
+      }
+    }
+  }
+}
+
+function stableSchemaKey(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableSchemaKey).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${stableSchemaKey(
+            (value as Record<string, unknown>)[key],
+          )}`,
+      )
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hasNonComponentReference(schema: Record<string, unknown>): boolean {
+  let invalid = false;
+  const visit = (current: Record<string, unknown>) => {
+    if (
+      typeof current.$ref === "string" &&
+      !current.$ref.startsWith("#/components/")
+    ) {
+      invalid = true;
+      return;
+    }
+    visitSchemaChildren(current, visit);
+  };
+  visit(schema);
+  return invalid;
+}
+
+function forEachOperationSchema(
+  spec: OpenAPISpec,
+  visitor: (schema: Record<string, unknown>) => void,
+): void {
+  for (const pathItem of Object.values(spec.paths)) {
+    for (const operation of Object.values(pathItem)) {
+      if (
+        !operation ||
+        typeof operation !== "object" ||
+        Array.isArray(operation)
+      ) {
+        continue;
+      }
+      for (const parameter of operation.parameters ?? []) {
+        const schema =
+          parameter &&
+          typeof parameter === "object" &&
+          !Array.isArray(parameter)
+            ? (parameter as Record<string, unknown>).schema
+            : undefined;
+        if (isSchemaObject(schema)) {
+          visitor(schema);
+        }
+      }
+      const requestContents = (
+        operation.requestBody as
+          { content?: Record<string, unknown> } | undefined
+      )?.content;
+      for (const content of Object.values(requestContents ?? {})) {
+        const schema =
+          content && typeof content === "object"
+            ? (content as Record<string, unknown>).schema
+            : undefined;
+        if (isSchemaObject(schema)) {
+          visitor(schema);
+        }
+      }
+      for (const response of Object.values(operation.responses ?? {})) {
+        const responseContents = (
+          response as { content?: Record<string, unknown> } | undefined
+        )?.content;
+        for (const content of Object.values(responseContents ?? {})) {
+          const schema =
+            content && typeof content === "object"
+              ? (content as Record<string, unknown>).schema
+              : undefined;
+          if (isSchemaObject(schema)) {
+            visitor(schema);
+          }
+        }
+      }
+    }
+  }
+}
+
+function schemaNameHint(schema: Record<string, unknown>): string | undefined {
+  if (
+    schema.type === "string" &&
+    schema.format === "date-time" &&
+    typeof schema.pattern === "string"
+  ) {
+    return "IsoDateTime";
+  }
+
+  const properties = schema.properties;
+  if (
+    !properties ||
+    typeof properties !== "object" ||
+    Array.isArray(properties)
+  ) {
+    return undefined;
+  }
+  const names = new Set(Object.keys(properties));
+  if (names.has("error") && names.has("meta")) return "ApiV1ErrorEnvelope";
+  if (names.size === 1 && names.has("requestId")) return "ApiV1ResponseMeta";
+  if (
+    names.size === 3 &&
+    names.has("path") &&
+    names.has("code") &&
+    names.has("message")
+  ) {
+    return "ApiV1ErrorIssue";
+  }
+  if (
+    Array.isArray(schema.oneOf) &&
+    schema.oneOf.some(
+      (variant) =>
+        isSchemaObject(variant) &&
+        (variant.properties as Record<string, unknown> | undefined)?.kind &&
+        (
+          (variant.properties as Record<string, unknown>).kind as Record<
+            string,
+            unknown
+          >
+        ).const === "absolute",
+    ) &&
+    schema.oneOf.some(
+      (variant) =>
+        isSchemaObject(variant) &&
+        (variant.properties as Record<string, unknown> | undefined)?.kind &&
+        (
+          (variant.properties as Record<string, unknown>).kind as Record<
+            string,
+            unknown
+          >
+        ).const === "preset",
+    )
+  ) {
+    return "AnalyticsTimeRange";
+  }
+  return undefined;
+}
+
+function schemaComponentName(
+  schema: Record<string, unknown>,
+  key: string,
+): string {
+  const hint = schemaNameHint(schema);
+  if (hint) return hint;
+  return `SharedSchema_${createHash("sha1").update(key).digest("hex").slice(0, 12)}`;
+}
+
+function rewriteSchemaChildren(
+  schema: Record<string, unknown>,
+  componentNames: Map<string, string>,
+  replaceRoot: boolean,
+): Record<string, unknown> {
+  const key = stableSchemaKey(schema);
+  const componentName = componentNames.get(key);
+  if (replaceRoot && componentName) {
+    return { $ref: `#/components/schemas/${componentName}` };
+  }
+
+  const result: Record<string, unknown> = { ...schema };
+  for (const [childKey, value] of Object.entries(schema)) {
+    if (
+      childKey === "properties" ||
+      childKey === "$defs" ||
+      childKey === "patternProperties"
+    ) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        result[childKey] = Object.fromEntries(
+          Object.entries(value).map(([name, child]) => [
+            name,
+            isSchemaObject(child)
+              ? rewriteSchemaChildren(child, componentNames, true)
+              : child,
+          ]),
+        );
+      }
+      continue;
+    }
+    if (schemaChildKeys.has(childKey)) {
+      if (isSchemaObject(value)) {
+        result[childKey] = rewriteSchemaChildren(value, componentNames, true);
+      }
+      continue;
+    }
+    if (schemaChildArrayKeys.has(childKey) && Array.isArray(value)) {
+      result[childKey] = value.map((child) =>
+        isSchemaObject(child)
+          ? rewriteSchemaChildren(child, componentNames, true)
+          : child,
+      );
+    }
+  }
+  return result;
+}
+
+/** Factor repeated, self-contained JSON Schemas into OpenAPI components. */
+function deduplicateOperationSchemas(spec: OpenAPISpec): void {
+  const counts = new Map<
+    string,
+    { count: number; schema: Record<string, unknown> }
+  >();
+  const collect = (schema: Record<string, unknown>) => {
+    const key = stableSchemaKey(schema);
+    const entry = counts.get(key) ?? { count: 0, schema };
+    entry.count += 1;
+    counts.set(key, entry);
+    visitSchemaChildren(schema, collect);
+  };
+  forEachOperationSchema(spec, collect);
+
+  const componentNames = new Map<string, string>();
+  const definitions = new Map<string, Record<string, unknown>>();
+  const existingByKey = new Map<string, string>();
+  const usedNames = new Set(Object.keys(spec.components.schemas));
+  for (const [name, schema] of Object.entries(spec.components.schemas)) {
+    existingByKey.set(stableSchemaKey(schema), name);
+  }
+
+  const candidates = [...counts.entries()]
+    .filter(
+      ([, entry]) =>
+        entry.count >= 2 &&
+        stableSchemaKey(entry.schema).length >= 256 &&
+        !hasNonComponentReference(entry.schema),
+    )
+    .sort(([left], [right]) => left.localeCompare(right));
+
+  for (const [key, entry] of candidates) {
+    const existingName = existingByKey.get(key);
+    if (existingName) {
+      componentNames.set(key, existingName);
+      continue;
+    }
+    const baseName = schemaComponentName(entry.schema, key);
+    let name = baseName;
+    let suffix = 2;
+    while (usedNames.has(name)) name = `${baseName}${suffix++}`;
+    usedNames.add(name);
+    componentNames.set(key, name);
+    definitions.set(name, JSON.parse(JSON.stringify(entry.schema)));
+  }
+
+  if (componentNames.size === 0) return;
+  forEachOperationSchema(spec, (schema) => {
+    const rewritten = rewriteSchemaChildren(schema, componentNames, true);
+    for (const key of Object.keys(schema)) {
+      Reflect.deleteProperty(schema, key);
+    }
+    Object.assign(schema, rewritten);
+  });
+  for (const [name, schema] of definitions) {
+    spec.components.schemas[name] = rewriteSchemaChildren(
+      schema,
+      componentNames,
+      false,
+    );
+  }
 }
 
 function jsonContent(container: unknown) {
@@ -306,11 +653,14 @@ function list(data: unknown[], extraMeta: Record<string, unknown> = {}) {
 
 function paginated(data: unknown[]) {
   return {
-    data,
-    pagination: {
-      limit: 100,
-      nextCursor: "cur_next_abc",
-      hasMore: true,
+    data: {
+      items: data,
+      pagination: {
+        limit: 100,
+        returned: data.length,
+        hasMore: true,
+        nextCursor: "cur_next_abc",
+      },
     },
     meta: meta(),
   };
@@ -489,25 +839,15 @@ function buildSchemas(): Record<string, unknown> {
       },
       additionalProperties: false,
     },
-    Pagination: {
+    PaginationMeta: {
       type: "object",
       description: "Cursor pagination state.",
-      required: ["limit", "nextCursor", "hasMore"],
+      required: ["limit", "returned", "hasMore", "nextCursor"],
       properties: {
         limit: { type: "integer", minimum: 1, maximum: 1000 },
-        nextCursor: { type: ["string", "null"], maxLength: MAX_CURSOR_LENGTH },
+        returned: { type: "integer", minimum: 0, maximum: 1000 },
         hasMore: { type: "boolean" },
-      },
-    },
-    PaginatedEnvelope: {
-      type: "object",
-      description: "Standard cursor-paginated list response envelope.",
-      required: ["data", "pagination", "meta"],
-      properties: {
-        data: { type: "array", items: {} },
-        pagination: ref("Pagination"),
-        links: ref("LinkMap"),
-        meta: ref("Meta"),
+        nextCursor: { type: ["string", "null"], maxLength: MAX_CURSOR_LENGTH },
       },
       additionalProperties: false,
     },
@@ -1790,7 +2130,6 @@ function buildSchemas(): Record<string, unknown> {
                 oneOf: [
                   ref("SuccessEnvelope"),
                   ref("ListEnvelope"),
-                  ref("PaginatedEnvelope"),
                   ref("ErrorResponse"),
                   { type: "null" },
                 ],
@@ -3814,11 +4153,9 @@ function populateTypedApiV1Examples(spec: OpenAPISpec): void {
       for (const body of bodies) {
         if (!body || typeof body !== "object") continue;
         const content = (body as Record<string, unknown>).content as
-          | Record<string, unknown>
-          | undefined;
+          Record<string, unknown> | undefined;
         const jsonContent = content?.[json] as
-          | Record<string, unknown>
-          | undefined;
+          Record<string, unknown> | undefined;
         if (!jsonContent?.schema) continue;
         const example = exampleForSchema(spec, jsonContent.schema);
         if (example === undefined) continue;
@@ -4429,15 +4766,15 @@ function mergeProjectOperations(spec: OpenAPISpec): void {
     "notification-email/test": ["post"],
     "login-turnstile": ["get", "post", "patch", "delete"],
     "login-turnstile/test": ["post"],
-    "bot-analytics-config": ["get", "post", "patch", "delete"],
-    "bot-analytics": ["get"],
+    "analytics-engine-config": ["get", "post", "patch", "delete"],
+    "request-observation": ["get"],
     "notification-email-preview": ["post"],
     "notification-rules": ["get", "post", "patch", "delete"],
     "notification-rules/preview": ["post"],
     "notification-rules/run": ["post"],
     "notification-test": ["post"],
     "system-performance": ["get"],
-    "scheduled-tasks": ["get"],
+    "scheduled-tasks": ["get", "patch"],
     "do-diagnostic": ["get"],
     "e2e/flush": ["post"],
   };
@@ -4578,6 +4915,7 @@ async function main() {
   mergeApiV1TargetOperations(spec);
   mergeProjectOperations(spec);
   retainPublishedOperations(spec);
+  deduplicateOperationSchemas(spec);
   populateTypedApiV1Examples(spec);
   pruneUnusedComponents(spec);
   pruneUnusedTags(spec);
@@ -4585,13 +4923,7 @@ async function main() {
   const jsonPath = resolve(root, "docs", "openapi.json");
 
   writeAtomically(yamlPath, YAML.stringify(spec, { indent: 2 }));
-  const prettierOptions = await resolveConfig(jsonPath);
-  const formattedJson = await format(`${JSON.stringify(spec, null, 2)}\n`, {
-    ...prettierOptions,
-    filepath: jsonPath,
-    parser: "json",
-  });
-  writeAtomically(jsonPath, formattedJson);
+  writeAtomically(jsonPath, `${JSON.stringify(spec, null, 2)}\n`);
 
   rlog.success(`Generated ${yamlPath}`);
   rlog.success(`Generated ${jsonPath}`);

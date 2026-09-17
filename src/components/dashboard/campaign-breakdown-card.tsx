@@ -3,31 +3,47 @@ import { RiPriceTag3Line } from "@remixicon/react";
 
 import {
   type CampaignBreakdownRow,
+  type CampaignSortKey,
   type CampaignTab,
 } from "@/components/dashboard/campaign-utils";
 import {
+  ComparisonMetricToggle,
+  type ComparisonTableMetric,
+  createComparisonTableColumns,
+} from "@/components/dashboard/comparison-table";
+import {
   TabbedDataTableCard,
   type TabbedDataTableColumn,
+  type TabbedDataTableLoader,
   type TabbedDataTableRowAdapter,
-  type TabbedDataTableSortState,
   type TabbedDataTableTab,
 } from "@/components/dashboard/tabbed-data-table-card";
+import type { DashboardComparisonQuery } from "@/lib/dashboard/comparison-query";
 import { numberFormat } from "@/lib/dashboard/format";
 import type { Locale } from "@/lib/i18n/config";
 import type { AppMessages } from "@/lib/i18n/messages";
 import { formatI18nTemplate } from "@/lib/i18n/template";
 import { cn } from "@/lib/utils";
 
-type CampaignSortKey = "views" | "sessions";
-type CampaignBreakdownGroupKey = "acquisition" | "signals";
+export type CampaignBreakdownGroupKey = "acquisition" | "signals";
 
 interface CampaignBreakdownCardProps {
   locale: Locale;
   messages: AppMessages;
-  loadRows: (
-    tab: CampaignTab,
-    signal: AbortSignal,
-  ) => Promise<CampaignBreakdownRow[]>;
+  loader: TabbedDataTableLoader<
+    CampaignTab,
+    CampaignBreakdownRow,
+    CampaignSortKey
+  >;
+  comparisonQuery: DashboardComparisonQuery | null;
+  comparisonLabel: string;
+  comparisonMetricByGroup: Readonly<
+    Record<CampaignBreakdownGroupKey, ComparisonTableMetric>
+  >;
+  onComparisonMetricChange: (
+    group: CampaignBreakdownGroupKey,
+    metric: ComparisonTableMetric,
+  ) => void;
   requestKey: string;
 }
 
@@ -48,7 +64,11 @@ const CAMPAIGN_BREAKDOWN_GROUPS: Array<{
 export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
   locale,
   messages,
-  loadRows,
+  loader,
+  comparisonQuery,
+  comparisonLabel,
+  comparisonMetricByGroup,
+  onComparisonMetricChange,
   requestKey,
 }: CampaignBreakdownCardProps) {
   const tabMeta = useMemo<Record<CampaignTab, TabbedDataTableTab<CampaignTab>>>(
@@ -87,7 +107,43 @@ export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
       messages.campaigns.tabTerm,
     ],
   );
-  const columns = useMemo<
+  const comparisonColumnsByGroup = useMemo(
+    () =>
+      Object.fromEntries(
+        (
+          Object.keys(comparisonMetricByGroup) as CampaignBreakdownGroupKey[]
+        ).map((group) => {
+          const metric = comparisonMetricByGroup[group];
+          return [
+            group,
+            createComparisonTableColumns<CampaignBreakdownRow, CampaignTab>({
+              metric,
+              comparisonLabel,
+              locale,
+              messages,
+              getCurrent: (row) => row[metric] ?? 0,
+              getReference: (row) => row.reference?.[metric],
+              getChange: (row) => row.change?.[metric],
+            }),
+          ];
+        }),
+      ) as Record<
+        CampaignBreakdownGroupKey,
+        readonly TabbedDataTableColumn<
+          CampaignBreakdownRow,
+          CampaignSortKey,
+          CampaignTab
+        >[]
+      >,
+    [
+      comparisonLabel,
+      comparisonMetricByGroup.acquisition,
+      comparisonMetricByGroup.signals,
+      locale,
+      messages,
+    ],
+  );
+  const currentColumns = useMemo<
     readonly TabbedDataTableColumn<
       CampaignBreakdownRow,
       CampaignSortKey,
@@ -96,16 +152,16 @@ export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
   >(
     () => [
       {
-        key: "views",
+        key: "views" as const,
         label: messages.common.views,
-        getValue: (row) => row.views,
-        format: (value) => numberFormat(locale, value),
+        getValue: (row: CampaignBreakdownRow) => row.views,
+        format: (value: number) => numberFormat(locale, value),
       },
       {
-        key: "sessions",
+        key: "sessions" as const,
         label: messages.common.sessions,
-        getValue: (row) => row.sessions,
-        format: (value) => numberFormat(locale, value),
+        getValue: (row: CampaignBreakdownRow) => row.sessions,
+        format: (value: number) => numberFormat(locale, value),
       },
     ],
     [locale, messages.common.sessions, messages.common.views],
@@ -145,24 +201,6 @@ export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
     }),
     [],
   );
-  const compareRows = useCallback(
-    (
-      left: CampaignBreakdownRow,
-      right: CampaignBreakdownRow,
-      { sort }: { sort: TabbedDataTableSortState<CampaignSortKey> },
-    ) => {
-      const primary =
-        (left[sort.key] - right[sort.key]) *
-        (sort.direction === "asc" ? 1 : -1);
-      if (primary !== 0) return primary;
-      if (right.views !== left.views) return right.views - left.views;
-      if (right.sessions !== left.sessions) {
-        return right.sessions - left.sessions;
-      }
-      return left.label.localeCompare(right.label);
-    },
-    [],
-  );
   const labelColumnLabel = useCallback(
     (tab: TabbedDataTableTab<CampaignTab>) => tab.columnLabel ?? tab.label,
     [],
@@ -194,6 +232,7 @@ export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
 
       <div className="grid items-stretch gap-6 lg:grid-cols-2">
         {CAMPAIGN_BREAKDOWN_GROUPS.map((group) => {
+          const comparisonMetric = comparisonMetricByGroup[group.key];
           return (
             <div key={group.key} className="h-full min-w-0">
               <TabbedDataTableCard<
@@ -202,17 +241,40 @@ export const CampaignBreakdownCard = memo(function CampaignBreakdownCard({
                 CampaignSortKey
               >
                 tabs={groupTabsByKey[group.key]}
-                loadRows={loadRows}
-                requestKey={`${requestKey}:${group.key}`}
-                columns={columns}
+                loader={loader}
+                requestKey={`${requestKey}:${group.key}:${comparisonMetric}`}
+                defaultSort={
+                  comparisonQuery
+                    ? { key: "current", direction: "desc" }
+                    : undefined
+                }
+                columns={
+                  comparisonQuery
+                    ? comparisonColumnsByGroup[group.key]
+                    : currentColumns
+                }
                 rowAdapter={rowAdapter}
-                compareRows={compareRows}
                 labelColumnLabel={labelColumnLabel}
+                sortActionLabel={(label) =>
+                  formatI18nTemplate(messages.common.sortBy, { label })
+                }
                 loadingLabel={messages.common.loading}
                 emptyLabel={messages.campaigns.noTaggedTraffic}
                 className="h-full min-h-[420px]"
                 search={search}
                 export={exportConfig}
+                headerRight={
+                  comparisonQuery ? (
+                    <ComparisonMetricToggle
+                      metric={comparisonMetric}
+                      metrics={["views", "sessions"]}
+                      messages={messages}
+                      onMetricChange={(metric) =>
+                        onComparisonMetricChange(group.key, metric)
+                      }
+                    />
+                  ) : null
+                }
               />
             </div>
           );

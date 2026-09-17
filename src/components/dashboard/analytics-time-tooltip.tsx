@@ -10,7 +10,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import { RiSearchLine } from "@remixicon/react";
 import { toast } from "sonner";
 
@@ -18,6 +17,7 @@ import { useReportingTimeZone } from "@/components/time-zone-provider";
 import { AutoResizer } from "@/components/ui/auto-resizer";
 import { Badge } from "@/components/ui/badge";
 import { Clickable } from "@/components/ui/clickable";
+import { LayerPortal } from "@/components/ui/layer/layer-portal";
 import {
   Tooltip,
   TooltipContent,
@@ -337,7 +337,6 @@ function AnalyticsDetailsTooltipContent({
                     className="shrink-0 text-background/70 transition-colors hover:text-background"
                     onClick={item.action.onClick}
                     aria-label={item.action.label}
-                    title={item.action.label}
                   >
                     <RiSearchLine size="1.2em" />
                   </Clickable>
@@ -406,9 +405,6 @@ export function AnalyticsTimeTooltipProvider({
   const [active, setActive] = useState<ActiveTooltip | null>(null);
   const [content, setContent] = useState<ActiveTooltip | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(
-    null,
-  );
   const activeRef = useRef<ActiveTooltip | null>(null);
   const hideTimerRef = useRef<number | null>(null);
   const pointerMoveFrameRef = useRef<number | null>(null);
@@ -422,10 +418,6 @@ export function AnalyticsTimeTooltipProvider({
   const { browserTimeZone } = useReportingTimeZone();
 
   activeRef.current = active;
-
-  useEffect(() => {
-    setPortalContainer(document.body);
-  }, []);
 
   const updateActive = useCallback(
     (
@@ -644,18 +636,15 @@ export function AnalyticsTimeTooltipProvider({
         open={active !== null}
         onOpenChange={(open) => !open && scheduleHide()}
       >
-        {portalContainer
-          ? createPortal(
-              <TooltipTrigger asChild>
-                <span
-                  aria-hidden="true"
-                  className="pointer-events-none fixed z-0 opacity-0"
-                  style={anchorStyle}
-                />
-              </TooltipTrigger>,
-              portalContainer,
-            )
-          : null}
+        <LayerPortal slot="floating">
+          <TooltipTrigger asChild>
+            <span
+              aria-hidden="true"
+              className="pointer-events-none fixed opacity-0"
+              style={anchorStyle}
+            />
+          </TooltipTrigger>
+        </LayerPortal>
         {content ? (
           <TooltipContent
             ref={tooltipContentRef}

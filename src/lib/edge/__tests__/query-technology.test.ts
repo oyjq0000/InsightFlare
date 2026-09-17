@@ -177,6 +177,8 @@ function createSqliteTrendEnv(): { env: Env; d1: SqliteD1Database } {
       screen_width INTEGER,
       screen_height INTEGER,
       language TEXT NOT NULL DEFAULT '',
+      user_id TEXT,
+      user_name TEXT,
       perf_ttfb_ms REAL,
       perf_fcp_ms REAL,
       perf_lcp_ms REAL,
@@ -188,6 +190,27 @@ function createSqliteTrendEnv(): { env: Env; d1: SqliteD1Database } {
       ON visits(site_id, started_at);
   `);
   installVisitSiteIdentityFixture(d1.database);
+  d1.database.exec(`
+    CREATE TABLE custom_event_names (
+      id INTEGER PRIMARY KEY,
+      site_id TEXT NOT NULL,
+      name TEXT NOT NULL
+    );
+    CREATE TABLE custom_events (
+      event_pk INTEGER PRIMARY KEY,
+      event_id TEXT NOT NULL,
+      site_id TEXT NOT NULL,
+      site_pk INTEGER NOT NULL DEFAULT 1,
+      visit_id TEXT NOT NULL,
+      event_name_id INTEGER NOT NULL,
+      occurred_at INTEGER NOT NULL,
+      received_at INTEGER NOT NULL,
+      sequence INTEGER NOT NULL,
+      node_count INTEGER NOT NULL,
+      value_count INTEGER NOT NULL,
+      ae_synced_at INTEGER
+    );
+  `);
   return {
     env: {
       DB: d1 as unknown as D1Database,
@@ -1119,6 +1142,10 @@ describe("edge query technology D1 mapping", () => {
     );
     expect(calls[0].bindings).toEqual([
       ...visitBindings(siteId, window),
+      "desktop",
+      "us",
+      window.startMs,
+      window.endExclusiveMs,
       "desktop",
       "us",
       12,

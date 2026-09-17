@@ -21,6 +21,7 @@ import {
   fetchPagesDashboard,
   type PagesDashboardRow,
 } from "@/lib/dashboard/client-data";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import {
   durationFormat,
   intlLocale,
@@ -122,7 +123,6 @@ const PageTrafficCard = memo(function PageTrafficCard({
       href={href}
       className="group block h-full outline-none focus-visible:ring-1 focus-visible:ring-ring/60"
       aria-label={`${messages.pages.viewDetails}: ${displayPathname}`}
-      title={messages.pages.viewDetails}
     >
       <motion.div
         className="h-full"
@@ -249,7 +249,7 @@ export function PagesClientPage({
     window: TimeWindow;
   };
   const [sentinelNode, setSentinelNode] = useState<HTMLDivElement | null>(null);
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
   const pagesPerSessionFormatter = useMemo(
     () =>
       new Intl.NumberFormat(intlLocale(locale), {
@@ -278,17 +278,19 @@ export function PagesClientPage({
     ],
     queryFn: ({ pageParam, signal }) =>
       fetchPagesDashboard(siteId, window, filters, {
-        page: pageParam,
-        pageSize: PAGE_CARD_PAGE_SIZE,
+        cursor: pageParam,
+        limit: PAGE_CARD_PAGE_SIZE,
         signal,
       }),
-    initialPageParam: 1,
+    initialPageParam: null as string | null,
     getNextPageParam: (lastPage) =>
-      lastPage.meta.hasMore ? lastPage.meta.nextPage : undefined,
+      lastPage.data.pagination.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
     enabled: typeof window !== "undefined",
   });
   const items = useMemo(
-    () => data?.pages.flatMap((page) => page.data) ?? [],
+    () => data?.pages.flatMap((page) => page.data.items) ?? [],
     [data?.pages],
   );
   const loadingInitial = isPending;

@@ -1,3 +1,9 @@
+import {
+  GOAL_TIMESERIES_MAX_BUCKETS,
+  goalQueryCost,
+} from "@/lib/edge/analytics/application/goal-cost";
+import { createD1SiteQueryRuntime } from "@/lib/edge/analytics/composition/d1";
+import { queryGoalDefinition } from "@/lib/edge/analytics/composition/d1/goals";
 import type { SimpleDimensionKey } from "@/lib/edge/analytics/composition/protocol/dimensions-contract-adapter";
 import type { OverviewTab } from "@/lib/edge/analytics/composition/protocol/overview-tabs-contract-adapter";
 import {
@@ -21,7 +27,13 @@ import {
   type SsrTeamDashboardData,
 } from "@/lib/edge/analytics/composition/ssr-query-runtime";
 import {
+  buildCalendarBucketPlan,
   createQueryTime,
+  createTimeRange,
+  filterConditionCount,
+  normalizeReportingTimeZone,
+  parseFilterUrlForAudience,
+  parseGoalFilter,
   siteQueryContext,
   teamQueryContext,
 } from "@/lib/edge/analytics/contract";
@@ -50,7 +62,6 @@ export interface PrivateTeamDashboardAdapterInput {
 
 const SIMPLE_DIMENSIONS: Readonly<Record<string, SimpleDimensionKey>> = {
   countries: "country",
-  "page-query": "page.query",
   "page-hash": "page.hash",
   "utm-source": "utm.source",
   "utm-medium": "utm.medium",
@@ -87,6 +98,7 @@ const TECHNOLOGY_HANDLERS: Readonly<Record<string, TechnologyHandlerName>> = {
 };
 
 const OVERVIEW_TABS: Readonly<Record<string, OverviewTab>> = {
+  "page-query": "page.query",
   "overview-page-path": "page.path",
   "overview-page-title": "page.title",
   "overview-page-hostname": "page.hostname",
@@ -186,6 +198,18 @@ export function executePrivateQuery(
           input.url,
           20,
           true,
+          ctx,
+          queryContext,
+        ),
+    );
+  }
+  if (input.pathname === "referrer-summary") {
+    return import("../composition/protocol/pages-contract-adapter").then(
+      ({ handleReferrerSummaryContract }) =>
+        handleReferrerSummaryContract(
+          input.env,
+          input.siteId,
+          input.url,
           ctx,
           queryContext,
         ),
@@ -326,8 +350,6 @@ export function executePrivateQuery(
                   input.url.searchParams.get("includeContext") !== "false",
                 includeBreakdowns:
                   input.url.searchParams.get("includeBreakdowns") !== "false",
-                includeFields:
-                  input.url.searchParams.get("includeFields") !== "false",
               }
             : undefined,
         ),
@@ -405,6 +427,24 @@ export function executePrivateQuery(
         ),
     );
   }
+  if (
+    input.pathname === "visitor-events" ||
+    input.pathname === "visitor-sessions" ||
+    input.pathname === "session-events"
+  ) {
+    return import("../composition/protocol/journeys-contract-adapter").then(
+      ({ handleJourneyCollectionContract }) =>
+        handleJourneyCollectionContract(
+          input.env,
+          input.siteId,
+          input.url,
+          input.pathname as
+            "visitor-events" | "visitor-sessions" | "session-events",
+          ctx,
+          queryContext,
+        ),
+    );
+  }
   if (input.pathname === "filter-values") {
     return import("../composition/protocol/filter-values-contract-adapter").then(
       ({ handleFilterValuesContract }) =>
@@ -445,6 +485,75 @@ export function executePrivateQuery(
     return import("../composition/protocol/funnels-contract-adapter").then(
       ({ handleFunnel }) =>
         handleFunnel(input.env, input.siteId, input.url, ctx, input.request),
+    );
+  }
+  if (
+    input.pathname === "goal-summary" ||
+    input.pathname === "goal-timeseries"
+  ) {
+    return (async () => {
+      const operation = operationForQueryRoute(input.pathname);
+      const window = parseWindow(input.url);
+      if (!window) return badRequest("Invalid time window");
+      const interval = parseInterval(input.url);
+      const filters = parseFilterUrlForAudience("private-dashboard", input.url);
+      const goalId = input.url.searchParams.get("id")?.trim() ?? "";
+      let goal;
+      try {
+        goal = await queryGoalDefinition(input.env, input.siteId, goalId);
+      } catch {
+        return queryErrorResponse({ kind: "internal", operation });
+      }
+      if (!goal) return notFound();
+      const cost = goalQueryCost({
+        filters,
+        startMs: window.startMs,
+        endExclusiveMs: window.endExclusiveMs,
+        timeZone: window.timeZone,
+        goalFilterComplexity: filterConditionCount(parseGoalFilter(goal)),
+        ...(input.pathname === "goal-timeseries" ? { interval } : {}),
+      });
+      if ((cost.bucketCount ?? 1) > GOAL_TIMESERIES_MAX_BUCKETS) {
+        return queryErrorResponse({
+          kind: "range-not-supported",
+          reason: "too-many-buckets",
+        });
+      }
+      const diagnostics = createD1ReadDiagnostics();
+      const query = {
+        context: queryContext,
+        time: createQueryTime(
+          window.startMs,
+          window.endExclusiveMs,
+          window.timeZone,
+          window.nowMs,
+        ),
+        filters,
+        goalId,
+        ...(input.pathname === "goal-timeseries" ? { interval } : {}),
+      };
+      return createD1SiteQueryRuntime({
+        env: input.env,
+        siteId: input.siteId,
+        diagnostics,
+      })
+        .execute(operation, query, { cost })
+        .then((result) => {
+          if (!result.ok) return queryErrorResponse(result.error);
+          if (!result.data) return notFound();
+          return jsonResponseWith(
+            ctx!,
+            { ok: true, data: result.data },
+            200,
+            analyticsDiagnosticHeaders(result.meta.source, diagnostics),
+          );
+        });
+    })();
+  }
+  if (input.pathname === "goals") {
+    return import("../composition/protocol/goals-contract-adapter").then(
+      ({ handleGoal }) =>
+        handleGoal(input.env, input.siteId, input.url, ctx, input.request),
     );
   }
   const dimension = SIMPLE_DIMENSIONS[input.pathname];
@@ -502,6 +611,35 @@ function teamResponseContext(
     : undefined;
 }
 
+function teamDashboardBucketError(
+  window: ReturnType<typeof parseWindow> extends infer Window
+    ? Exclude<Window, null>
+    : never,
+  interval: ReturnType<typeof parseInterval>,
+): Response | null {
+  // Keep the HTTP boundary aligned with the D1 provider's 2,000-bucket
+  // calendar plan limit. The provider intentionally truncates plans for
+  // callers that need partial data, but a dashboard trend must reject before
+  // that truncated plan is interpolated into a large SQL CASE expression.
+  if (
+    !Number.isSafeInteger(window.startMs) ||
+    !Number.isSafeInteger(window.endExclusiveMs)
+  ) {
+    return badRequest("Invalid time window");
+  }
+  const plan = buildCalendarBucketPlan({
+    range: createTimeRange(window.startMs, window.endExclusiveMs),
+    granularity: interval,
+    reportingTimeZone: normalizeReportingTimeZone(window.timeZone),
+  });
+  return plan.truncated
+    ? queryErrorResponse({
+        kind: "range-not-supported",
+        reason: "too-many-buckets",
+      })
+    : null;
+}
+
 /** Private team-dashboard adapter after authentication has resolved its team
  * scope. Caching remains at the Hono boundary. */
 export async function executePrivateTeamDashboard(
@@ -509,12 +647,16 @@ export async function executePrivateTeamDashboard(
 ): Promise<Response> {
   const window = parseWindow(input.url);
   if (!window) return badRequest("Invalid time window");
+  const interval = parseInterval(input.url);
+  const bucketError = teamDashboardBucketError(window, interval);
+  if (bucketError) return bucketError;
   const diagnostics = createD1ReadDiagnostics();
+  const filters = parseFilterUrlForAudience("private-dashboard", input.url);
   const result = await createTeamDashboardQueryRuntime({
     env: input.env,
     teamId: input.teamId,
     window,
-    interval: parseInterval(input.url),
+    interval,
     allowedSiteIds: input.allowedSiteIds,
     diagnostics,
   }).execute<SsrTeamDashboardData>("team-dashboard", {
@@ -529,6 +671,7 @@ export async function executePrivateTeamDashboard(
       window.timeZone,
       window.nowMs,
     ),
+    filters,
   });
   if (!result.ok) {
     return queryErrorResponse(result.error);

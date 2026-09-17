@@ -58,6 +58,7 @@ interface AggregationCandidateRow {
   siteId: string;
   sitePk: number;
   aggregatedUntilHour: number | null;
+  lastError: string | null;
 }
 
 interface AggregationStateRow {
@@ -92,17 +93,26 @@ interface BasicRollupRow {
   perfInpCount: number;
 }
 
-interface DistinctVisitorRow {
+interface AggregateSiteHourMetricRow {
+  metric: "basic" | "visitor" | "session";
   siteId: string;
   hourBucket: number;
-  visitorId: string;
-}
-
-interface SessionCountRow {
-  siteId: string;
-  hourBucket: number;
-  sessionId: string;
-  visitCount: number;
+  views: number | null;
+  durationMsSum: number | null;
+  durationMsCount: number | null;
+  perfTtfbSum: number | null;
+  perfTtfbCount: number | null;
+  perfFcpSum: number | null;
+  perfFcpCount: number | null;
+  perfLcpSum: number | null;
+  perfLcpCount: number | null;
+  perfClsSum: number | null;
+  perfClsCount: number | null;
+  perfInpSum: number | null;
+  perfInpCount: number | null;
+  visitorId: string | null;
+  sessionId: string | null;
+  visitCount: number | null;
 }
 
 interface StoredRollupRow extends BasicRollupRow {
@@ -1087,7 +1097,8 @@ async function listAggregationCandidates(
       SELECT
         s.id AS siteId,
         si.site_pk AS sitePk,
-        st.aggregated_until_hour AS aggregatedUntilHour
+        st.aggregated_until_hour AS aggregatedUntilHour,
+        st.last_error AS lastError
       FROM sites s
       INNER JOIN site_identities si
         ON si.site_id = s.id
@@ -1113,6 +1124,10 @@ async function listAggregationCandidates(
       row.aggregatedUntilHour === null || row.aggregatedUntilHour === undefined
         ? null
         : Number(row.aggregatedUntilHour),
+    lastError:
+      row.lastError === null || row.lastError === undefined
+        ? null
+        : String(row.lastError),
   }));
 }
 
@@ -1202,11 +1217,30 @@ async function aggregateSiteHours(
   if (endHour < startHour) return 0;
   const startMs = startHour * ONE_HOUR_MS;
   const endExclusiveMs = (endHour + 1) * ONE_HOUR_MS;
-  const basic = await env.DB.prepare(
+  const metrics = await env.DB.prepare(
     `
+      WITH base_visits AS MATERIALIZED (
+        SELECT
+          site_id AS siteId,
+          CAST(started_at / ? AS INTEGER) AS hourBucket,
+          duration_ms,
+          perf_ttfb_ms,
+          perf_fcp_ms,
+          perf_lcp_ms,
+          perf_cls,
+          perf_inp_ms,
+          visitor_id,
+          session_id
+        FROM visits
+        WHERE site_pk = ?
+          AND started_at >= ?
+          AND started_at < ?
+          AND status != 'open'
+      )
       SELECT
-        site_id AS siteId,
-        CAST(started_at / ? AS INTEGER) AS hourBucket,
+        'basic' AS metric,
+        siteId,
+        hourBucket,
         COUNT(*) AS views,
         COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 0 THEN duration_ms ELSE 0 END), 0) AS durationMsSum,
         COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 0 THEN 1 ELSE 0 END), 0) AS durationMsCount,
@@ -1219,22 +1253,72 @@ async function aggregateSiteHours(
         COALESCE(SUM(CASE WHEN perf_cls IS NOT NULL THEN perf_cls ELSE 0 END), 0) AS perfClsSum,
         COALESCE(SUM(CASE WHEN perf_cls IS NOT NULL THEN 1 ELSE 0 END), 0) AS perfClsCount,
         COALESCE(SUM(CASE WHEN perf_inp_ms IS NOT NULL THEN perf_inp_ms ELSE 0 END), 0) AS perfInpSum,
-        COALESCE(SUM(CASE WHEN perf_inp_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS perfInpCount
-      FROM visits
-      WHERE site_pk = ?
-        AND started_at >= ?
-        AND started_at < ?
-        AND status != 'open'
-      GROUP BY site_pk, hourBucket
-      ORDER BY hourBucket ASC
+        COALESCE(SUM(CASE WHEN perf_inp_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS perfInpCount,
+        CAST(NULL AS TEXT) AS visitorId,
+        CAST(NULL AS TEXT) AS sessionId,
+        CAST(NULL AS INTEGER) AS visitCount
+      FROM base_visits
+      GROUP BY siteId, hourBucket
+
+      UNION ALL
+
+      SELECT
+        'visitor' AS metric,
+        siteId,
+        hourBucket,
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        visitor_id AS visitorId,
+        CAST(NULL AS TEXT) AS sessionId,
+        CAST(NULL AS INTEGER) AS visitCount
+      FROM base_visits
+      WHERE TRIM(COALESCE(visitor_id, '')) != ''
+      GROUP BY siteId, hourBucket, visitor_id
+
+      UNION ALL
+
+      SELECT
+        'session' AS metric,
+        siteId,
+        hourBucket,
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS INTEGER),
+        CAST(NULL AS TEXT) AS visitorId,
+        session_id AS sessionId,
+        COUNT(*) AS visitCount
+      FROM base_visits
+      WHERE TRIM(COALESCE(session_id, '')) != ''
+      GROUP BY siteId, hourBucket, session_id
+      ORDER BY metric ASC, hourBucket ASC, visitorId ASC, sessionId ASC
     `,
   )
     .bind(ONE_HOUR_MS, sitePk, startMs, endExclusiveMs)
-    .all<BasicRollupRow>();
+    .all<AggregateSiteHourMetricRow>();
   const byHour = new Map<number, StoredRollupRow>();
-  for (const row of basic.results) {
+  for (const row of metrics.results.filter((item) => item.metric === "basic")) {
     byHour.set(Number(row.hourBucket), {
-      ...row,
       siteId,
       hourBucket: Number(row.hourBucket),
       views: Number(row.views ?? 0),
@@ -1258,53 +1342,20 @@ async function aggregateSiteHours(
     });
   }
 
-  const visitors = await env.DB.prepare(
-    `
-      SELECT
-        site_id AS siteId,
-        CAST(started_at / ? AS INTEGER) AS hourBucket,
-        visitor_id AS visitorId
-      FROM visits
-      WHERE site_pk = ?
-        AND started_at >= ?
-        AND started_at < ?
-        AND status != 'open'
-        AND TRIM(COALESCE(visitor_id, '')) != ''
-      GROUP BY site_pk, hourBucket, visitor_id
-      ORDER BY hourBucket ASC, visitor_id ASC
-    `,
-  )
-    .bind(ONE_HOUR_MS, sitePk, startMs, endExclusiveMs)
-    .all<DistinctVisitorRow>();
   const visitorsByHour = new Map<number, string[]>();
-  for (const row of visitors.results) {
+  for (const row of metrics.results.filter(
+    (item) => item.metric === "visitor",
+  )) {
     const hour = Number(row.hourBucket);
     const list = visitorsByHour.get(hour) ?? [];
     list.push(String(row.visitorId ?? ""));
     visitorsByHour.set(hour, list);
   }
 
-  const sessions = await env.DB.prepare(
-    `
-      SELECT
-        site_id AS siteId,
-        CAST(started_at / ? AS INTEGER) AS hourBucket,
-        session_id AS sessionId,
-        COUNT(*) AS visitCount
-      FROM visits
-      WHERE site_pk = ?
-        AND started_at >= ?
-        AND started_at < ?
-        AND status != 'open'
-        AND TRIM(COALESCE(session_id, '')) != ''
-      GROUP BY site_pk, hourBucket, session_id
-      ORDER BY hourBucket ASC, session_id ASC
-    `,
-  )
-    .bind(ONE_HOUR_MS, sitePk, startMs, endExclusiveMs)
-    .all<SessionCountRow>();
   const sessionsByHour = new Map<number, Array<[string, number]>>();
-  for (const row of sessions.results) {
+  for (const row of metrics.results.filter(
+    (item) => item.metric === "session",
+  )) {
     const hour = Number(row.hourBucket);
     const list = sessionsByHour.get(hour) ?? [];
     list.push([String(row.sessionId ?? ""), Number(row.visitCount ?? 0)]);
@@ -1493,6 +1544,15 @@ export async function runHourlyAggregation(
 
   for (const site of candidates) {
     if (!site.siteId) continue;
+    if (
+      site.aggregatedUntilHour !== null &&
+      Number.isFinite(site.aggregatedUntilHour) &&
+      site.aggregatedUntilHour >= endHour &&
+      site.lastError === null
+    ) {
+      summary.sitesAlreadyCurrent += 1;
+      continue;
+    }
     const firstClosedHour = await readFirstClosedHour(
       env,
       site.sitePk,

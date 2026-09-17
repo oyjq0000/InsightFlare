@@ -137,6 +137,7 @@ import {
   parseDemoNumber,
   withoutDemoGeoFilter,
 } from "@/lib/realtime/mock/filters";
+import { demoPage } from "@/lib/realtime/mock/pagination";
 import {
   buildPathTransitionGraph,
   nextPath,
@@ -210,6 +211,7 @@ export function generateDemoEventsSummary(
   const events = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   );
   const sessions = new Set(events.map((event) => event.visit.sessionId));
   const visitors = new Set(events.map((event) => event.visit.visitorId));
@@ -242,7 +244,7 @@ export function generateDemoEventsTrend(
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   const interval = parseDemoInterval(params.interval);
-  const limit = parseDemoLimit(params.limit, 8, 1, 12);
+  const limit = parseDemoLimit(params.limit, 8, 1, 18);
   const filters = parseDemoFilters(params);
   const eventName = normalizeDemoFilterValue(params.eventName);
   const timeZone = parseDemoTimeZone(params);
@@ -251,6 +253,7 @@ export function generateDemoEventsTrend(
   const allEvents = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   ).filter((event) => !eventName || event.eventName === eventName);
   const buckets = buildDemoTimeBuckets(from, to, interval, timeZone);
   const seriesRows = demoEventDimensionRows(
@@ -333,9 +336,11 @@ export function generateDemoEventsTrend(
 
   return {
     ok: true,
-    interval,
-    series,
-    data,
+    data: {
+      interval,
+      series,
+      data,
+    },
   };
 }
 
@@ -345,7 +350,6 @@ export function generateDemoEventsRecords(
 ): Record<string, unknown> {
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
-  const pageSize = parseDemoLimit(params.pageSize, 80, 1, 120);
   const filters = parseDemoFilters(params);
   const eventName = normalizeDemoFilterValue(params.eventName);
   const search = normalizeDemoSearch(params);
@@ -354,6 +358,7 @@ export function generateDemoEventsRecords(
   const events = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   ).filter((event) => {
     if (eventName && event.eventName !== eventName) return false;
     return demoValuesIncludeSearch(search, [
@@ -368,23 +373,27 @@ export function generateDemoEventsRecords(
     ]);
   });
   const sorted = sortDemoEventRecords(events, parseDemoEventRecordSort(params));
-  const offset =
-    params.cursor !== undefined
-      ? parseDemoLimit(params.cursor, 0, 0, 1_000_000)
-      : (parseDemoLimit(params.page, 1, 1, 10_000) - 1) * pageSize;
-  const requestedRows = sorted.slice(offset, offset + pageSize + 1);
-  const hasMore = requestedRows.length > pageSize;
-  const currentRows = requestedRows.slice(0, pageSize);
+  const page = demoPage(
+    sorted.map(demoEventRecordFromFact),
+    params,
+    {
+      operation: "events-records",
+      siteId,
+      from,
+      to,
+      filters,
+      eventName,
+      search,
+      sort: parseDemoEventRecordSort(params),
+    },
+    80,
+    1_000,
+    false,
+  );
 
   return {
     ok: true,
-    data: currentRows.map(demoEventRecordFromFact),
-    meta: {
-      pageSize,
-      returned: currentRows.length,
-      hasMore,
-      nextCursor: hasMore ? String(offset + pageSize) : null,
-    },
+    data: page,
   };
 }
 
@@ -401,10 +410,17 @@ export function generateDemoEventTypeDetail(
   const allEvents = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   );
   const events = allEvents.filter((event) => event.eventName === eventName);
   const sessions = new Set(events.map((event) => event.visit.sessionId));
   const visitors = new Set(events.map((event) => event.visit.visitorId));
+  const includeContext =
+    params.includeContext === undefined ||
+    parseDemoBoolean(params.includeContext);
+  const includeBreakdowns =
+    params.includeBreakdowns === undefined ||
+    parseDemoBoolean(params.includeBreakdowns);
   const interval = parseDemoInterval(params.interval);
   const timeZone = parseDemoTimeZone(params);
   const buckets = buildDemoTimeBuckets(from, to, interval, timeZone);
@@ -453,34 +469,37 @@ export function generateDemoEventTypeDetail(
         ),
       })),
     },
-    breakdowns: {
-      pages: demoEventDimensionRows(
-        dataset,
-        events,
-        8,
-        (event) => event.visit.pathname,
-      ),
-      countries: demoEventDimensionRows(
-        dataset,
-        events,
-        8,
-        (event) => event.visit.country,
-      ),
-      devices: demoEventDimensionRows(
-        dataset,
-        events,
-        8,
-        (event) => event.visit.deviceType,
-      ),
-      browsers: demoEventDimensionRows(
-        dataset,
-        events,
-        8,
-        (event) => event.visit.browser,
-      ),
-    },
-    cards: demoEventContextCards(dataset, events, 100),
-    fields: collectDemoEventFields(events, 100),
+    breakdowns: includeBreakdowns
+      ? {
+          pages: demoEventDimensionRows(
+            dataset,
+            events,
+            8,
+            (event) => event.visit.pathname,
+          ),
+          countries: demoEventDimensionRows(
+            dataset,
+            events,
+            8,
+            (event) => event.visit.country,
+          ),
+          devices: demoEventDimensionRows(
+            dataset,
+            events,
+            8,
+            (event) => event.visit.deviceType,
+          ),
+          browsers: demoEventDimensionRows(
+            dataset,
+            events,
+            8,
+            (event) => event.visit.browser,
+          ),
+        }
+      : { pages: [], countries: [], devices: [], browsers: [] },
+    cards: includeContext
+      ? demoEventContextCards(dataset, events, 100)
+      : demoEventContextCards(dataset, [], 0),
   };
 }
 
@@ -491,19 +510,56 @@ export function generateDemoEventTypeContext(
   const eventName = normalizeDemoFilterValue(params.eventName) ?? "";
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
-  const limit = parseDemoLimit(params.limit, 100, 1, 100);
   const filters = parseDemoFilters(params);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
   const events = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   ).filter((event) => event.eventName === eventName);
+
+  const cards = demoEventContextCards(dataset, events, 100);
+  if (params.cards !== undefined) {
+    const selected = new Set(
+      String(params.cards)
+        .split(",")
+        .map((key) => key.trim())
+        .filter(Boolean),
+    );
+    const cardGroups: Array<[string, string, string]> = [
+      ["page", "path", "path"],
+      ["page", "query", "query"],
+      ["page", "title", "title"],
+      ["page", "hostname", "hostname"],
+      ["page", "entry", "entry"],
+      ["page", "exit", "exit"],
+      ["source", "domain", "sourceDomain"],
+      ["source", "link", "sourceLink"],
+      ["client", "browser", "browser"],
+      ["client", "osVersion", "osVersion"],
+      ["client", "deviceType", "deviceType"],
+      ["client", "language", "language"],
+      ["client", "screenSize", "screenSize"],
+      ["geo", "country", "country"],
+      ["geo", "region", "region"],
+      ["geo", "city", "city"],
+      ["geo", "continent", "continent"],
+      ["geo", "timezone", "timezone"],
+      ["geo", "organization", "organization"],
+    ];
+    for (const [group, key, selectedKey] of cardGroups) {
+      if (!selected.has(selectedKey)) {
+        (cards[group as keyof typeof cards] as Record<string, unknown>)[key] =
+          [];
+      }
+    }
+  }
 
   return {
     ok: true,
     eventName,
-    cards: demoEventContextCards(dataset, events, limit),
+    cards,
   };
 }
 
@@ -521,14 +577,27 @@ export function generateDemoEventFields(
   const events = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   ).filter((event) => !eventName || event.eventName === eventName);
+  const binding = {
+    operation: "event-fields",
+    siteId,
+    from,
+    to,
+    filters,
+    eventName,
+    sort: "events:desc,occurrences:desc,path:asc,valueType:asc",
+  };
 
   return {
     ok: true,
     eventName,
-    fields: collectDemoEventFields(
-      events,
-      parseDemoLimit(params.limit, 100, 1, 200),
+    data: demoPage(
+      collectDemoEventFields(events, Math.max(1, events.length)),
+      params,
+      binding,
+      100,
+      200,
     ),
   };
 }
@@ -543,14 +612,25 @@ export function generateDemoEventTypeFieldValues(
   const from = parseDemoNumber(params.from, 0);
   const to = parseDemoNumber(params.to, Date.now());
   const filters = parseDemoFilters(params);
-  const limit = parseDemoLimit(params.limit, 25, 1, 100);
   const search = normalizeDemoSearch(params);
+  const binding = {
+    operation: "event-field-values",
+    siteId,
+    from,
+    to,
+    filters,
+    eventName,
+    fieldPath,
+    fieldValueType,
+    search,
+    sort: "occurrences:desc,events:desc,value:asc",
+  };
   if (!fieldPath || !fieldValueType) {
     return {
       ok: true,
       fieldPath,
       fieldValueType,
-      data: [],
+      data: demoPage([], params, binding, 25, 100),
     };
   }
   const dataset = buildDemoFactDataset(siteId, from, to);
@@ -558,15 +638,20 @@ export function generateDemoEventTypeFieldValues(
   const events = filterDemoCustomEventsByPayload(
     createDemoCustomEventFacts(filtered.visits),
     filters,
+    { allVisits: dataset.visits },
   ).filter((event) => !eventName || event.eventName === eventName);
 
+  const rows = collectDemoEventFieldValues(
+    events,
+    fieldPath,
+    fieldValueType,
+    Math.max(1, events.length),
+  ).filter((row) => demoValuesIncludeSearch(search, [row.value]));
   return {
     ok: true,
     fieldPath,
     fieldValueType,
-    data: collectDemoEventFieldValues(events, fieldPath, fieldValueType, limit)
-      .filter((row) => demoValuesIncludeSearch(search, [row.value]))
-      .slice(0, limit),
+    data: demoPage(rows, params, binding, 25, 100),
   };
 }
 
@@ -578,10 +663,9 @@ export function generateDemoEventRecordDetail(
   const to = parseDemoNumber(params.to, Date.now());
   const eventId = normalizeDemoFilterValue(params.eventId) ?? "";
   const dataset = buildDemoFactDataset(siteId, from, to);
-  const event =
-    createDemoCustomEventFacts(dataset.visits).find(
-      (item) => item.eventId === eventId,
-    ) ?? createDemoCustomEventFacts(dataset.visits)[0];
+  const event = createDemoCustomEventFacts(dataset.visits).find(
+    (item) => item.eventId === eventId,
+  );
   if (!event) return { ok: true, data: null };
   const record = demoEventRecordFromFact(event);
   const queryString =
@@ -617,8 +701,8 @@ export function generateDemoEventRecordDetail(
         visitId: record.visitId,
         sessionId: record.sessionId,
         visitorId: record.visitorId,
-        userId: `demo-user-${event.visit.visitorId}`,
-        userName: `Demo visitor ${event.visit.visitorId.slice(-6).toUpperCase()}`,
+        userId: event.visit.userId ?? "",
+        userName: event.visit.userName ?? "",
         pathname: record.pathname,
         queryString,
         hash: "",

@@ -1,7 +1,7 @@
 import {
-  defaultBotAnalyticsConfig,
-  redactBotAnalyticsConfig,
-} from "@/lib/bot-analytics-config";
+  defaultAnalyticsEngineConfig,
+  redactAnalyticsEngineConfig,
+} from "@/lib/analytics-engine-config";
 import { normalizeTimeZone } from "@/lib/dashboard/time-zone";
 import type { NotificationPreferencesData } from "@/lib/edge-client";
 import type {
@@ -43,6 +43,7 @@ import {
   getDemoTeams,
   getDemoUser,
   getDemoUsers,
+  updateDemoScheduledTasks,
 } from "@/lib/realtime/mock/admin";
 import {
   generateDemoDimension,
@@ -51,6 +52,7 @@ import {
   generateDemoPagesDashboard,
   generateDemoPerformance,
   generateDemoReferrers,
+  generateDemoReferrerSummary,
   generateDemoRetention,
   generateDemoTrend,
 } from "@/lib/realtime/mock/analytics";
@@ -78,12 +80,22 @@ import {
   generateDemoEventTypeDetail,
   generateDemoEventTypeFieldValues,
 } from "@/lib/realtime/mock/events";
-import { parseDemoInterval } from "@/lib/realtime/mock/filters";
+import {
+  normalizeDemoSearch,
+  parseDemoInterval,
+} from "@/lib/realtime/mock/filters";
 import {
   createDemoFunnel,
   deleteDemoFunnel,
   generateDemoFunnels,
+  updateDemoFunnel,
 } from "@/lib/realtime/mock/funnels";
+import {
+  createDemoGoal,
+  deleteDemoGoal,
+  generateDemoGoals,
+  updateDemoGoal,
+} from "@/lib/realtime/mock/goals";
 import {
   generateDemoJourneyEventDetail,
   generateDemoSessionDetail,
@@ -91,6 +103,11 @@ import {
   generateDemoVisitorDetail,
   generateDemoVisitors,
 } from "@/lib/realtime/mock/journeys";
+import {
+  DemoInvalidCursorError,
+  demoPage,
+  type DemoPagination,
+} from "@/lib/realtime/mock/pagination";
 import { generateDemoRequestObservationData } from "@/lib/realtime/mock/request-observation";
 import { handleDemoSavedFilters } from "@/lib/realtime/mock/saved-filters";
 import {
@@ -134,6 +151,421 @@ const demoNotificationPreferences: NotificationPreferencesData = {
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function paginateDemoEnvelope(
+  result: unknown,
+  params: Record<string, string | number>,
+  fallbackLimit: number,
+  operation = "demo-collection",
+  maxLimit = 200,
+): unknown {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return result;
+  }
+  const record = result as Record<string, unknown>;
+  if (!Array.isArray(record.data)) return result;
+  const comparisonEnabled =
+    params.compare === "same" || params.compare === "previous";
+  const comparisonMetric = params.metric === "visitors" ? "visitors" : "views";
+  const comparisonSortBy =
+    params.sortBy === "reference" || params.sortBy === "change"
+      ? params.sortBy
+      : "current";
+  const getRowValue = (row: unknown, key: string): number => {
+    if (!row || typeof row !== "object") return 0;
+    const value = (row as Record<string, unknown>)[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  const getComparisonMetric = (row: unknown, side: "current" | "reference") =>
+    getRowValue(
+      side === "reference" && row && typeof row === "object"
+        ? (row as Record<string, unknown>).reference
+        : row,
+      comparisonMetric,
+    );
+  const getComparisonChange = (row: unknown): number => {
+    if (!row || typeof row !== "object") return Number.NEGATIVE_INFINITY;
+    const change = (row as Record<string, unknown>).change;
+    if (!change || typeof change !== "object") return Number.NEGATIVE_INFINITY;
+    const metricChange = (change as Record<string, unknown>)[comparisonMetric];
+    if (!metricChange || typeof metricChange !== "object") {
+      return Number.NEGATIVE_INFINITY;
+    }
+    const relative = (metricChange as Record<string, unknown>).relative;
+    return typeof relative === "number" && Number.isFinite(relative)
+      ? relative
+      : Number.NEGATIVE_INFINITY;
+  };
+  const getRowLabel = (row: unknown): string => {
+    if (!row || typeof row !== "object") return "";
+    const record = row as Record<string, unknown>;
+    for (const key of [
+      "label",
+      "value",
+      "pathname",
+      "referrer",
+      "channel",
+      "key",
+    ]) {
+      const value = String(record[key] ?? "").trim();
+      if (value) return value;
+    }
+    return "";
+  };
+  const compareRows = (left: unknown, right: unknown): number => {
+    const direction = params.direction === "asc" ? 1 : -1;
+    const leftValue = comparisonEnabled
+      ? comparisonSortBy === "reference"
+        ? getComparisonMetric(left, "reference")
+        : comparisonSortBy === "change"
+          ? getComparisonChange(left)
+          : getComparisonMetric(left, "current")
+      : getRowValue(
+          left,
+          params.sort === "sessions" || params.sort === "visitors"
+            ? String(params.sort)
+            : "views",
+        );
+    const rightValue = comparisonEnabled
+      ? comparisonSortBy === "reference"
+        ? getComparisonMetric(right, "reference")
+        : comparisonSortBy === "change"
+          ? getComparisonChange(right)
+          : getComparisonMetric(right, "current")
+      : getRowValue(
+          right,
+          params.sort === "sessions" || params.sort === "visitors"
+            ? String(params.sort)
+            : "views",
+        );
+    if (comparisonEnabled && comparisonSortBy === "change") {
+      const leftNew =
+        getComparisonMetric(left, "reference") === 0 &&
+        getComparisonMetric(left, "current") > 0;
+      const rightNew =
+        getComparisonMetric(right, "reference") === 0 &&
+        getComparisonMetric(right, "current") > 0;
+      if (leftNew !== rightNew) {
+        return direction === 1 ? (leftNew ? 1 : -1) : leftNew ? -1 : 1;
+      }
+    }
+    return (
+      (leftValue - rightValue) * direction ||
+      getRowLabel(left).localeCompare(getRowLabel(right))
+    );
+  };
+  const requestBinding = Object.fromEntries(
+    Object.entries(params).filter(([key]) => key !== "cursor"),
+  );
+  const page = demoPage(
+    record.data,
+    params,
+    {
+      operation,
+      request: requestBinding,
+    },
+    fallbackLimit,
+    maxLimit,
+    true,
+    {
+      search: normalizeDemoSearch(params),
+      getSearchValues: (row) => [getRowLabel(row)],
+      compare:
+        comparisonEnabled ||
+        params.sort === "views" ||
+        params.sort === "sessions" ||
+        params.sort === "visitors"
+          ? compareRows
+          : undefined,
+    },
+  );
+  return {
+    ...record,
+    data: page,
+  };
+}
+
+function demoShareTrendDimension(result: unknown): {
+  series: unknown[];
+  data: unknown[];
+} {
+  const record =
+    result && typeof result === "object"
+      ? (result as Record<string, unknown>)
+      : {};
+  return {
+    series: Array.isArray(record.series) ? record.series : [],
+    data: Array.isArray(record.data) ? record.data : [],
+  };
+}
+
+const DEMO_CLIENT_DIMENSIONS = new Set([
+  "browser",
+  "operatingSystem",
+  "osVersion",
+  "deviceType",
+  "language",
+  "screenSize",
+]);
+const DEMO_UTM_DIMENSIONS = new Set([
+  "source",
+  "medium",
+  "campaign",
+  "term",
+  "content",
+]);
+const DEMO_CROSS_DIMENSIONS = new Set([
+  "page.path",
+  "page.title",
+  "page.hostname",
+  "page.query",
+  "page.hash",
+  "referrer.domain",
+  "referrer.url",
+  "utm.source",
+  "utm.medium",
+  "utm.campaign",
+  "utm.term",
+  "utm.content",
+  "client.browser",
+  "browser",
+  "client.browserVersion",
+  "client.browserEngine",
+  "client.os",
+  "operatingSystem",
+  "client.osVersion",
+  "osVersion",
+  "client.deviceType",
+  "deviceType",
+  "client.language",
+  "language",
+  "client.screenSize",
+  "screenSize",
+  "geo.country",
+  "geo.region",
+  "geo.city",
+  "geo.continent",
+  "geo.timeZone",
+  "geo.organization",
+]);
+const DEMO_EVENT_CONTEXT_CARDS = new Set([
+  "path",
+  "query",
+  "title",
+  "hostname",
+  "entry",
+  "exit",
+  "sourceDomain",
+  "sourceLink",
+  "browser",
+  "osVersion",
+  "deviceType",
+  "language",
+  "screenSize",
+  "country",
+  "region",
+  "city",
+  "continent",
+  "timezone",
+  "organization",
+]);
+
+function parseDemoRequestNumber(value: string | number): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string" || value.length === 0) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function invalidDemoTimeWindow(
+  params: Record<string, string | number>,
+): boolean {
+  const hasFrom = Object.prototype.hasOwnProperty.call(params, "from");
+  const hasTo = Object.prototype.hasOwnProperty.call(params, "to");
+  const from = hasFrom ? parseDemoRequestNumber(params.from!) : null;
+  const to = hasTo ? parseDemoRequestNumber(params.to!) : null;
+  if ((hasFrom && from === null) || (hasTo && to === null)) return true;
+
+  const now = Date.now();
+  const start = from ?? now - 24 * 60 * 60 * 1000;
+  const end = to ?? now;
+  return start < 0 || end <= start;
+}
+
+function demoRequiredParam(
+  params: Record<string, string | number>,
+  key: string,
+): boolean {
+  return String(params[key] ?? "").trim().length > 0;
+}
+
+function validateDemoAnalyticsRequest(
+  path: string,
+  params: Record<string, string | number>,
+): unknown | null {
+  const isAnalyticsRequest =
+    path.includes("/api/private/") ||
+    path.includes("/api/public/share/") ||
+    path.includes("/api/v1/");
+  if (!isAnalyticsRequest) return null;
+  if (invalidDemoTimeWindow(params))
+    return demoBadRequest("Invalid time window");
+
+  if (path.includes("/client-dimension-trend")) {
+    const dimension = String(params.dimension ?? "").trim();
+    if (!DEMO_CLIENT_DIMENSIONS.has(dimension)) {
+      return demoBadRequest("Invalid client dimension");
+    }
+  }
+  if (path.includes("/utm-dimension-trend")) {
+    const dimension = String(params.dimension ?? "").trim();
+    if (!DEMO_UTM_DIMENSIONS.has(dimension)) {
+      return demoBadRequest("Invalid UTM dimension");
+    }
+  }
+  if (path.includes("/client-cross-breakdown")) {
+    const primary = String(params.primaryDimension ?? "").trim();
+    const secondary = String(params.secondaryDimension ?? "").trim();
+    if (!DEMO_CROSS_DIMENSIONS.has(primary)) {
+      return demoBadRequest("Unsupported primary dimension");
+    }
+    if (!DEMO_CROSS_DIMENSIONS.has(secondary)) {
+      return demoBadRequest("Unsupported secondary dimension");
+    }
+    if (primary === secondary) {
+      return demoBadRequest("Primary and secondary dimensions must differ");
+    }
+  }
+  if (path.includes("/event-type-context")) {
+    if (!demoRequiredParam(params, "eventName")) {
+      return demoBadRequest("eventName is required");
+    }
+    const cards = [
+      ...new Set(
+        String(params.cards ?? "")
+          .split(",")
+          .map((card) => card.trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (
+      cards.length === 0 ||
+      cards.length > DEMO_EVENT_CONTEXT_CARDS.size ||
+      cards.some((card) => !DEMO_EVENT_CONTEXT_CARDS.has(card))
+    ) {
+      return demoBadRequest("Valid context cards are required");
+    }
+  }
+  if (
+    path.includes("/event-type-detail") &&
+    !demoRequiredParam(params, "eventName")
+  ) {
+    return demoBadRequest("eventName is required");
+  }
+  if (
+    path.includes("/event-type-field-values") ||
+    path.includes("/event-fields/values")
+  ) {
+    if (String(params.fieldPath ?? "").length === 0) {
+      return demoBadRequest("fieldPath is required");
+    }
+    if (!demoRequiredParam(params, "fieldValueType")) {
+      return demoBadRequest("fieldValueType is required");
+    }
+    const fieldValueType = String(params.fieldValueType).trim();
+    if (
+      !new Set(["string", "number", "boolean", "object", "array", "null"]).has(
+        fieldValueType,
+      )
+    ) {
+      return demoBadRequest("Invalid fieldValueType");
+    }
+  }
+  if (
+    path.includes("/event-record-detail") &&
+    !demoRequiredParam(params, "eventId")
+  ) {
+    return demoBadRequest("eventId is required");
+  }
+  if (
+    (path.includes("/journey-event-detail") ||
+      path.includes("/journey-events/detail")) &&
+    !demoRequiredParam(params, "eventId")
+  ) {
+    return demoBadRequest("Missing eventId");
+  }
+  if (
+    (path.includes("/journey-event-detail") ||
+      path.includes("/journey-events/detail")) &&
+    params.eventKind !== undefined &&
+    !new Set(["pageview", "session_start", "leave"]).has(
+      String(params.eventKind).trim(),
+    )
+  ) {
+    return demoBadRequest("Invalid eventKind");
+  }
+  if (
+    path.includes("/visitor-detail") &&
+    !demoRequiredParam(params, "visitorId")
+  ) {
+    return demoBadRequest("Missing visitorId");
+  }
+  if (
+    path.includes("/session-detail") &&
+    !demoRequiredParam(params, "sessionId")
+  ) {
+    return demoBadRequest("Missing sessionId");
+  }
+  if (path.includes("/visitor-events") || path.includes("/visitor-sessions")) {
+    if (!demoRequiredParam(params, "visitorId")) {
+      return demoBadRequest("Missing visitorId");
+    }
+  }
+  if (
+    path.includes("/session-events") &&
+    !demoRequiredParam(params, "sessionId")
+  ) {
+    return demoBadRequest("Missing sessionId");
+  }
+  return null;
+}
+
+function paginateDemoDetailCollection(
+  result: unknown,
+  collectionKey: "events" | "sessions",
+  params: Record<string, string | number>,
+): { ok: boolean; data: { items: unknown[]; pagination: DemoPagination } } {
+  const record =
+    result && typeof result === "object"
+      ? (result as Record<string, unknown>)
+      : {};
+  const detail =
+    record.data && typeof record.data === "object"
+      ? (record.data as Record<string, unknown>)
+      : {};
+  const rows = Array.isArray(detail[collectionKey])
+    ? detail[collectionKey]
+    : [];
+  const collectionId =
+    collectionKey === "events"
+      ? String(params.visitorId ?? params.sessionId ?? "")
+      : String(params.visitorId ?? "");
+  const page = demoPage(
+    rows,
+    params,
+    {
+      operation:
+        collectionKey === "events" ? "detail-events" : "detail-sessions",
+      siteId: String(params.siteId ?? ""),
+      collectionKey,
+      collectionId,
+      from: params.from ?? null,
+      to: params.to ?? null,
+    },
+    100,
+  );
+  return { ok: record.ok !== false, data: page };
 }
 
 function requestRuleId(body: unknown): string {
@@ -512,7 +944,30 @@ function handleDemoRequestInner(options: {
   const locale = demoLocale(params.locale ?? bodyRecord.locale);
 
   if (path.startsWith("/api/private/saved-filters")) {
-    return handleDemoSavedFilters({ path, method, siteId, body: options.body });
+    return handleDemoSavedFilters({
+      path,
+      method,
+      siteId,
+      params,
+      body: options.body,
+    });
+  }
+
+  if (
+    method === "POST" &&
+    (path.includes("/analytics/goals/summary") ||
+      path.includes("/analytics/goals/timeseries"))
+  ) {
+    return generateDemoGoals(siteId, {
+      ...params,
+      id: String(bodyRecord.goalId ?? params.id ?? ""),
+      operation: path.includes("/analytics/goals/timeseries")
+        ? "goal-timeseries"
+        : "goal-summary",
+      ...(bodyRecord.interval !== undefined
+        ? { interval: String(bodyRecord.interval) }
+        : {}),
+    });
   }
 
   // Write operations → read-only stub
@@ -522,24 +977,51 @@ function handleDemoRequestInner(options: {
     method === "PUT" ||
     method === "DELETE"
   ) {
-    if (path.includes("/admin/bot-analytics-config")) {
+    if (path.includes("/admin/scheduled-tasks")) {
+      const retentionPatch =
+        bodyRecord.retention &&
+        typeof bodyRecord.retention === "object" &&
+        !Array.isArray(bodyRecord.retention)
+          ? (bodyRecord.retention as Record<string, unknown>)
+          : {};
+      if (bodyRecord.retentionDays !== undefined) {
+        retentionPatch.scheduledTaskLogsDays = bodyRecord.retentionDays;
+      }
+      updateDemoScheduledTasks({
+        taskKey: bodyRecord.taskKey,
+        enabled: bodyRecord.enabled,
+        retention:
+          Object.keys(retentionPatch).length > 0 ? retentionPatch : undefined,
+        retentionDays: bodyRecord.retentionDays,
+      });
+      return { ok: true, data: generateDemoScheduledTasks(params) };
+    }
+    if (path.includes("/admin/analytics-engine-config")) {
       const body = bodyRecord as {
         accountId?: unknown;
         apiToken?: unknown;
         clearApiToken?: unknown;
       };
-      const config = defaultBotAnalyticsConfig();
+      const config = defaultAnalyticsEngineConfig();
       config.accountId = String(body.accountId ?? "").trim();
       config.configured =
         body.clearApiToken !== true &&
         String(body.apiToken ?? "").trim() !== "";
       config.apiTokenHint = config.configured ? "••••demo" : "";
       config.updatedAt = Date.now();
-      return { ok: true, data: redactBotAnalyticsConfig(config) };
+      return { ok: true, data: redactAnalyticsEngineConfig(config) };
     }
     if (path.includes("/funnels")) {
       if (method === "DELETE") return deleteDemoFunnel(siteId, params);
+      if (method === "PATCH")
+        return updateDemoFunnel(siteId, params, options.body);
       return createDemoFunnel(siteId, options.body);
+    }
+    if (path.includes("/goals") && !path.includes("/analytics/goals/")) {
+      if (method === "DELETE") return deleteDemoGoal(siteId, params);
+      if (method === "PATCH")
+        return updateDemoGoal(siteId, params, options.body);
+      return createDemoGoal(siteId, options.body);
     }
     // Special cases that need real-looking responses
     if (path === "/api/public/session" || path.includes("/auth/login")) {
@@ -933,12 +1415,12 @@ function handleDemoRequestInner(options: {
     const tid = teamId || getDemoTeams()[0].id;
     return { ok: true, data: generateDemoApiKeys(tid) };
   }
-  if (path.includes("/admin/bot-analytics-config")) {
-    const config = defaultBotAnalyticsConfig();
-    return { ok: true, data: redactBotAnalyticsConfig(config) };
+  if (path.includes("/admin/analytics-engine-config")) {
+    const config = defaultAnalyticsEngineConfig();
+    return { ok: true, data: redactAnalyticsEngineConfig(config) };
   }
-  if (path.includes("/admin/bot-analytics")) {
-    return demoBotAnalyticsResponse(params);
+  if (path.includes("/admin/request-observation")) {
+    return demoRequestObservationResponse(params);
   }
   if (path.includes("/admin/notification-rules")) {
     return {
@@ -1012,73 +1494,183 @@ function handleDemoRequestInner(options: {
   }
 
   // Analytics query routes
+  const analyticsValidationError = validateDemoAnalyticsRequest(path, params);
+  if (analyticsValidationError) return analyticsValidationError;
   if (path.includes("/filter-values")) {
-    return generateDemoFilterValues(
-      siteId,
+    return paginateDemoEnvelope(
+      generateDemoFilterValues(
+        siteId,
+        params,
+        path.includes("/api/public/")
+          ? "public-share"
+          : path.includes("/api/v1/")
+            ? "api-v1"
+            : "private-dashboard",
+      ),
       params,
+      50,
       path.includes("/api/public/")
-        ? "public-share"
+        ? "filter-values:public"
         : path.includes("/api/v1/")
-          ? "api-v1"
-          : "private-dashboard",
+          ? "filter-values:api-v1"
+          : "filter-values:private",
+      500,
     );
   }
   if (path.includes("/overview-page-path")) {
-    return generateDemoOverviewPageTab(siteId, params, "path");
+    return paginateDemoEnvelope(
+      generateDemoOverviewPageTab(siteId, params, "path"),
+      params,
+      100,
+      "overview-page-path",
+    );
   }
   if (path.includes("/overview-page-title")) {
-    return generateDemoOverviewPageTab(siteId, params, "title");
+    return paginateDemoEnvelope(
+      generateDemoOverviewPageTab(siteId, params, "title"),
+      params,
+      100,
+      "overview-page-title",
+    );
   }
   if (path.includes("/overview-page-hostname")) {
-    return generateDemoOverviewPageTab(siteId, params, "hostname");
+    return paginateDemoEnvelope(
+      generateDemoOverviewPageTab(siteId, params, "hostname"),
+      params,
+      100,
+      "overview-page-hostname",
+    );
   }
   if (path.includes("/overview-page-entry")) {
-    return generateDemoOverviewPageTab(siteId, params, "entry");
+    return paginateDemoEnvelope(
+      generateDemoOverviewPageTab(siteId, params, "entry"),
+      params,
+      100,
+      "overview-page-entry",
+    );
   }
   if (path.includes("/overview-page-exit")) {
-    return generateDemoOverviewPageTab(siteId, params, "exit");
+    return paginateDemoEnvelope(
+      generateDemoOverviewPageTab(siteId, params, "exit"),
+      params,
+      100,
+      "overview-page-exit",
+    );
   }
   if (path.includes("/overview-source-channel")) {
-    return generateDemoOverviewSourceTab(siteId, params, "channel");
+    return paginateDemoEnvelope(
+      generateDemoOverviewSourceTab(siteId, params, "channel"),
+      params,
+      100,
+      "overview-source-channel",
+    );
   }
   if (path.includes("/overview-source-domain")) {
-    return generateDemoOverviewSourceTab(siteId, params, "domain");
+    return paginateDemoEnvelope(
+      generateDemoOverviewSourceTab(siteId, params, "domain"),
+      params,
+      100,
+      "overview-source-domain",
+    );
   }
   if (path.includes("/overview-source-link")) {
-    return generateDemoOverviewSourceTab(siteId, params, "link");
+    return paginateDemoEnvelope(
+      generateDemoOverviewSourceTab(siteId, params, "link"),
+      params,
+      100,
+      "overview-source-link",
+    );
+  }
+  if (path.includes("/referrer-summary")) {
+    return generateDemoReferrerSummary(siteId, params);
   }
   if (path.includes("/overview-client-browser")) {
-    return generateDemoOverviewClientTab(siteId, params, "browser");
+    return paginateDemoEnvelope(
+      generateDemoOverviewClientTab(siteId, params, "browser"),
+      params,
+      100,
+      "overview-client-browser",
+    );
   }
   if (path.includes("/overview-client-os-version")) {
-    return generateDemoOverviewClientTab(siteId, params, "osVersion");
+    return paginateDemoEnvelope(
+      generateDemoOverviewClientTab(siteId, params, "osVersion"),
+      params,
+      100,
+      "overview-client-os-version",
+    );
   }
   if (path.includes("/overview-client-device-type")) {
-    return generateDemoOverviewClientTab(siteId, params, "deviceType");
+    return paginateDemoEnvelope(
+      generateDemoOverviewClientTab(siteId, params, "deviceType"),
+      params,
+      100,
+      "overview-client-device-type",
+    );
   }
   if (path.includes("/overview-client-language")) {
-    return generateDemoOverviewClientTab(siteId, params, "language");
+    return paginateDemoEnvelope(
+      generateDemoOverviewClientTab(siteId, params, "language"),
+      params,
+      100,
+      "overview-client-language",
+    );
   }
   if (path.includes("/overview-client-screen-size")) {
-    return generateDemoOverviewClientTab(siteId, params, "screenSize");
+    return paginateDemoEnvelope(
+      generateDemoOverviewClientTab(siteId, params, "screenSize"),
+      params,
+      100,
+      "overview-client-screen-size",
+    );
   }
   if (path.includes("/overview-geo-country")) {
-    return generateDemoOverviewGeoTab(siteId, params, "country");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "country"),
+      params,
+      100,
+      "overview-geo-country",
+    );
   }
   if (path.includes("/overview-geo-region")) {
-    return generateDemoOverviewGeoTab(siteId, params, "region");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "region"),
+      params,
+      100,
+      "overview-geo-region",
+    );
   }
   if (path.includes("/overview-geo-city")) {
-    return generateDemoOverviewGeoTab(siteId, params, "city");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "city"),
+      params,
+      100,
+      "overview-geo-city",
+    );
   }
   if (path.includes("/overview-geo-continent")) {
-    return generateDemoOverviewGeoTab(siteId, params, "continent");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "continent"),
+      params,
+      100,
+      "overview-geo-continent",
+    );
   }
   if (path.includes("/overview-geo-timezone")) {
-    return generateDemoOverviewGeoTab(siteId, params, "timezone");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "timezone"),
+      params,
+      100,
+      "overview-geo-timezone",
+    );
   }
   if (path.includes("/overview-geo-organization")) {
-    return generateDemoOverviewGeoTab(siteId, params, "organization");
+    return paginateDemoEnvelope(
+      generateDemoOverviewGeoTab(siteId, params, "organization"),
+      params,
+      100,
+      "overview-geo-organization",
+    );
   }
   if (path.includes("/overview-geo-points")) {
     return generateDemoGeoPoints(siteId, params);
@@ -1088,6 +1680,27 @@ function handleDemoRequestInner(options: {
     path.includes("/journey-events/detail")
   ) {
     return generateDemoJourneyEventDetail(siteId, params);
+  }
+  if (path.includes("/visitor-events")) {
+    return paginateDemoDetailCollection(
+      generateDemoVisitorDetail(siteId, params),
+      "events",
+      params,
+    );
+  }
+  if (path.includes("/visitor-sessions")) {
+    return paginateDemoDetailCollection(
+      generateDemoVisitorDetail(siteId, params),
+      "sessions",
+      params,
+    );
+  }
+  if (path.includes("/session-events")) {
+    return paginateDemoDetailCollection(
+      generateDemoSessionDetail(siteId, params),
+      "events",
+      params,
+    );
   }
   if (path.includes("/event-record-detail")) {
     return generateDemoEventRecordDetail(siteId, params);
@@ -1130,6 +1743,15 @@ function handleDemoRequestInner(options: {
   if (path.includes("/funnels")) {
     return generateDemoFunnels(siteId, params);
   }
+  if (path.includes("/goal-summary") || path.includes("/goal-timeseries")) {
+    params.operation = path.includes("goal-timeseries")
+      ? "goal-timeseries"
+      : "goal-summary";
+    return generateDemoGoals(siteId, params);
+  }
+  if (path.includes("/goals")) {
+    return generateDemoGoals(siteId, params);
+  }
   if (path.includes("/retention")) {
     return generateDemoRetention(siteId, params);
   }
@@ -1155,8 +1777,12 @@ function handleDemoRequestInner(options: {
     return {
       ok: true,
       interval: parseDemoInterval(params.interval),
-      source: generateDemoReferrerTrend(siteId, params),
-      channel: generateDemoChannelTrend(siteId, params),
+      source: demoShareTrendDimension(
+        generateDemoReferrerTrend(siteId, params, { maxLimit: 12 }),
+      ),
+      channel: demoShareTrendDimension(
+        generateDemoChannelTrend(siteId, params, { maxLimit: 12 }),
+      ),
     };
   }
   if (path.includes("/referrer-dimension-trend")) {
@@ -1190,10 +1816,17 @@ function handleDemoRequestInner(options: {
     return generateDemoSessions(siteId, params);
   }
   if (path.includes("/pages")) {
-    return generateDemoPages(siteId, params);
+    return generateDemoPages(siteId, params, {
+      includeTabs: !path.includes("/api/public/") && !path.includes("/api/v1/"),
+      defaultLimit: 20,
+    });
   }
   if (path.includes("/referrers")) {
-    return generateDemoReferrers(siteId, params);
+    const isPublic = path.includes("/api/public/");
+    return generateDemoReferrers(siteId, params, {
+      allowFullUrl: !isPublic,
+      defaultLimit: isPublic ? 8 : 20,
+    });
   }
   if (path.includes("/utm-source")) {
     return generateDemoUtmDimension(siteId, "source", params);
@@ -1217,7 +1850,7 @@ function handleDemoRequestInner(options: {
     return generateDemoDimension(siteId, "countries", params);
   }
   if (path.includes("/devices")) {
-    return generateDemoDimension(siteId, "devices", params);
+    return demoNotFoundResponse();
   }
   if (path.includes("/page-hash")) {
     return generateDemoDimension(siteId, "page-hash", params);
@@ -1236,8 +1869,18 @@ function handleDemoRequestInner(options: {
     const subPath = publicMatch[1];
     if (subPath === "overview") return generateDemoOverview(siteId, params);
     if (subPath === "trend") return generateDemoTrend(siteId, params);
-    if (subPath === "pages") return generateDemoPages(siteId, params);
-    if (subPath === "referrers") return generateDemoReferrers(siteId, params);
+    if (subPath === "pages")
+      return generateDemoPages(siteId, params, {
+        includeTabs: false,
+        defaultLimit: 20,
+      });
+    if (subPath === "referrers")
+      return generateDemoReferrers(siteId, params, {
+        allowFullUrl: false,
+        defaultLimit: 8,
+      });
+    if (subPath === "referrer-summary")
+      return generateDemoReferrerSummary(siteId, params);
     if (subPath === "performance")
       return generateDemoPerformance(siteId, params);
     if (subPath === "countries")
@@ -1273,7 +1916,12 @@ function handleDemoRequestInner(options: {
         tab === "timezone" ||
         tab === "organization"
       ) {
-        return generateDemoOverviewGeoTab(siteId, params, tab);
+        return paginateDemoEnvelope(
+          generateDemoOverviewGeoTab(siteId, params, tab),
+          params,
+          100,
+          `overview-geo-${tab}`,
+        );
       }
     }
     if (subPath === "browser-trend")
@@ -1292,8 +1940,12 @@ function handleDemoRequestInner(options: {
       return {
         ok: true,
         interval: parseDemoInterval(params.interval),
-        source: generateDemoReferrerTrend(siteId, params),
-        channel: generateDemoChannelTrend(siteId, params),
+        source: demoShareTrendDimension(
+          generateDemoReferrerTrend(siteId, params, { maxLimit: 12 }),
+        ),
+        channel: demoShareTrendDimension(
+          generateDemoChannelTrend(siteId, params, { maxLimit: 12 }),
+        ),
       };
     if (subPath === "referrer-dimension-trend")
       return generateDemoReferrerTrend(siteId, params);
@@ -1308,7 +1960,7 @@ function handleDemoRequestInner(options: {
   return demoNotFoundResponse();
 }
 
-function demoBotAnalyticsResponse(
+function demoRequestObservationResponse(
   params: Record<string, string | number>,
 ): Record<string, unknown> {
   const from = Number(params.from);
@@ -1328,104 +1980,402 @@ function demoBotAnalyticsResponse(
   const data = generateDemoRequestObservationData(
     minutes,
     Number.isFinite(to) && to > 0 ? to : undefined,
-  ) as unknown as {
-    ok: true;
-    configured: boolean;
-    generatedAt: number;
-    events: Array<Record<string, unknown>>;
-    normal?: { events?: Array<Record<string, unknown>> };
-  } & Record<string, unknown>;
+  );
+  const serializeDetailEvent = (event: Record<string, unknown>) => {
+    const { sampleWeight: _sampleWeight, ...serialized } = event;
+    return serialized;
+  };
+  const serializeListEvent = (
+    event: Record<string, unknown>,
+    source: "blocked" | "included",
+  ) => {
+    const shared = {
+      timestamp: event.timestamp,
+      receivedAt: event.receivedAt,
+      siteId: event.siteId,
+      siteName: event.siteName,
+      siteDomain: event.siteDomain,
+      kind: event.kind,
+      category: event.category,
+      disposition: event.disposition,
+      pathname: event.pathname,
+      country: event.country,
+      region: event.region,
+      asOrganization: event.asOrganization,
+      asn: event.asn,
+      rayId: event.rayId,
+      traceId: event.traceId,
+    };
+    if (source === "blocked") {
+      return {
+        ...shared,
+        reasons: event.reasons,
+        ip: event.ip,
+        userAgent: event.userAgent,
+        verifiedBotCategory: event.verifiedBotCategory,
+        botScore: event.botScore,
+      };
+    }
+    return {
+      ...shared,
+      hostname: event.hostname,
+      colo: event.colo,
+      requestMethod: event.requestMethod,
+      edgeLatencyMs: event.edgeLatencyMs,
+    };
+  };
+  const blockedEvents = data.blockedEvents as unknown as Array<
+    Record<string, unknown>
+  >;
+  const includedEvents = data.includedEvents as unknown as Array<
+    Record<string, unknown>
+  >;
 
   if (params.detail === "1") {
     const traceId = String(params.traceId || "");
     const rayId = String(params.rayId || "");
-    const detail = data.events.find(
+    const detail = [...blockedEvents, ...includedEvents].find(
       (event) => event.traceId === traceId || event.rayId === rayId,
     );
     return {
       ok: true,
       configured: data.configured,
       generatedAt: data.generatedAt,
-      detail: detail ?? null,
+      sampling: data.sampling,
+      detail: detail ? serializeDetailEvent(detail) : null,
     };
   }
 
-  const source = params.page === "normal" ? "normal" : "abnormal";
-  const events =
-    source === "normal" ? (data.normal?.events ?? []) : data.events;
-  if (params.page === "normal" || params.page === "abnormal") {
-    const page = paginateDemoBotEvents(
+  const rawPage = String(params.source || "");
+  const source =
+    rawPage === "abnormal"
+      ? "blocked"
+      : rawPage === "normal"
+        ? "included"
+        : rawPage;
+  const events = source === "included" ? includedEvents : blockedEvents;
+  if (source === "blocked" || source === "included") {
+    const page = demoPage(
       events,
-      parseDemoBotAnalyticsLimit(params.limit),
-      params.cursor,
+      params,
+      {
+        operation: "request-observation-events",
+        source,
+        from,
+        to,
+        interval: minutes,
+        order: "timestamp:desc,receivedAt:desc,traceId:desc,rayId:desc",
+      },
+      parseRequestObservationLimit(params.limit),
+      100,
     );
     return {
       ok: true,
       configured: data.configured,
       generatedAt: data.generatedAt,
-      page: {
-        source,
-        ...page,
+      sampling: data.sampling,
+      source,
+      data: {
+        items: page.items.map((event) => serializeListEvent(event, source)),
+        pagination: page.pagination,
       },
     };
   }
 
   if (params.dimensionTab) {
-    const key = String(params.dimensionTab);
-    const counts = new Map<string, { count: number; highConfidence: number }>();
-    for (const event of events) {
-      const value = String(event[key] ?? "Unknown");
-      const current = counts.get(value) ?? { count: 0, highConfidence: 0 };
-      current.count += 1;
-      if (event.confidence === "high") current.highConfidence += 1;
-      counts.set(value, current);
+    const group = String(params.dimensionGroup || "");
+    const tab = String(params.dimensionTab);
+    const rawDimensionSource = String(params.dimensionSource || "blocked");
+    const dimensionSource =
+      rawDimensionSource === "abnormal"
+        ? "blocked"
+        : rawDimensionSource === "normal"
+          ? "included"
+          : rawDimensionSource === "included"
+            ? "included"
+            : "blocked";
+    const dimensionEvents =
+      dimensionSource === "included" ? includedEvents : blockedEvents;
+    const counts = new Map<
+      string,
+      DemoRequestObservationDimensionValue & {
+        count: number;
+        botCount: number;
+      }
+    >();
+    for (const event of dimensionEvents) {
+      for (const value of demoRequestObservationDimensionValues(
+        event,
+        group,
+        tab,
+      )) {
+        const current = counts.get(value.key) ?? {
+          ...value,
+          count: 0,
+          botCount: 0,
+        };
+        const sampleWeight = Math.max(1, Number(event.sampleWeight) || 1);
+        current.count += sampleWeight;
+        if (event.category === "bot") current.botCount += sampleWeight;
+        counts.set(value.key, current);
+      }
     }
     return {
       ok: true,
+      sampling: data.sampling,
       dimension: {
+        group,
+        tab,
+        source: dimensionSource,
         rows: [...counts.entries()]
-          .map(([key, value]) => ({ key, label: key, ...value }))
+          .map(([key, value]) => ({
+            key,
+            label: value.label,
+            count: value.count,
+            botCount: value.botCount,
+            ...(value.iconLabel ? { iconLabel: value.iconLabel } : {}),
+            ...(value.country ? { country: value.country } : {}),
+            ...(value.region ? { region: value.region } : {}),
+          }))
           .sort((left, right) => right.count - left.count)
           .slice(0, 30),
       },
     };
   }
 
-  const abnormalPage = paginateDemoBotEvents(
-    data.events,
-    parseDemoBotAnalyticsLimit(params.limit),
+  const blockedPage = demoPage(
+    blockedEvents,
+    params,
+    {
+      operation: "request-observation-events",
+      source: "blocked",
+      from,
+      to,
+      interval: minutes,
+      order: "timestamp:desc,receivedAt:desc,traceId:desc,rayId:desc",
+    },
+    parseRequestObservationLimit(params.limit),
+    100,
   );
-  const normalPage = paginateDemoBotEvents(
-    data.normal?.events ?? [],
-    parseDemoBotAnalyticsLimit(params.limit),
+  const includedPage = demoPage(
+    includedEvents,
+    params,
+    {
+      operation: "request-observation-events",
+      source: "included",
+      from,
+      to,
+      interval: minutes,
+      order: "timestamp:desc,receivedAt:desc,traceId:desc,rayId:desc",
+    },
+    parseRequestObservationLimit(params.limit),
+    100,
+  );
+  const serializedBlockedEvents = blockedPage.items.map((event) =>
+    serializeListEvent(event, "blocked"),
+  );
+  const serializedIncludedEvents = includedPage.items.map((event) =>
+    serializeListEvent(event, "included"),
   );
 
   return {
     ...data,
-    events: abnormalPage.events,
-    normalEvents: normalPage.events,
-    abnormal: data.abnormal
-      ? {
-          ...data.abnormal,
-          events: abnormalPage.events,
-          hasMore: abnormalPage.hasMore,
-          nextCursor: abnormalPage.nextCursor,
-        }
-      : data.abnormal,
-    normal: data.normal
-      ? {
-          ...data.normal,
-          events: normalPage.events,
-          hasMore: normalPage.hasMore,
-          nextCursor: normalPage.nextCursor,
-        }
-      : data.normal,
+    events: serializedBlockedEvents,
+    normalEvents: serializedIncludedEvents.filter(
+      (event) => event.category === "normal",
+    ),
+    blockedEvents: serializedBlockedEvents,
+    includedEvents: serializedIncludedEvents,
+    blocked: {
+      ...data.blocked,
+      events: serializedBlockedEvents,
+      pagination: blockedPage.pagination,
+    },
+    included: {
+      ...data.included,
+      events: serializedIncludedEvents,
+      pagination: includedPage.pagination,
+    },
   };
 }
 
-const DEMO_BOT_ANALYTICS_DEFAULT_LIMIT = 50;
+interface DemoRequestObservationDimensionValue {
+  key: string;
+  label: string;
+  iconLabel?: string;
+  country?: string;
+  region?: string;
+}
 
-function parseDemoBotAnalyticsLimit(value: unknown): number {
+function demoDimensionString(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "";
+}
+
+function demoBotScoreBucket(value: unknown): string {
+  const score = Number(value);
+  if (!Number.isFinite(score) || score <= 0) return "";
+  if (score < 20) return "1-19";
+  if (score < 40) return "20-39";
+  if (score < 60) return "40-59";
+  if (score < 80) return "60-79";
+  return "80-99";
+}
+
+function demoUserAgentLengthBucket(value: unknown): string {
+  const length = Number(value);
+  if (!Number.isFinite(length) || length <= 0) return "";
+  if (length < 80) return "1-79";
+  if (length < 160) return "80-159";
+  if (length < 256) return "160-255";
+  if (length < 512) return "256-511";
+  return "512+";
+}
+
+function demoIpPrefix(value: unknown): string {
+  const ip = demoDimensionString(value);
+  const ipv4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/);
+  if (ipv4) return `${ipv4[1]}.${ipv4[2]}.${ipv4[3]}.0/24`;
+  if (ip.includes(":")) {
+    const parts = ip.split(":").filter(Boolean);
+    if (parts.length >= 4) return `${parts.slice(0, 4).join(":")}::/64`;
+  }
+  return ip;
+}
+
+function demoRequestObservationDimensionValue(
+  value: unknown,
+  options?: Pick<
+    DemoRequestObservationDimensionValue,
+    "iconLabel" | "country" | "region"
+  >,
+): DemoRequestObservationDimensionValue {
+  const label = demoDimensionString(value) || "Unknown";
+  return {
+    key: label,
+    label,
+    ...options,
+  };
+}
+
+function demoRequestObservationDimensionValues(
+  event: Record<string, unknown>,
+  group: string,
+  tab: string,
+): DemoRequestObservationDimensionValue[] {
+  if (group === "detection") {
+    if (tab === "reason") {
+      const reasons = Array.isArray(event.reasons)
+        ? event.reasons.map(demoDimensionString).filter(Boolean)
+        : demoDimensionString(event.reasons)
+            .split(",")
+            .map((reason) => reason.trim())
+            .filter(Boolean);
+      return [demoRequestObservationDimensionValue(reasons.join(","))];
+    }
+    if (tab === "category") {
+      const category = demoDimensionString(event.category);
+      return [demoRequestObservationDimensionValue(category)];
+    }
+    if (tab === "kind") {
+      return [demoRequestObservationDimensionValue(event.kind)];
+    }
+    if (tab === "botScoreBucket") {
+      return [
+        demoRequestObservationDimensionValue(
+          demoBotScoreBucket(event.botScore),
+        ),
+      ];
+    }
+    if (tab === "verifiedBotCategory") {
+      return [demoRequestObservationDimensionValue(event.verifiedBotCategory)];
+    }
+  }
+
+  if (group === "target") {
+    if (tab === "site") {
+      const siteId = demoDimensionString(event.siteId);
+      const siteName =
+        demoDimensionString(event.siteName) ||
+        demoDimensionString(event.siteDomain) ||
+        siteId;
+      return [
+        demoRequestObservationDimensionValue(siteName, {
+          iconLabel: demoDimensionString(event.siteDomain) || undefined,
+        }),
+      ].map((value) => ({ ...value, key: siteId || value.key }));
+    }
+    if (tab === "hostname") {
+      return [demoRequestObservationDimensionValue(event.hostname)];
+    }
+    if (tab === "pathname") {
+      return [
+        demoRequestObservationDimensionValue(
+          demoDimensionString(event.pathname) || "/",
+        ),
+      ];
+    }
+    if (tab === "origin") {
+      return [demoRequestObservationDimensionValue(event.origin)];
+    }
+  }
+
+  if (group === "network") {
+    if (tab === "asOrganization") {
+      return [demoRequestObservationDimensionValue(event.asOrganization)];
+    }
+    if (tab === "asn") {
+      return [demoRequestObservationDimensionValue(event.asn)];
+    }
+    if (tab === "country") {
+      return [demoRequestObservationDimensionValue(event.country)];
+    }
+    if (tab === "region") {
+      return [
+        demoRequestObservationDimensionValue(event.region, {
+          country: demoDimensionString(event.country) || undefined,
+        }),
+      ];
+    }
+    if (tab === "city") {
+      return [
+        demoRequestObservationDimensionValue(event.city, {
+          country: demoDimensionString(event.country) || undefined,
+          region: demoDimensionString(event.region) || undefined,
+        }),
+      ];
+    }
+    if (tab === "colo") {
+      return [demoRequestObservationDimensionValue(event.colo)];
+    }
+  }
+
+  if (group === "client") {
+    if (tab === "ip") {
+      return [demoRequestObservationDimensionValue(event.ip)];
+    }
+    if (tab === "userAgent") {
+      return [demoRequestObservationDimensionValue(event.userAgent)];
+    }
+    if (tab === "userAgentLengthBucket") {
+      return [
+        demoRequestObservationDimensionValue(
+          demoUserAgentLengthBucket(event.userAgentLength),
+        ),
+      ];
+    }
+    if (tab === "ipPrefix") {
+      return [demoRequestObservationDimensionValue(demoIpPrefix(event.ip))];
+    }
+  }
+
+  return [demoRequestObservationDimensionValue(event[tab])];
+}
+
+const DEMO_REQUEST_OBSERVATION_DEFAULT_LIMIT = 50;
+
+function parseRequestObservationLimit(value: unknown): number {
   const parsed = Number(value);
   return Math.max(
     1,
@@ -1433,61 +2383,9 @@ function parseDemoBotAnalyticsLimit(value: unknown): number {
       100,
       Number.isFinite(parsed)
         ? Math.trunc(parsed)
-        : DEMO_BOT_ANALYTICS_DEFAULT_LIMIT,
+        : DEMO_REQUEST_OBSERVATION_DEFAULT_LIMIT,
     ),
   );
-}
-
-function parseDemoBotAnalyticsCursor(
-  value: unknown,
-): { timestamp: string; receivedAt: number } | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const parsed = JSON.parse(value) as {
-      timestamp?: unknown;
-      receivedAt?: unknown;
-    };
-    const timestamp = String(parsed.timestamp || "");
-    const receivedAt = Number(parsed.receivedAt);
-    if (!timestamp || !Number.isFinite(receivedAt)) return null;
-    return { timestamp, receivedAt };
-  } catch {
-    return null;
-  }
-}
-
-function paginateDemoBotEvents(
-  events: Array<Record<string, unknown>>,
-  limit: number,
-  cursorValue?: unknown,
-): {
-  events: Array<Record<string, unknown>>;
-  hasMore: boolean;
-  nextCursor: { timestamp: string; receivedAt: number } | null;
-} {
-  const cursor = parseDemoBotAnalyticsCursor(cursorValue);
-  const startIndex = cursor
-    ? Math.max(
-        0,
-        events.findIndex(
-          (event) =>
-            String(event.timestamp || "") === cursor.timestamp &&
-            Number(event.receivedAt) === cursor.receivedAt,
-        ) + 1,
-      )
-    : 0;
-  const pageEvents = events.slice(startIndex, startIndex + limit);
-  const hasMore = startIndex + pageEvents.length < events.length;
-  const lastEvent = pageEvents[pageEvents.length - 1];
-  const nextCursor =
-    hasMore && lastEvent
-      ? {
-          timestamp: String(lastEvent.timestamp || ""),
-          receivedAt: Number(lastEvent.receivedAt),
-        }
-      : null;
-
-  return { events: pageEvents, hasMore, nextCursor };
 }
 
 /**
@@ -1500,16 +2398,23 @@ function paginateDemoBotEvents(
 export function handleDemoRequest(
   options: Parameters<typeof handleDemoRequestInner>[0],
 ): unknown {
-  const result: unknown = handleDemoRequestInner(options);
-  if (
-    result &&
-    typeof result === "object" &&
-    (result as { ok?: unknown }).ok === true &&
-    typeof (result as { requestId?: unknown }).requestId !== "string"
-  ) {
-    return demoOk({ ...(result as Record<string, unknown>) });
+  try {
+    const result: unknown = handleDemoRequestInner(options);
+    if (
+      result &&
+      typeof result === "object" &&
+      (result as { ok?: unknown }).ok === true &&
+      typeof (result as { requestId?: unknown }).requestId !== "string"
+    ) {
+      return demoOk({ ...(result as Record<string, unknown>) });
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof DemoInvalidCursorError) {
+      return demoBadRequest("Invalid cursor");
+    }
+    throw error;
   }
-  return result;
 }
 
 /**

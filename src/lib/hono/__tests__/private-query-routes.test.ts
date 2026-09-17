@@ -60,6 +60,10 @@ vi.mock("@/lib/edge/analytics/providers/d1/internal/funnels", () => ({
   handleFunnel: vi.fn(async () => new Response("funnel")),
 }));
 
+vi.mock("@/lib/edge/analytics/providers/d1/internal/goals", () => ({
+  handleGoal: vi.fn(async () => new Response("goal")),
+}));
+
 vi.mock(
   "@/lib/edge/analytics/composition/protocol/events-contract-adapter",
   () => ({
@@ -102,6 +106,7 @@ describe("Hono private query routes", () => {
       id: "site-1",
       name: "Site",
       domain: "app.test",
+      canManage: true,
     });
     vi.mocked(dispatchQueryRoute).mockResolvedValue(new Response("query"));
     vi.mocked(handleOverviewContract).mockResolvedValue(new Response("query"));
@@ -205,6 +210,63 @@ describe("Hono private query routes", () => {
     expect(withDashboardCache).not.toHaveBeenCalled();
   });
 
+  it("allows Goal definition CRUD through the private site route", async () => {
+    const app = createApp();
+
+    const getResponse = await app.fetch(
+      request("/api/private/goals?siteId=site-1"),
+      env as never,
+      ctx,
+    );
+    const postResponse = await app.fetch(
+      request("/api/private/goals?siteId=site-1", { method: "POST" }),
+      env as never,
+      ctx,
+    );
+
+    expect(getResponse.status).toBe(200);
+    expect(postResponse.status).toBe(200);
+    expect(withDashboardCache).not.toHaveBeenCalled();
+  });
+
+  it("denies Goal mutations to a readable site member", async () => {
+    vi.mocked(resolvePrivateSiteForSession).mockResolvedValueOnce({
+      id: "site-1",
+      name: "Site",
+      domain: "app.test",
+      canManage: false,
+    });
+    const app = createApp();
+    const response = await app.fetch(
+      request("/api/private/goals?siteId=site-1", {
+        method: "PATCH",
+        body: "{}",
+      }),
+      env as never,
+      ctx,
+    );
+    expect(response.status).toBe(403);
+  });
+
+  it("denies funnel mutations to a readable site member", async () => {
+    vi.mocked(resolvePrivateSiteForSession).mockResolvedValueOnce({
+      id: "site-1",
+      name: "Site",
+      domain: "app.test",
+      canManage: false,
+    });
+    const app = createApp();
+    const response = await app.fetch(
+      request("/api/private/funnels?siteId=site-1", {
+        method: "PATCH",
+        body: "{}",
+      }),
+      env as never,
+      ctx,
+    );
+    expect(response.status).toBe(403);
+  });
+
   it("throws when the private session context is missing", async () => {
     const app = new Hono<AppEnv>();
     app.route("/api/private", privateQueryRoutes);
@@ -281,6 +343,7 @@ describe("Hono private query routes", () => {
           tenantId: "team-1",
           route: "team-dashboard",
           audienceId: "user-1",
+          allowedSiteIds: ["site-1"],
         },
         request: expect.any(Request),
       }),
@@ -316,7 +379,7 @@ describe("Hono private query routes", () => {
   it("enables dashboard-only event detail response shaping", async () => {
     const app = createApp();
     const detailUrl =
-      "/api/private/event-type-detail?siteId=site-1&eventName=checkout&includeContext=false&includeBreakdowns=false&includeFields=false";
+      "/api/private/event-type-detail?siteId=site-1&eventName=checkout&includeContext=false&includeBreakdowns=false";
 
     const response = await app.fetch(request(detailUrl), env as never, ctx);
 

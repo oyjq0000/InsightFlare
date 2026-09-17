@@ -1,3 +1,9 @@
+import {
+  D1_FLUSH_INTERVAL_MS,
+  HIDDEN_LEAVE_GRACE_MS,
+  ORPHAN_CUSTOM_EVENT_TIMEOUT_MS,
+  VISIT_TIMEOUT_MS,
+} from "./ingest-constants";
 import { toUnixSeconds } from "./ingest-time";
 import type {
   BufferedCustomEventInput,
@@ -19,6 +25,107 @@ interface BufferStoreContext extends SqlWriter {
   env: Pick<Env, "DB">;
 }
 
+function minDueAt(
+  flushDueAt: number | null,
+  lifecycleDeadline: number | null,
+): number | null {
+  if (flushDueAt === null) return lifecycleDeadline;
+  if (lifecycleDeadline === null) return flushDueAt;
+  return Math.min(flushDueAt, lifecycleDeadline);
+}
+
+function visitLifecycleDeadline(row: {
+  status: string;
+  lastActivityAt: number;
+  hiddenAt?: number | null;
+}): number | null {
+  if (row.status === "open") return row.lastActivityAt + VISIT_TIMEOUT_MS;
+  if (row.status !== "hidden_pending") return null;
+  return (
+    (row.hiddenAt ?? row.lastActivityAt ?? 0) +
+    (row.hiddenAt === null || row.hiddenAt === undefined
+      ? VISIT_TIMEOUT_MS
+      : HIDDEN_LEAVE_GRACE_MS)
+  );
+}
+
+function visitNextDueSql(
+  flushDueExpression: string,
+  lastActivityExpression = "last_activity_at",
+): string {
+  const lifecycleDeadline = `CASE
+    WHEN status = 'open'
+      THEN (${lastActivityExpression}) + ${VISIT_TIMEOUT_MS}
+    WHEN status = 'hidden_pending'
+      THEN COALESCE(hidden_at, (${lastActivityExpression}), 0) +
+        CASE
+          WHEN hidden_at IS NULL THEN ${VISIT_TIMEOUT_MS}
+          ELSE ${HIDDEN_LEAVE_GRACE_MS}
+        END
+    ELSE NULL
+  END`;
+  return `CASE
+    WHEN (${flushDueExpression}) IS NULL THEN ${lifecycleDeadline}
+    WHEN (${lifecycleDeadline}) IS NULL THEN (${flushDueExpression})
+    WHEN (${flushDueExpression}) <= (${lifecycleDeadline})
+      THEN (${flushDueExpression})
+    ELSE (${lifecycleDeadline})
+  END`;
+}
+
+function updateBufferedVisitPerformance(
+  context: Pick<BufferStoreContext, "sqlRun">,
+  siteId: string,
+  visitId: string,
+  performance: TrackerPerformancePayload,
+  updatedAt: number,
+  flushDueAt: number,
+): number {
+  const flushDueExpression = "CASE WHEN dirty = 0 THEN ? ELSE flush_due_at END";
+  return context.sqlRun(
+    `
+      UPDATE buffered_visits
+      SET perf_ttfb_ms = ?,
+          perf_fcp_ms = ?,
+          perf_lcp_ms = ?,
+          perf_cls = ?,
+          perf_inp_ms = ?,
+          dirty = 1,
+          flush_due_at = ${flushDueExpression},
+          buffer_revision = COALESCE(buffer_revision, 1) + 1,
+          next_due_at = ${visitNextDueSql(flushDueExpression)},
+          updated_at = ?
+      WHERE site_id = ?
+        AND visit_id = ?
+        AND (
+          perf_ttfb_ms IS NOT ? OR
+          perf_fcp_ms IS NOT ? OR
+          perf_lcp_ms IS NOT ? OR
+          perf_cls IS NOT ? OR
+          perf_inp_ms IS NOT ?
+        )
+    `,
+    performance.ttfb ?? null,
+    performance.fcp ?? null,
+    performance.lcp ?? null,
+    performance.cls ?? null,
+    performance.inp ?? null,
+    flushDueAt,
+    flushDueAt,
+    flushDueAt,
+    flushDueAt,
+    flushDueAt,
+    updatedAt,
+    siteId,
+    visitId,
+    performance.ttfb ?? null,
+    performance.fcp ?? null,
+    performance.lcp ?? null,
+    performance.cls ?? null,
+    performance.inp ?? null,
+  );
+}
+
 export async function attachPerformanceToVisit(
   context: BufferStoreContext,
   siteId: string,
@@ -28,32 +135,20 @@ export async function attachPerformanceToVisit(
 ): Promise<void> {
   if (!siteId || !visitId) return;
   const updatedAt = toUnixSeconds(receivedAt);
-  const rowsWritten = context.sqlRun(
-    `
-      UPDATE buffered_visits
-      SET perf_ttfb_ms = ?,
-          perf_fcp_ms = ?,
-          perf_lcp_ms = ?,
-          perf_cls = ?,
-          perf_inp_ms = ?,
-          dirty = 1,
-          updated_at = ?
-      WHERE site_id = ? AND visit_id = ?
-    `,
-    performance.ttfb ?? null,
-    performance.fcp ?? null,
-    performance.lcp ?? null,
-    performance.cls ?? null,
-    performance.inp ?? null,
-    updatedAt,
+  const flushDueAt = receivedAt + D1_FLUSH_INTERVAL_MS;
+  const rowsWritten = updateBufferedVisitPerformance(
+    context,
     siteId,
     visitId,
+    performance,
+    updatedAt,
+    flushDueAt,
   );
   if (rowsWritten > 0) return;
 
   const persistedRow = await readPersistedVisitRow(context, siteId, visitId);
   if (!persistedRow) return;
-  insertBufferedVisitRow(context, {
+  const inserted = insertBufferedVisitRowIfAbsent(context, {
     ...persistedRow,
     perfTtfbMs: performance.ttfb ?? null,
     perfFcpMs: performance.fcp ?? null,
@@ -62,8 +157,26 @@ export async function attachPerformanceToVisit(
     perfInpMs: performance.inp ?? null,
     dirty: 1,
     flushAttempts: 0,
+    flushDueAt,
+    nextDueAt: minDueAt(flushDueAt, visitLifecycleDeadline(persistedRow)),
+    bufferRevision: 1,
+    lastFlushError: null,
     updatedAt,
   });
+
+  // The row may have been inserted by another local writer after the first
+  // UPDATE.  INSERT ... DO NOTHING deliberately preserves that winner; retry
+  // the business update so the performance payload is not lost in that race.
+  if (!inserted) {
+    updateBufferedVisitPerformance(
+      context,
+      siteId,
+      visitId,
+      performance,
+      updatedAt,
+      flushDueAt,
+    );
+  }
 }
 
 export async function getVisitContext(
@@ -76,7 +189,9 @@ export async function getVisitContext(
     const persisted = await readPersistedVisitRow(context, siteId, visitId);
     if (persisted) {
       insertBufferedVisitRow(context, persisted);
-      row = persisted;
+      // Do not return the D1 snapshot after a raced INSERT ... DO NOTHING:
+      // another invocation may already have a newer local business state.
+      row = (await readVisitRow(context, siteId, visitId)) ?? persisted;
     }
   }
   if (!row) return null;
@@ -258,7 +373,10 @@ export async function findRecentVisitorSession(
       input.visitId,
       cutoff,
     )
-    .first<RecentVisitorSession>();
+    .first<RecentVisitorSession>()
+    // A persisted-session lookup is an optimization for session continuity;
+    // a D1 outage must not turn a valid pageview into a failed ingest.
+    .catch(() => null);
 
   return persisted ?? null;
 }
@@ -403,14 +521,26 @@ export async function readPersistedVisitRow(
         dirty: 0,
         flushAttempts: 0,
         hiddenAt: null,
+        lastFlushError: null,
+        flushDueAt: null,
+        nextDueAt: null,
+        bufferRevision: 1,
       }
     : null;
 }
 
-export function insertBufferedVisitRow(
+function insertBufferedVisitRowIfAbsent(
   context: Pick<BufferStoreContext, "sqlRun">,
   row: BufferedVisitRow,
-): void {
+): boolean {
+  const flushDueAt =
+    row.flushDueAt !== undefined
+      ? row.flushDueAt
+      : row.dirty === 1
+        ? Date.now() + D1_FLUSH_INTERVAL_MS
+        : null;
+  const nextDueAt = minDueAt(flushDueAt, visitLifecycleDeadline(row));
+  const bufferRevision = row.bufferRevision ?? 1;
   const bindings: Array<string | number | null> = [
     row.visitId,
     row.siteId,
@@ -467,13 +597,16 @@ export function insertBufferedVisitRow(
     row.perfInpMs,
     row.dirty,
     row.flushAttempts,
-    null,
+    row.lastFlushError ?? null,
+    nextDueAt,
+    flushDueAt,
+    bufferRevision,
     row.createdAt,
     row.updatedAt,
   ];
-  context.sqlRun(
+  const rowsWritten = context.sqlRun(
     `
-      INSERT OR REPLACE INTO buffered_visits (
+      INSERT INTO buffered_visits (
         visit_id, site_id, visitor_id, session_id, status, started_at, last_activity_at,
         hidden_at, ended_at, finalized_at, duration_ms, duration_source, exit_reason,
         pathname, query_string, hash_fragment, hostname, title, referrer_url, referrer_host,
@@ -483,11 +616,21 @@ export function insertBufferedVisitRow(
         os, os_version, device_type, screen_width, screen_height, language,
         user_id, user_name,
         perf_ttfb_ms, perf_fcp_ms, perf_lcp_ms, perf_cls, perf_inp_ms,
-        dirty, flush_attempts, last_flush_error, created_at, updated_at
+        dirty, flush_attempts, last_flush_error, next_due_at, flush_due_at,
+        buffer_revision, created_at, updated_at
       ) VALUES (${bindings.map(() => "?").join(", ")})
+      ON CONFLICT(visit_id) DO NOTHING
     `,
     ...bindings,
   );
+  return rowsWritten > 0;
+}
+
+export function insertBufferedVisitRow(
+  context: Pick<BufferStoreContext, "sqlRun">,
+  row: BufferedVisitRow,
+): void {
+  insertBufferedVisitRowIfAbsent(context, row);
 }
 
 export async function insertVisit(
@@ -495,6 +638,8 @@ export async function insertVisit(
   record: NormalizedPageview,
 ): Promise<boolean> {
   const createdAt = toUnixSeconds(record.receivedAt);
+  const flushDueAt = record.receivedAt + D1_FLUSH_INTERVAL_MS;
+  const nextDueAt = minDueAt(flushDueAt, record.startedAt + VISIT_TIMEOUT_MS);
   const bindings: Array<string | number | null> = [
     record.visitId,
     record.siteId,
@@ -546,6 +691,9 @@ export async function insertVisit(
     1,
     0,
     null,
+    nextDueAt,
+    flushDueAt,
+    1,
     createdAt,
     createdAt,
   ];
@@ -560,7 +708,8 @@ export async function insertVisit(
           os, os_version, device_type, screen_width, screen_height, language,
           user_id, user_name,
           perf_ttfb_ms, perf_fcp_ms, perf_lcp_ms, perf_cls, perf_inp_ms,
-          dirty, flush_attempts, last_flush_error, created_at, updated_at
+          dirty, flush_attempts, last_flush_error, next_due_at, flush_due_at,
+          buffer_revision, created_at, updated_at
         ) VALUES (${bindings.map(() => "?").join(", ")})
         ON CONFLICT(visit_id) DO NOTHING
       `,
@@ -591,13 +740,26 @@ export function insertBufferedCustomEvent(
   record: BufferedCustomEventInput,
 ): boolean {
   const createdAt = toUnixSeconds(record.receivedAt);
+  const flushDueAt = record.receivedAt + D1_FLUSH_INTERVAL_MS;
+  const nextDueAt = minDueAt(
+    flushDueAt,
+    record.occurredAt + ORPHAN_CUSTOM_EVENT_TIMEOUT_MS,
+  );
   const rowsWritten = context.sqlRun(
     `
-      INSERT OR IGNORE INTO buffered_custom_events (
+      INSERT INTO buffered_custom_events (
         event_id, site_id, visit_id, occurred_at, received_at, sequence,
         event_name, event_data_json, user_id,
-        dirty, flush_attempts, last_flush_error, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?)
+        dirty, flush_attempts, last_flush_error, next_due_at, flush_due_at,
+        buffer_revision, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM buffered_visits
+          WHERE site_id = ? AND visit_id = ?
+        ) THEN NULL ELSE 'waiting_for_visit' END,
+        ?, ?, 1, ?)
+      ON CONFLICT(event_id) DO NOTHING
     `,
     record.eventId,
     record.siteId,
@@ -608,6 +770,10 @@ export function insertBufferedCustomEvent(
     record.eventName,
     record.eventDataJson,
     record.userId || "",
+    record.siteId,
+    record.visitId,
+    nextDueAt,
+    flushDueAt,
     createdAt,
   );
   return rowsWritten > 0;
@@ -618,19 +784,67 @@ export async function updateOpenVisitActivity(
   visitId: string,
   eventAt: number,
 ): Promise<void> {
-  const updatedAt = toUnixSeconds(Date.now());
+  const now = Date.now();
+  const updatedAt = toUnixSeconds(now);
+  const flushDueAt = now + D1_FLUSH_INTERVAL_MS;
+
+  // Most activity arrives while the visit is already dirty and its flush is
+  // earlier than the lifecycle timeout.  In that state the scheduling keys do
+  // not change, so update only the non-indexed activity fields.  This avoids
+  // rewriting the due indexes for every custom event while preserving the
+  // exact latest activity timestamp and revision used by the flush CAS.
+  const activityOnlyRows = context.sqlRun(
+    `
+      UPDATE buffered_visits
+      SET last_activity_at = ?,
+          buffer_revision = COALESCE(buffer_revision, 1) + 1,
+          updated_at = ?
+      WHERE visit_id = ?
+        AND status = 'open'
+        AND last_activity_at < ?
+        AND dirty = 1
+        AND flush_due_at IS NOT NULL
+        AND next_due_at = flush_due_at
+    `,
+    eventAt,
+    updatedAt,
+    visitId,
+    eventAt,
+  );
+  if (activityOnlyRows > 0) return;
+
   context.sqlRun(
     `
       UPDATE buffered_visits
-      SET last_activity_at = CASE WHEN last_activity_at > ? THEN last_activity_at ELSE ? END,
+      SET last_activity_at = ?,
           dirty = 1,
-          updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
-      WHERE visit_id = ? AND status = 'open'
+          flush_due_at = CASE WHEN dirty = 0 THEN ? ELSE flush_due_at END,
+          buffer_revision = COALESCE(buffer_revision, 1) + 1,
+          next_due_at = CASE
+            WHEN dirty = 0 THEN CASE
+              WHEN ? <= ? + ${VISIT_TIMEOUT_MS} THEN ?
+              ELSE ? + ${VISIT_TIMEOUT_MS}
+            END
+            WHEN flush_due_at IS NULL THEN ? + ${VISIT_TIMEOUT_MS}
+            WHEN flush_due_at <= ? + ${VISIT_TIMEOUT_MS} THEN flush_due_at
+            ELSE ? + ${VISIT_TIMEOUT_MS}
+          END,
+          updated_at = ?
+      WHERE visit_id = ?
+        AND status = 'open'
+        AND last_activity_at < ?
     `,
     eventAt,
+    flushDueAt,
+    flushDueAt,
+    eventAt,
+    flushDueAt,
+    eventAt,
+    eventAt,
+    eventAt,
     eventAt,
     updatedAt,
-    updatedAt,
     visitId,
+    eventAt,
   );
 }

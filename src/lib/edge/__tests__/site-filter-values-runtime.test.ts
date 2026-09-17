@@ -2,10 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/edge/analytics/providers/d1/internal/filter-values", () => ({
   queryFilterValuesFromD1: vi.fn(),
+  queryFilterValuesPageFromD1: vi.fn(),
 }));
 
 import type { FilterFieldId } from "@/lib/edge/analytics/contract";
-import { queryFilterValuesFromD1 } from "@/lib/edge/analytics/providers/d1/internal/filter-values";
+import {
+  queryFilterValuesFromD1,
+  queryFilterValuesPageFromD1,
+} from "@/lib/edge/analytics/providers/d1/internal/filter-values";
 import {
   readSiteFilterValues,
   type ReadSiteFilterValuesInput,
@@ -50,26 +54,33 @@ describe("site filter-values runtime", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("strips the selected top-level facet before querying candidates", async () => {
-    vi.mocked(queryFilterValuesFromD1).mockResolvedValue([
-      { value: "/pricing", occurrences: 10 },
-    ]);
+    vi.mocked(queryFilterValuesPageFromD1).mockResolvedValue({
+      items: [{ value: "/pricing", occurrences: 10 }],
+      pagination: { limit: 50, returned: 1, hasMore: false, nextCursor: null },
+    });
     await expect(readSiteFilterValues(input)).resolves.toMatchObject({
       field: "page.path",
       items: [{ value: "/pricing", label: "/pricing", occurrences: 10 }],
-      page: { limit: 50, hasMore: false, nextCursor: null },
+      pagination: { limit: 50, returned: 1, hasMore: false, nextCursor: null },
     });
-    expect(queryFilterValuesFromD1).toHaveBeenCalledWith(
+    expect(queryFilterValuesPageFromD1).toHaveBeenCalledWith(
       input.env,
       input.siteId,
       input.window,
       { version: 1, root: input.filters.root.children[1] },
       "page.path",
       50,
+      null,
       "/",
+      undefined,
     );
   });
 
   it("passes field selection to the provider without audience policy", async () => {
+    vi.mocked(queryFilterValuesPageFromD1).mockResolvedValue({
+      items: [],
+      pagination: { limit: 50, returned: 0, hasMore: false, nextCursor: null },
+    });
     await expect(
       readSiteFilterValues({ ...input, field: "event.payload" }),
     ).resolves.toBeDefined();
@@ -79,10 +90,14 @@ describe("site filter-values runtime", () => {
         field: "unknown.field",
       }),
     ).resolves.toBeDefined();
-    expect(queryFilterValuesFromD1).toHaveBeenCalled();
+    expect(queryFilterValuesPageFromD1).toHaveBeenCalled();
   });
 
   it("passes canonical filters through and preserves provider failures", async () => {
+    vi.mocked(queryFilterValuesPageFromD1).mockResolvedValue({
+      items: [],
+      pagination: { limit: 50, returned: 0, hasMore: false, nextCursor: null },
+    });
     await expect(
       readSiteFilterValues({
         ...input,
@@ -100,9 +115,49 @@ describe("site filter-values runtime", () => {
         },
       }),
     ).resolves.toBeDefined();
-    vi.mocked(queryFilterValuesFromD1).mockRejectedValueOnce(
+    vi.mocked(queryFilterValuesPageFromD1).mockRejectedValueOnce(
       new Error("D1 unavailable"),
     );
     await expect(readSiteFilterValues(input)).rejects.toThrow("D1 unavailable");
+  });
+
+  it("returns the provider pagination contract for candidate pages", async () => {
+    vi.mocked(queryFilterValuesPageFromD1).mockResolvedValue({
+      items: [{ value: "/docs", occurrences: 7 }],
+      pagination: {
+        limit: 1,
+        returned: 1,
+        hasMore: true,
+        nextCursor: "next-filter-cursor",
+      },
+    });
+
+    await expect(
+      readSiteFilterValues({
+        ...input,
+        audience: "public-share",
+        page: { limit: 1, cursor: "filter-cursor" },
+      }),
+    ).resolves.toEqual({
+      field: "page.path",
+      items: [{ value: "/docs", label: "/docs", occurrences: 7 }],
+      pagination: {
+        limit: 1,
+        returned: 1,
+        hasMore: true,
+        nextCursor: "next-filter-cursor",
+      },
+    });
+    expect(queryFilterValuesPageFromD1).toHaveBeenCalledWith(
+      input.env,
+      input.siteId,
+      input.window,
+      { version: 1, root: input.filters.root.children[1] },
+      input.field,
+      1,
+      "filter-cursor",
+      input.search,
+      "public-share",
+    );
   });
 });

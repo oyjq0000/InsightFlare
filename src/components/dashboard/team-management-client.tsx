@@ -80,6 +80,11 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { TableCell, TableHead, TableRow } from "@/components/ui/table";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   type AdminServiceHttpMethod,
   requestAdminService,
 } from "@/lib/admin-service-client";
@@ -106,6 +111,7 @@ import {
 import type { MemberData, SiteData, TeamData } from "@/lib/edge-client";
 import type { Locale } from "@/lib/i18n/config";
 import type { AppMessages } from "@/lib/i18n/messages";
+import { formatI18nTemplate } from "@/lib/i18n/template";
 import { navigateWithTransition } from "@/lib/page-transition";
 import Link from "@/lib/router";
 import { useRouter } from "@/lib/router";
@@ -427,7 +433,11 @@ export function TeamManagementClient({
   const [deleteTeamDialogOpen, setDeleteTeamDialogOpen] = useState(false);
   const [creatingInvite, setCreatingInvite] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState<string | null>(null);
+  const [revokeInviteTarget, setRevokeInviteTarget] =
+    useState<TeamInviteData | null>(null);
   const [removingMemberId, setRemovingMemberId] = useState<string | null>(null);
+  const [removeMemberTarget, setRemoveMemberTarget] =
+    useState<MemberData | null>(null);
   const [changingRoleId, setChangingRoleId] = useState<string | null>(null);
   const [savingSiteAccessId, setSavingSiteAccessId] = useState<string | null>(
     null,
@@ -685,6 +695,7 @@ export function TeamManagementClient({
         "PATCH",
       );
       await refreshInvites();
+      setRevokeInviteTarget(null);
       toast.success(copy.toasts.inviteRevoked);
     } catch (error) {
       const message =
@@ -841,6 +852,7 @@ export function TeamManagementClient({
         "PATCH",
       );
       await refreshMembers();
+      setRemoveMemberTarget(null);
       toast.success(copy.toasts.memberRemoved);
     } catch (error) {
       const message =
@@ -1098,16 +1110,27 @@ export function TeamManagementClient({
               <TableCell>{invite.email || copy.members.anyEmail}</TableCell>
               <TableCell>
                 {invite.code ? (
-                  <button
-                    type="button"
-                    className="font-mono text-xs text-primary underline-offset-4 hover:underline disabled:pointer-events-none disabled:text-muted-foreground"
-                    disabled={!invite.url}
-                    onClick={() => {
-                      void handleCopyInviteUrl(invite);
-                    }}
-                  >
-                    {invite.code}
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span
+                        className="inline-flex"
+                        tabIndex={!invite.url ? 0 : undefined}
+                      >
+                        <button
+                          type="button"
+                          className="font-mono text-xs text-primary underline-offset-4 hover:underline disabled:pointer-events-none disabled:text-muted-foreground"
+                          disabled={!invite.url}
+                          aria-label={copy.members.copyInvite}
+                          onClick={() => {
+                            void handleCopyInviteUrl(invite);
+                          }}
+                        >
+                          {invite.code}
+                        </button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>{copy.members.copyInvite}</TooltipContent>
+                  </Tooltip>
                 ) : (
                   "-"
                 )}
@@ -1155,14 +1178,16 @@ export function TeamManagementClient({
               <TableCell className="text-right">
                 <TableActionButton
                   onClick={() => {
-                    void handleRevokeInvite(invite.id);
+                    setRevokeInviteTarget(invite);
                   }}
                   disabled={
                     !canManage ||
                     invite.status !== "active" ||
                     revokingInviteId === invite.id
                   }
-                  label={copy.members.revokeInvite}
+                  label={formatI18nTemplate(copy.members.revokeInviteAction, {
+                    target: invite.email || copy.members.anyEmail,
+                  })}
                   tone="destructive"
                   transitionKey={
                     revokingInviteId === invite.id ? "revoking" : "revoke"
@@ -1323,10 +1348,12 @@ export function TeamManagementClient({
                 {member.role === "owner" ? null : (
                   <TableActionButton
                     onClick={() => {
-                      void handleRemoveMember(member.userId);
+                      setRemoveMemberTarget(member);
                     }}
                     disabled={!canManage || removingMemberId === member.userId}
-                    label={copy.members.remove}
+                    label={formatI18nTemplate(copy.members.removeMemberAction, {
+                      target: member.name || member.username || member.email,
+                    })}
                     tone="destructive"
                     transitionKey={
                       removingMemberId === member.userId ? "removing" : "remove"
@@ -1472,10 +1499,114 @@ export function TeamManagementClient({
     </ResponsiveDialog>
   );
 
+  const revokeInviteDialog = (
+    <AlertDialog
+      open={Boolean(revokeInviteTarget)}
+      onOpenChange={(open) => {
+        if (revokingInviteId) return;
+        if (!open) setRevokeInviteTarget(null);
+      }}
+    >
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle icon={RiDeleteBinLine}>
+            {revokeInviteTarget
+              ? formatI18nTemplate(copy.members.revokeInviteAction, {
+                  target: revokeInviteTarget.email || copy.members.anyEmail,
+                })
+              : copy.members.revokeInvite}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {revokeInviteTarget
+              ? formatI18nTemplate(copy.members.revokeInviteConfirm, {
+                  target: revokeInviteTarget.email || copy.members.anyEmail,
+                })
+              : null}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={Boolean(revokingInviteId)}>
+            <RiCloseLine className="size-4" />
+            <span>{messages.teamSelect.cancel}</span>
+          </AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={!revokeInviteTarget || Boolean(revokingInviteId)}
+            onClick={(event) => {
+              event.preventDefault();
+              if (revokeInviteTarget) {
+                void handleRevokeInvite(revokeInviteTarget.id);
+              }
+            }}
+          >
+            <RiDeleteBinLine className="size-4" />
+            <span>{copy.members.revokeInvite}</span>
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+
+  const removeMemberDialog = (
+    <AlertDialog
+      open={Boolean(removeMemberTarget)}
+      onOpenChange={(open) => {
+        if (removingMemberId) return;
+        if (!open) setRemoveMemberTarget(null);
+      }}
+    >
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle icon={RiDeleteBinLine}>
+            {removeMemberTarget
+              ? formatI18nTemplate(copy.members.removeMemberAction, {
+                  target:
+                    removeMemberTarget.name ||
+                    removeMemberTarget.username ||
+                    removeMemberTarget.email,
+                })
+              : copy.members.remove}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {removeMemberTarget
+              ? formatI18nTemplate(copy.members.removeMemberConfirm, {
+                  target:
+                    removeMemberTarget.name ||
+                    removeMemberTarget.username ||
+                    removeMemberTarget.email,
+                })
+              : null}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={Boolean(removingMemberId)}>
+            <RiCloseLine className="size-4" />
+            <span>{messages.teamSelect.cancel}</span>
+          </AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={!removeMemberTarget || Boolean(removingMemberId)}
+            onClick={(event) => {
+              event.preventDefault();
+              if (removeMemberTarget) {
+                void handleRemoveMember(removeMemberTarget.userId);
+              }
+            }}
+          >
+            <RiDeleteBinLine className="size-4" />
+            <span>{copy.members.remove}</span>
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+
   return (
     <div className="space-y-6">
       {inviteSiteAccessDialog}
       {siteAccessDialog}
+      {revokeInviteDialog}
+      {removeMemberDialog}
       <PageHeading
         title={`${panelTitle} · ${currentTeamName}`}
         subtitle={panelSubtitle}
@@ -1713,7 +1844,6 @@ export function TeamManagementClient({
                       href={buildSitePath(locale, activeTeam.slug, site.slug)}
                       className="group block h-full cursor-pointer outline-none transition-transform hover:-translate-y-0.5 active:translate-y-0 focus-visible:ring-1 focus-visible:ring-ring/60"
                       aria-label={`${copy.sites.openAnalytics}: ${site.name}`}
-                      title={copy.sites.openAnalytics}
                     >
                       <Card className="h-full transition-colors group-hover:bg-accent/20">
                         <CardHeader className="space-y-2">

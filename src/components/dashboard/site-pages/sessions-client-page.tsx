@@ -3,16 +3,16 @@ import { RiSearchLine } from "@remixicon/react";
 import { useInfiniteQuery } from "@tanstack/react-query";
 
 import {
-  type AnalyticsTableColumnDefinition,
   AnalyticsTableColumnSettings,
   useAnalyticsTableColumns,
 } from "@/components/dashboard/analytics-table-column-settings";
 import { PageHeading } from "@/components/dashboard/page-heading";
 import {
+  createSessionTableColumnDefinitions,
+  SESSION_TABLE_COLUMNS_STORAGE_KEY,
   type SessionSortKey,
   type SessionSortState,
   SessionsTableCard,
-  type SessionTableColumnId,
 } from "@/components/dashboard/sessions-table-card";
 import {
   DETAIL_QUERY_PARAM,
@@ -28,6 +28,7 @@ import {
   useLiveSearchParams,
 } from "@/lib/client-history";
 import { fetchSessions } from "@/lib/dashboard/client-data";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import { serializeDashboardSearchParams } from "@/lib/dashboard/filter-state";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
 import type { JourneySession } from "@/lib/edge-client";
@@ -86,30 +87,12 @@ export function SessionsClientPage({
   pathname,
 }: SessionsClientPageProps) {
   const labels = messages.sessions;
-  const sessionColumnDefinitions = useMemo<
-    readonly AnalyticsTableColumnDefinition<SessionTableColumnId>[]
-  >(
-    () => [
-      { id: "visitor", label: labels.visitor, required: true },
-      { id: "sessionId", label: labels.sessionId, required: true },
-      { id: "started", label: labels.started },
-      { id: "duration", label: labels.duration },
-      { id: "pageViews", label: labels.pageViews },
-      { id: "customEvents", label: labels.customEvents },
-      { id: "referrer", label: labels.referrer },
-      { id: "location", label: labels.location },
-      { id: "os", label: labels.os },
-      { id: "browser", label: labels.browser },
-      { id: "device", label: labels.device },
-      { id: "entryPage", label: labels.entryPage },
-      { id: "exitPage", label: labels.exitPage },
-      { id: "screenSize", label: labels.screenSize },
-      { id: "exitTime", label: labels.exitTime },
-    ],
+  const sessionColumnDefinitions = useMemo(
+    () => createSessionTableColumnDefinitions(labels),
     [labels],
   );
   const sessionColumns = useAnalyticsTableColumns({
-    storageKey: "insightflare:analytics-table-columns:sessions",
+    storageKey: SESSION_TABLE_COLUMNS_STORAGE_KEY,
     columns: sessionColumnDefinitions,
   });
   const { filters, window: timeWindow } = useDashboardQuery() as {
@@ -124,7 +107,7 @@ export function SessionsClientPage({
   const [nestedDetails, setNestedDetails] = useState<NestedJourneyDetail[]>([]);
   const nestedDetailKeyRef = useRef(0);
   const openedDetailFromListRef = useRef(false);
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -165,7 +148,7 @@ export function SessionsClientPage({
     queryFn: ({ pageParam, signal }) =>
       fetchSessions(siteId, timeWindow, filters, {
         cursor: pageParam,
-        pageSize: SESSION_PAGE_SIZE,
+        limit: SESSION_PAGE_SIZE,
         sortBy: sort.key,
         sortDir: sort.direction,
         search: debouncedQuery,
@@ -173,13 +156,15 @@ export function SessionsClientPage({
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) =>
-      lastPage.meta.hasMore ? lastPage.meta.nextCursor : undefined,
+      lastPage.data.pagination.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
     enabled: typeof window !== "undefined",
   });
   const rows = useMemo(
     () =>
       data?.pages.reduce<JourneySession[]>(
-        (current, page) => appendUniqueSessions(current, page.data),
+        (current, page) => appendUniqueSessions(current, page.data.items),
         [],
       ) ?? [],
     [data?.pages],

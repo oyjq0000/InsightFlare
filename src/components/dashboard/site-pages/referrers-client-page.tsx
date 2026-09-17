@@ -1,17 +1,31 @@
-import { useMemo } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useCallback, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
+import type { ComparisonTableMetric } from "@/components/dashboard/comparison-table";
 import { PageHeading } from "@/components/dashboard/page-heading";
-import { ReferrerBreakdownCard } from "@/components/dashboard/referrer-breakdown-card";
+import {
+  ReferrerBreakdownCard,
+  type ReferrerBreakdownGroupKey,
+} from "@/components/dashboard/referrer-breakdown-card";
 import { ReferrerPerformanceRadarCard } from "@/components/dashboard/referrer-performance-radar-card";
 import { ReferrerShareTrendCard } from "@/components/dashboard/referrer-share-trend-card";
 import { ReferrerSummarySection } from "@/components/dashboard/referrer-summary-section";
-import { buildReferrerRowsByTab } from "@/components/dashboard/referrer-utils";
+import {
+  buildReferrerRowsByTab,
+  type ReferrerSortKey,
+  type ReferrerTab,
+} from "@/components/dashboard/referrer-utils";
 import { useDashboardQuery } from "@/components/dashboard/site-pages/use-dashboard-query";
+import type { TabbedDataTableLoader } from "@/components/dashboard/tabbed-data-table-card";
+import {
+  dashboardComparisonLabel,
+  useDashboardComparisonQuery,
+} from "@/components/dashboard/use-dashboard-comparison-query";
 import {
   fetchOverviewSourceCardTab,
-  type OverviewTabRows,
+  fetchReferrerSummary,
 } from "@/lib/dashboard/client-data";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
 import type { FilterDocument } from "@/lib/filter-contract";
 import type { Locale } from "@/lib/i18n/config";
@@ -25,8 +39,6 @@ interface ReferrersClientPageProps {
   showSourceLinkTab?: boolean;
 }
 
-const EMPTY_ROWS: OverviewTabRows = [];
-
 export function ReferrersClientPage({
   locale,
   messages,
@@ -38,8 +50,25 @@ export function ReferrersClientPage({
     filters: FilterDocument;
     window: TimeWindow;
   };
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
-  const requestFilters = useMemo(() => ({ ...filters }), [filtersKey]);
+  const comparisonQuery = useDashboardComparisonQuery(window, filters);
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
+  const comparisonFiltersKey = useMemo(
+    () => (comparisonQuery ? filterQueryKey(comparisonQuery.filters) : "none"),
+    [comparisonQuery],
+  );
+  const requestFilters = filters;
+  const [comparisonMetricByGroup, setComparisonMetricByGroup] = useState<
+    Record<ReferrerBreakdownGroupKey, ComparisonTableMetric>
+  >({ source: "views", channel: "views" });
+  const handleComparisonMetricChange = useCallback(
+    (group: ReferrerBreakdownGroupKey, metric: ComparisonTableMetric) => {
+      setComparisonMetricByGroup((current) => ({
+        ...current,
+        [group]: metric,
+      }));
+    },
+    [],
+  );
   const requestWindow = useMemo(
     () => ({
       preset: window.preset,
@@ -50,67 +79,108 @@ export function ReferrersClientPage({
     }),
     [window.from, window.interval, window.preset, window.timeZone, window.to],
   );
-
-  const { data: rowsByTab, isFetching: loading } = useQuery({
+  const comparisonKey = comparisonQuery
+    ? `${comparisonQuery.mode}:${comparisonQuery.window.from}:${comparisonQuery.window.to}:${comparisonFiltersKey}`
+    : "none";
+  const requestKey = `${siteId}:${window.from}:${window.to}:${window.interval}:${window.timeZone}:${locale}:${filtersKey}:${comparisonKey}`;
+  const summaryQuery = useQuery({
     queryKey: [
       "dashboard",
-      "referrer-breakdown",
+      "referrer-summary",
       siteId,
-      showSourceLinkTab,
       window.from,
       window.to,
       window.interval,
       window.timeZone,
       filtersKey,
+      comparisonQuery?.mode ?? "none",
+      comparisonQuery?.window.from ?? "none",
+      comparisonQuery?.window.to ?? "none",
+      comparisonQuery?.window.interval ?? "none",
+      comparisonQuery?.window.timeZone ?? "none",
+      comparisonFiltersKey,
     ],
     queryFn: async ({ signal }) => {
-      const [domain, link, channel] = await Promise.all([
-        fetchOverviewSourceCardTab(
-          siteId,
-          requestWindow,
-          "domain",
-          requestFilters,
-          { limit: 100, signal },
-        ),
-        showSourceLinkTab
-          ? fetchOverviewSourceCardTab(
+      const [current, comparison] = await Promise.all([
+        fetchReferrerSummary(siteId, requestWindow, requestFilters, {
+          topN: 5,
+          signal,
+        }),
+        comparisonQuery
+          ? fetchReferrerSummary(
               siteId,
-              requestWindow,
-              "link",
-              requestFilters,
-              { limit: 100, signal },
+              comparisonQuery.window,
+              comparisonQuery.filters,
+              { topN: 5, signal },
             )
-          : Promise.resolve(EMPTY_ROWS),
-        fetchOverviewSourceCardTab(
-          siteId,
-          requestWindow,
-          "channel",
-          requestFilters,
-          { limit: 100, signal },
-        ),
+          : Promise.resolve(null),
       ]);
-      return { domain, link, channel };
+      return { current, comparison };
     },
-    placeholderData: keepPreviousData,
     enabled: typeof window !== "undefined",
   });
-  const resolvedRowsByTab = rowsByTab ?? {
-    domain: EMPTY_ROWS,
-    link: EMPTY_ROWS,
-    channel: EMPTY_ROWS,
-  };
-
-  const normalizedRowsByTab = useMemo(
-    () =>
-      buildReferrerRowsByTab(
-        resolvedRowsByTab,
+  const loader = useCallback<
+    TabbedDataTableLoader<
+      ReferrerTab,
+      ReturnType<typeof buildReferrerRowsByTab>["domain"][number],
+      ReferrerSortKey
+    >
+  >(
+    async ({ tab, cursor, limit, search, sort, signal }) => {
+      const comparisonMetric =
+        tab === "channel"
+          ? comparisonMetricByGroup.channel
+          : comparisonMetricByGroup.source;
+      const page = await fetchOverviewSourceCardTab(
+        siteId,
+        requestWindow,
+        tab,
+        requestFilters,
+        {
+          limit,
+          search,
+          sort:
+            sort.key === "current" ||
+            sort.key === "reference" ||
+            sort.key === "change"
+              ? comparisonMetric
+              : sort.key,
+          direction: sort.direction,
+          cursor,
+          signal,
+          comparison: comparisonQuery,
+          comparisonMetric,
+          comparisonSortBy:
+            sort.key === "current" ||
+            sort.key === "reference" ||
+            sort.key === "change"
+              ? sort.key
+              : undefined,
+        },
+      );
+      const normalized = buildReferrerRowsByTab(
+        {
+          domain: tab === "domain" ? page.items : [],
+          link: tab === "link" ? page.items : [],
+          channel: tab === "channel" ? page.items : [],
+        },
         messages.overview.direct,
         messages.overview.channelLabels,
-      ),
+      );
+      return {
+        items: normalized[tab],
+        pagination: page.pagination,
+      };
+    },
     [
       messages.overview.channelLabels,
       messages.overview.direct,
-      resolvedRowsByTab,
+      requestFilters,
+      requestWindow,
+      comparisonMetricByGroup.channel,
+      comparisonMetricByGroup.source,
+      comparisonQuery,
+      siteId,
     ],
   );
 
@@ -124,8 +194,10 @@ export function ReferrersClientPage({
       <ReferrerSummarySection
         locale={locale}
         messages={messages}
-        rowsByTab={normalizedRowsByTab}
-        loading={loading}
+        summary={summaryQuery.data?.current.data ?? null}
+        comparisonSummary={summaryQuery.data?.comparison?.data ?? null}
+        comparisonLabel={dashboardComparisonLabel(messages, comparisonQuery)}
+        loading={summaryQuery.isFetching}
         hideSummaryCard
       />
 
@@ -150,8 +222,12 @@ export function ReferrersClientPage({
         messages={messages}
         pathname={pathname}
         filters={requestFilters}
-        rowsByTab={normalizedRowsByTab}
-        loading={loading}
+        comparisonQuery={comparisonQuery}
+        comparisonLabel={dashboardComparisonLabel(messages, comparisonQuery)}
+        comparisonMetricByGroup={comparisonMetricByGroup}
+        onComparisonMetricChange={handleComparisonMetricChange}
+        requestKey={requestKey}
+        loader={loader}
         showSourceLinkTab={showSourceLinkTab}
       />
     </div>

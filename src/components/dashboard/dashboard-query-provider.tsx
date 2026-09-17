@@ -10,6 +10,10 @@ import {
 } from "react";
 
 import { useReportingTimeZone } from "@/components/time-zone-provider";
+import {
+  replaceUrlWithoutNavigation,
+  useLiveSearchParams,
+} from "@/lib/client-history";
 import { EMPTY_DASHBOARD_FILTER_DOCUMENT } from "@/lib/dashboard/filter-state";
 import {
   readDashboardQueryPreferences,
@@ -23,6 +27,7 @@ import {
   type DashboardInterval,
   DEFAULT_RANGE_PRESET,
   finestIntervalForRange,
+  parseFilterDocumentFromSearchParams,
   type RangePreset,
   resolveRangePreset,
   resolveTimeWindow,
@@ -30,8 +35,12 @@ import {
 } from "@/lib/dashboard/query-state";
 import {
   analyticsFilterRegistry,
+  attachFilterScopePreference,
   type FilterDocument,
+  type FilterScopePreference,
+  filterScopePreferenceFromDocument,
   normalizeFilterDocument,
+  parseFilterScopePreference,
 } from "@/lib/filter-contract";
 
 interface DashboardQueryContextValue {
@@ -40,11 +49,13 @@ interface DashboardQueryContextValue {
   filters: FilterDocument;
   uiFilters: FilterDocument;
   uiFilterDsl?: string;
+  scopePreference: FilterScopePreference;
   customRange: CustomTimeRange | null;
   setRange: (range: RangePreset) => void;
   setCustomRange: (range: CustomTimeRange | null) => void;
   setInterval: (interval: DashboardInterval) => void;
   setUiFilters: (filters: FilterDocument, rawDsl?: string) => void;
+  setScopePreference: (preference: FilterScopePreference) => void;
   clearUiFilters: () => void;
   allowedIntervals: DashboardInterval[];
   timeZone: string;
@@ -56,6 +67,8 @@ interface DashboardQueryProviderProps {
   scopeKey?: string;
   maxRangeDays?: number;
   initialWindow?: TimeWindow;
+  initialFilters?: FilterDocument;
+  initialScopePreference?: FilterScopePreference;
 }
 
 const EMPTY_FILTERS = EMPTY_DASHBOARD_FILTER_DOCUMENT;
@@ -70,10 +83,22 @@ function normalizeFilters(
 ): FilterDocument {
   if (!filters) return EMPTY_FILTERS;
   try {
-    return normalizeFilterDocument(filters, analyticsFilterRegistry);
+    const normalized = normalizeFilterDocument(
+      filters,
+      analyticsFilterRegistry,
+    );
+    const scopePreference = filterScopePreferenceFromDocument(filters);
+    return scopePreference
+      ? attachFilterScopePreference(normalized, scopePreference)
+      : normalized;
   } catch {
     return EMPTY_FILTERS;
   }
+}
+
+function readInitialScopePreference(): FilterScopePreference {
+  if (typeof window === "undefined") return "auto";
+  return parseFilterScopePreference(window.location.search);
 }
 
 function filterDocumentKey(filters: FilterDocument): string {
@@ -98,7 +123,24 @@ function normalizeCustomRange(
   };
 }
 
-function buildInitialState(timeZone: string, initialWindow?: TimeWindow) {
+function buildInitialState(
+  timeZone: string,
+  initialWindow?: TimeWindow,
+  initialScope?: FilterScopePreference,
+  initialFilters?: FilterDocument,
+) {
+  const normalizedFilters = normalizeFilters(initialFilters ?? EMPTY_FILTERS);
+  const requestedScopePreference =
+    initialScope ??
+    filterScopePreferenceFromDocument(initialFilters) ??
+    readInitialScopePreference();
+  const scopePreference = normalizedFilters.root
+    ? requestedScopePreference
+    : "auto";
+  const uiFilters = attachFilterScopePreference(
+    normalizedFilters,
+    scopePreference,
+  );
   if (initialWindow) {
     return {
       range: initialWindow.preset,
@@ -107,8 +149,9 @@ function buildInitialState(timeZone: string, initialWindow?: TimeWindow) {
         initialWindow.preset === "custom"
           ? { from: initialWindow.from, to: initialWindow.to }
           : null,
-      uiFilters: EMPTY_FILTERS,
+      uiFilters,
       uiFilterDsl: undefined,
+      scopePreference,
     };
   }
 
@@ -120,8 +163,9 @@ function buildInitialState(timeZone: string, initialWindow?: TimeWindow) {
       range: DEFAULT_RANGE as RangePreset,
       interval: initialWindow.interval as DashboardInterval,
       customRange: null as CustomTimeRange | null,
-      uiFilters: EMPTY_FILTERS,
+      uiFilters,
       uiFilterDsl: undefined,
+      scopePreference,
     };
   }
 
@@ -138,8 +182,9 @@ function buildInitialState(timeZone: string, initialWindow?: TimeWindow) {
     range: persistedRange,
     interval: persistedWindow.interval,
     customRange: persistedCustomRange,
-    uiFilters: EMPTY_FILTERS,
+    uiFilters,
     uiFilterDsl: undefined,
+    scopePreference,
   };
 }
 
@@ -167,7 +212,6 @@ function clampPresetForMaxDays(
   if (range === "thisYear" && maxRangeDays <= 90) {
     return "90d";
   }
-  if (range === "all") return "12m";
   return range;
 }
 
@@ -176,8 +220,37 @@ export function DashboardQueryProvider({
   scopeKey = "",
   maxRangeDays,
   initialWindow,
+  initialFilters,
+  initialScopePreference,
 }: DashboardQueryProviderProps) {
   const { timeZone: managedTimeZone } = useReportingTimeZone();
+  const routeSearchParams = useLiveSearchParams();
+  const routeSearchParamsKey = routeSearchParams.toString();
+  // During the first client render after SSR, useSyncExternalStore may still
+  // use its server snapshot (an empty search string) for hydration. Capture
+  // the browser URL separately so the first analytics query cannot run with
+  // an empty filter document and leave its unfiltered result in the cache.
+  const initialRouteSearchParamsKeyRef = useRef<string | null>(null);
+  if (initialRouteSearchParamsKeyRef.current === null) {
+    initialRouteSearchParamsKeyRef.current =
+      typeof window === "undefined"
+        ? routeSearchParamsKey
+        : window.location.search;
+  }
+  const routeQueryDocument = useMemo(
+    () =>
+      parseFilterDocumentFromSearchParams(
+        new URLSearchParams(routeSearchParamsKey),
+      ),
+    [routeSearchParamsKey],
+  );
+  const initialRouteQueryDocument = useMemo(
+    () =>
+      parseFilterDocumentFromSearchParams(
+        new URLSearchParams(initialRouteSearchParamsKeyRef.current ?? ""),
+      ),
+    [],
+  );
   const initialCookieTimeZone =
     typeof document === "undefined"
       ? managedTimeZone
@@ -187,7 +260,12 @@ export function DashboardQueryProvider({
     () => initialWindowRef.current?.timeZone ?? initialCookieTimeZone,
   );
   const [initial] = useState(() =>
-    buildInitialState(timeZone, initialWindowRef.current),
+    buildInitialState(
+      timeZone,
+      initialWindowRef.current,
+      initialScopePreference,
+      initialFilters ?? initialRouteQueryDocument,
+    ),
   );
   const [range, setRangeState] = useState<RangePreset>(
     clampPresetForMaxDays(initial.range, maxRangeDays),
@@ -204,10 +282,13 @@ export function DashboardQueryProvider({
   const [uiFilterDsl, setUiFilterDslState] = useState<string | undefined>(
     initial.uiFilterDsl,
   );
+  const [scopePreference, setScopePreferenceState] =
+    useState<FilterScopePreference>(initial.scopePreference);
   const [uiFilterDslDocumentKey, setUiFilterDslDocumentKey] = useState(() =>
     initial.uiFilterDsl ? filterDocumentKey(initial.uiFilters) : undefined,
   );
   const previousScopeKeyRef = useRef(scopeKey);
+  const previousRouteSearchParamsKeyRef = useRef(routeSearchParamsKey);
 
   useEffect(() => {
     setTimeZone(managedTimeZone);
@@ -264,12 +345,58 @@ export function DashboardQueryProvider({
 
   useEffect(() => {
     if (previousScopeKeyRef.current === scopeKey) return;
+    const previousScopeKey = previousScopeKeyRef.current;
     previousScopeKeyRef.current = scopeKey;
+    // The shell can render before its site list has resolved. Treat the
+    // initial empty-to-site transition as scope initialization so URL filters
+    // are not cleared after the first correctly scoped request completes.
+    if (!previousScopeKey) return;
     // Site-scoped data filters are easy to carry across sites and cause empty states.
     setUiFiltersState(EMPTY_FILTERS);
     setUiFilterDslState(undefined);
     setUiFilterDslDocumentKey(undefined);
   }, [scopeKey]);
+
+  useEffect(() => {
+    if (previousRouteSearchParamsKeyRef.current === routeSearchParamsKey) {
+      return;
+    }
+    previousRouteSearchParamsKeyRef.current = routeSearchParamsKey;
+
+    const requestedScopePreference = parseFilterScopePreference(
+      new URLSearchParams(routeSearchParamsKey),
+    );
+    const normalizedFilters = normalizeFilters(routeQueryDocument);
+    const nextScopePreference = normalizedFilters.root
+      ? requestedScopePreference
+      : "auto";
+    const nextFilters = attachFilterScopePreference(
+      normalizedFilters,
+      nextScopePreference,
+    );
+    const nextDocumentKey = filterDocumentKey(nextFilters);
+
+    setScopePreferenceState(nextScopePreference);
+    setUiFiltersState(nextFilters);
+    if (uiFilterDslDocumentKey !== nextDocumentKey) {
+      setUiFilterDslState(undefined);
+      setUiFilterDslDocumentKey(undefined);
+    }
+  }, [routeQueryDocument, routeSearchParamsKey, uiFilterDslDocumentKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("scope")) return;
+    if (parseFilterDocumentFromSearchParams(params).root) return;
+
+    params.delete("scope");
+    const search = params.toString();
+    replaceUrlWithoutNavigation(
+      `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`,
+    );
+  }, [routeSearchParamsKey]);
 
   const setRange = useCallback(
     (next: RangePreset) => {
@@ -310,11 +437,21 @@ export function DashboardQueryProvider({
     setIntervalState(next);
   }, []);
 
+  const setScopePreference = useCallback((next: FilterScopePreference) => {
+    setScopePreferenceState(next);
+    setUiFiltersState((current) =>
+      attachFilterScopePreference(normalizeFilters(current), next),
+    );
+  }, []);
+
   const setUiFilters = useCallback(
     (next: FilterDocument, rawDsl?: string) => {
       const normalized = normalizeFilters(next);
-      const nextKey = filterDocumentKey(normalized);
-      setUiFiltersState(normalized);
+      const nextScope =
+        filterScopePreferenceFromDocument(next) ?? scopePreference;
+      const scoped = attachFilterScopePreference(normalized, nextScope);
+      const nextKey = filterDocumentKey(scoped);
+      setUiFiltersState(scoped);
       if (rawDsl !== undefined) {
         const persisted = persistedRawDsl(rawDsl);
         setUiFilterDslState(persisted);
@@ -326,14 +463,16 @@ export function DashboardQueryProvider({
         setUiFilterDslDocumentKey(undefined);
       }
     },
-    [uiFilterDslDocumentKey],
+    [scopePreference, uiFilterDslDocumentKey],
   );
 
   const clearUiFilters = useCallback(() => {
-    setUiFiltersState(EMPTY_FILTERS);
+    setUiFiltersState(
+      attachFilterScopePreference(EMPTY_FILTERS, scopePreference),
+    );
     setUiFilterDslState(undefined);
     setUiFilterDslDocumentKey(undefined);
-  }, []);
+  }, [scopePreference]);
 
   const allowedIntervals = useMemo(
     () => allowedIntervalsForRange(windowState.from, windowState.to),
@@ -347,11 +486,13 @@ export function DashboardQueryProvider({
       filters: normalizeFilters(uiFilters),
       uiFilters,
       uiFilterDsl,
+      scopePreference,
       customRange,
       setRange,
       setCustomRange,
       setInterval,
       setUiFilters,
+      setScopePreference,
       clearUiFilters,
       allowedIntervals,
       timeZone,
@@ -362,11 +503,13 @@ export function DashboardQueryProvider({
       windowState,
       uiFilters,
       uiFilterDsl,
+      scopePreference,
       customRange,
       setRange,
       setCustomRange,
       setInterval,
       setUiFilters,
+      setScopePreference,
       clearUiFilters,
       allowedIntervals,
       timeZone,
@@ -391,11 +534,13 @@ function useDashboardQueryContext(): DashboardQueryContextValue {
       filters: EMPTY_FILTERS,
       uiFilters: EMPTY_FILTERS,
       uiFilterDsl: undefined,
+      scopePreference: "auto",
       customRange: null,
       setRange: () => {},
       setCustomRange: () => {},
       setInterval: () => {},
       setUiFilters: () => {},
+      setScopePreference: () => {},
       clearUiFilters: () => {},
       allowedIntervals: ["hour", "day", "week", "month"],
       timeZone: fallbackWindow.timeZone,
@@ -411,6 +556,7 @@ export function useDashboardQuery() {
     range: context.range,
     filters: context.filters,
     window: context.window,
+    scopePreference: context.scopePreference,
   };
 }
 

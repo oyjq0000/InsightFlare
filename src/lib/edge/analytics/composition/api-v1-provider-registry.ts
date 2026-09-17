@@ -31,6 +31,8 @@ import {
 } from "@/lib/edge/analytics/providers/d1/operations/site-events";
 import { readSiteFilterValues } from "@/lib/edge/analytics/providers/d1/operations/site-filter-values";
 import { readSiteFunnelAnalysis } from "@/lib/edge/analytics/providers/d1/operations/site-funnel-analysis";
+import { readSiteGoalSummary } from "@/lib/edge/analytics/providers/d1/operations/site-goal-summary";
+import { readSiteGoalTimeseries } from "@/lib/edge/analytics/providers/d1/operations/site-goal-timeseries";
 import {
   readSiteJourneyEventDetail,
   readSiteSessionDetail,
@@ -96,6 +98,9 @@ function timeWindow(time: QueryTime): QueryWindow {
     endExclusiveMs: time.range.endExclusiveMs,
     nowMs: time.capturedAtMs,
     timeZone: time.reportingTimeZone,
+    ...(time.paginationBinding
+      ? { paginationBinding: time.paginationBinding }
+      : {}),
   };
 }
 
@@ -152,6 +157,14 @@ function analyticsResultProvider<Result>(
             time: runtimeInput.time,
             source: result.source ?? "raw",
             approximateVisitors: Boolean(result.approximateVisitors),
+            ...(runtimeInput.scopePlan
+              ? {
+                  filterScope: {
+                    requested: runtimeInput.scopePreference ?? "auto",
+                    resolved: runtimeInput.scopePlan.scope,
+                  },
+                }
+              : {}),
           },
         },
       };
@@ -250,7 +263,7 @@ function registerSiteOperation(
             siteId: siteId(input, configuredSiteId),
             field: stringField(input, "field"),
             search: typeof input.search === "string" ? input.search : undefined,
-            limit: limitField(input),
+            page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
           }),
@@ -284,6 +297,37 @@ function registerSiteOperation(
           });
           return result;
         }),
+      );
+      return;
+    case "site.analytics.goalSummary":
+      registry.register(
+        operation,
+        provider((input) =>
+          readSiteGoalSummary({
+            env,
+            siteId: siteId(input, configuredSiteId),
+            goalId: stringField(input, "goalId"),
+            window: timeWindow(input.time),
+            filters: filters(input),
+            scopedDataset: input.scopedDataset,
+          }),
+        ),
+      );
+      return;
+    case "site.analytics.goalTimeseries":
+      registry.register(
+        operation,
+        provider((input) =>
+          readSiteGoalTimeseries({
+            env,
+            siteId: siteId(input, configuredSiteId),
+            goalId: stringField(input, "goalId"),
+            interval: input.interval as never,
+            window: timeWindow(input.time),
+            filters: filters(input),
+            scopedDataset: input.scopedDataset,
+          }),
+        ),
       );
       return;
     case "site.analytics.performanceSummary":
@@ -353,7 +397,7 @@ function registerSiteOperation(
             env,
             siteId: siteId(input, configuredSiteId),
             search: typeof input.search === "string" ? input.search : undefined,
-            limit: limitField(input),
+            page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
           }),
@@ -383,9 +427,10 @@ function registerSiteOperation(
             env,
             siteId: siteId(input, configuredSiteId),
             eventName: stringField(input, "eventName"),
-            limit: limitField(input),
+            page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -401,9 +446,10 @@ function registerSiteOperation(
             fieldPath: stringField(input, "fieldPath"),
             fieldValueType: stringField(input, "fieldValueType"),
             search: typeof input.search === "string" ? input.search : undefined,
-            limit: limitField(input),
+            page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -422,6 +468,7 @@ function registerSiteOperation(
             page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -474,10 +521,7 @@ function registerSiteOperation(
             siteId: siteId(input, configuredSiteId),
             eventId: stringField(input, "eventId"),
             eventKind: stringField(input, "eventKind") as
-              | "pageview"
-              | "session_start"
-              | "leave"
-              | undefined,
+              "pageview" | "session_start" | "leave" | undefined,
             window: timeWindow(input.time),
           }),
         ),
@@ -495,6 +539,7 @@ function registerSiteOperation(
             page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -511,6 +556,7 @@ function registerSiteOperation(
             page: page(input),
             window: timeWindow(input.time),
             filters: filters(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -527,6 +573,7 @@ function registerSiteOperation(
             window: timeWindow(input.time),
             filters: filters(input),
             page: page(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -543,6 +590,7 @@ function registerSiteOperation(
             window: timeWindow(input.time),
             filters: filters(input),
             page: page(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );
@@ -559,6 +607,7 @@ function registerSiteOperation(
             window: timeWindow(input.time),
             filters: filters(input),
             page: page(input),
+            audience: input.context.policy.audience,
           }),
         ),
       );

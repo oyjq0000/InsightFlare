@@ -35,6 +35,7 @@ import {
   OsMeta,
   ReferrerMeta,
   VisitorAvatar,
+  visitorDisplayName,
 } from "@/components/dashboard/journey-display";
 import { PageHeading } from "@/components/dashboard/page-heading";
 import {
@@ -53,6 +54,7 @@ import {
   useLiveSearchParams,
 } from "@/lib/client-history";
 import { fetchVisitors } from "@/lib/dashboard/client-data";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import { serializeDashboardSearchParams } from "@/lib/dashboard/filter-state";
 import { numberFormat } from "@/lib/dashboard/format";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
@@ -60,6 +62,7 @@ import type { VisitorsData } from "@/lib/edge-client";
 import type { FilterDocument } from "@/lib/filter-contract";
 import type { Locale } from "@/lib/i18n/config";
 import type { AppMessages } from "@/lib/i18n/messages";
+import { formatI18nTemplate } from "@/lib/i18n/template";
 import { cn } from "@/lib/utils";
 
 interface VisitorsClientPageProps {
@@ -69,20 +72,23 @@ interface VisitorsClientPageProps {
   pathname: string;
 }
 
-type VisitorRow = VisitorsData["data"][number];
+export type VisitorRow = VisitorsData["data"]["items"][number];
 
-const VISITOR_PAGE_SIZE = 50;
-const VISITOR_SKELETON_ROWS = 25;
+export const VISITOR_PAGE_SIZE = 50;
+export const VISITOR_SKELETON_ROWS = 25;
+export const VISITOR_TABLE_COLUMNS_STORAGE_KEY =
+  "insightflare:analytics-table-columns:visitors";
 
-type SortDirection = "asc" | "desc";
-type VisitorSortKey = "firstSeenAt" | "lastSeenAt" | "sessions" | "views";
+export type SortDirection = "asc" | "desc";
+export type VisitorSortKey =
+  "firstSeenAt" | "lastSeenAt" | "sessions" | "views";
 
-interface VisitorSortState {
+export interface VisitorSortState {
   key: VisitorSortKey;
   direction: SortDirection;
 }
 
-type VisitorTableColumnId =
+export type VisitorTableColumnId =
   | "visitor"
   | "sessionId"
   | "firstSeen"
@@ -97,10 +103,31 @@ type VisitorTableColumnId =
   | "device"
   | "screenSize";
 
-const DEFAULT_VISITOR_SORT: VisitorSortState = {
+export const DEFAULT_VISITOR_SORT: VisitorSortState = {
   key: "lastSeenAt",
   direction: "desc",
 };
+
+export function createVisitorTableColumnDefinitions(
+  labels: AppMessages["visitors"],
+  visitorIdLabel: string,
+): readonly AnalyticsTableColumnDefinition<VisitorTableColumnId>[] {
+  return [
+    { id: "visitor", label: labels.visitor, required: true },
+    { id: "sessionId", label: visitorIdLabel },
+    { id: "firstSeen", label: labels.firstSeen },
+    { id: "lastSeen", label: labels.lastSeen },
+    { id: "sessions", label: labels.sessions },
+    { id: "pageViews", label: labels.pageViews },
+    { id: "customEvents", label: labels.customEvents },
+    { id: "referrer", label: labels.referrer },
+    { id: "location", label: labels.location },
+    { id: "os", label: labels.os },
+    { id: "browser", label: labels.browser },
+    { id: "device", label: labels.device },
+    { id: "screenSize", label: labels.screenSize },
+  ];
+}
 
 type NestedJourneyDetail = {
   kind: "session" | "visitor";
@@ -186,6 +213,7 @@ function SortIndicator({
 
 function SortHeader({
   label,
+  ariaLabel,
   active,
   direction,
   onClick,
@@ -193,6 +221,7 @@ function SortHeader({
   className,
 }: {
   label: string;
+  ariaLabel?: string;
   active: boolean;
   direction: SortDirection;
   onClick: () => void;
@@ -215,6 +244,7 @@ function SortHeader({
       >
         <button
           type="button"
+          aria-label={ariaLabel ?? label}
           className={cn(
             "inline-flex items-center gap-1 whitespace-nowrap transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
             active ? "text-foreground" : "text-muted-foreground",
@@ -268,6 +298,9 @@ const VisitorTableRowContent = memo(function VisitorTableRowContent({
 }) {
   const openDetail = () => onOpenDetail(row.visitorId);
   const visitorId = row.visitorId.trim();
+  const userId = String(row.userId || "").trim();
+  const userName = String(row.userName || "").trim();
+  const displayName = visitorDisplayName(userName, userId, labels.anonymous);
   const referrerHost = String(row.referrerHost || "").trim();
   const referrerUrl = String(row.referrerUrl || "").trim();
   const referrerDetails = {
@@ -311,13 +344,32 @@ const VisitorTableRowContent = memo(function VisitorTableRowContent({
         focusable
         ariaLabel={`${labels.visitor}: ${row.visitorId}`}
       >
-        <div className="flex w-28 items-center gap-2">
+        <div className="flex w-28 min-w-0 items-center gap-2">
           <VisitorAvatar seed={row.visitorId} className="size-6" />
           <AnalyticsDetailsTooltipTarget
+            className="min-w-0 flex-1 truncate"
             locale={locale}
             request={{
               key: `visitor-id:${visitorId}`,
               items: [
+                ...(userName
+                  ? [
+                      {
+                        label: messages.visitorDetail.userName,
+                        value: userName,
+                        copyValue: userName,
+                      },
+                    ]
+                  : []),
+                ...(userId
+                  ? [
+                      {
+                        label: messages.visitorDetail.userId,
+                        value: userId,
+                        copyValue: userId,
+                      },
+                    ]
+                  : []),
                 {
                   label: messages.visitorDetail.visitorId,
                   value: visitorId || messages.common.unknown,
@@ -332,7 +384,7 @@ const VisitorTableRowContent = memo(function VisitorTableRowContent({
               ],
             }}
           >
-            <span className="truncate">{labels.anonymous}</span>
+            <span className="truncate">{displayName}</span>
           </AnalyticsDetailsTooltipTarget>
         </div>
       </ClickableTableCell>
@@ -528,7 +580,7 @@ function detailQueryTarget(
   return query ? `${pathname}?${query}` : pathname;
 }
 
-const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
+export const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
   locale,
   messages,
   labels,
@@ -574,6 +626,9 @@ const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
       firstSeen: (
         <SortHeader
           label={labels.firstSeen}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.firstSeen,
+          })}
           active={sort.key === "firstSeenAt"}
           direction={sort.direction}
           onClick={() => onToggleSort("firstSeenAt")}
@@ -584,6 +639,9 @@ const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
       lastSeen: (
         <SortHeader
           label={labels.lastSeen}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.lastSeen,
+          })}
           active={sort.key === "lastSeenAt"}
           direction={sort.direction}
           onClick={() => onToggleSort("lastSeenAt")}
@@ -594,6 +652,9 @@ const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
       sessions: (
         <SortHeader
           label={labels.sessions}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.sessions,
+          })}
           active={sort.key === "sessions"}
           direction={sort.direction}
           onClick={() => onToggleSort("sessions")}
@@ -604,6 +665,9 @@ const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
       pageViews: (
         <SortHeader
           label={labels.pageViews}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.pageViews,
+          })}
           active={sort.key === "views"}
           direction={sort.direction}
           onClick={() => onToggleSort("views")}
@@ -623,7 +687,13 @@ const VisitorAnalyticsTable = memo(function VisitorAnalyticsTable({
         <TableHead className="pr-4 text-center">{labels.screenSize}</TableHead>
       ),
     }),
-    [labels, messages.visitorDetail.visitorId, onToggleSort, sort],
+    [
+      labels,
+      messages.common.sortBy,
+      messages.visitorDetail.visitorId,
+      onToggleSort,
+      sort,
+    ],
   );
   const header = useMemo(
     () => (
@@ -691,28 +761,16 @@ export function VisitorsClientPage({
   pathname,
 }: VisitorsClientPageProps) {
   const labels = messages.visitors;
-  const visitorColumnDefinitions = useMemo<
-    readonly AnalyticsTableColumnDefinition<VisitorTableColumnId>[]
-  >(
-    () => [
-      { id: "visitor", label: labels.visitor, required: true },
-      { id: "sessionId", label: messages.visitorDetail.visitorId },
-      { id: "firstSeen", label: labels.firstSeen },
-      { id: "lastSeen", label: labels.lastSeen },
-      { id: "sessions", label: labels.sessions },
-      { id: "pageViews", label: labels.pageViews },
-      { id: "customEvents", label: labels.customEvents },
-      { id: "referrer", label: labels.referrer },
-      { id: "location", label: labels.location },
-      { id: "os", label: labels.os },
-      { id: "browser", label: labels.browser },
-      { id: "device", label: labels.device },
-      { id: "screenSize", label: labels.screenSize },
-    ],
+  const visitorColumnDefinitions = useMemo(
+    () =>
+      createVisitorTableColumnDefinitions(
+        labels,
+        messages.visitorDetail.visitorId,
+      ),
     [labels, messages.visitorDetail.visitorId],
   );
   const visitorColumns = useAnalyticsTableColumns({
-    storageKey: "insightflare:analytics-table-columns:visitors",
+    storageKey: VISITOR_TABLE_COLUMNS_STORAGE_KEY,
     columns: visitorColumnDefinitions,
   });
   const { filters, window: timeWindow } = useDashboardQuery() as {
@@ -728,7 +786,7 @@ export function VisitorsClientPage({
   const [nestedDetails, setNestedDetails] = useState<NestedJourneyDetail[]>([]);
   const nestedDetailKeyRef = useRef(0);
   const openedDetailFromListRef = useRef(false);
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -774,7 +832,7 @@ export function VisitorsClientPage({
     queryFn: ({ pageParam, signal }) =>
       fetchVisitors(siteId, timeWindow, filters, {
         cursor: pageParam,
-        pageSize: VISITOR_PAGE_SIZE,
+        limit: VISITOR_PAGE_SIZE,
         sortBy: sort.key,
         sortDir: sort.direction,
         search: debouncedQuery,
@@ -782,13 +840,15 @@ export function VisitorsClientPage({
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) =>
-      lastPage.meta.hasMore ? lastPage.meta.nextCursor : undefined,
+      lastPage.data.pagination.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
     enabled: typeof window !== "undefined",
   });
   const rows = useMemo(
     () =>
       data?.pages.reduce<VisitorRow[]>(
-        (current, page) => appendUniqueVisitors(current, page.data),
+        (current, page) => appendUniqueVisitors(current, page.data.items),
         [],
       ) ?? [],
     [data?.pages],

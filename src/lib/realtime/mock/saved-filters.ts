@@ -1,27 +1,31 @@
-import { parseFilterPanelExpression } from "@/lib/dashboard/filter-panel-expression";
 import {
   analyticsFilterRegistry,
   assertFilterAudience,
+  FILTER_DSL_MAX_LENGTH,
+  parseFilterDsl,
 } from "@/lib/filter-contract";
 import {
   SAVED_FILTER_DSL_VERSION,
+  SAVED_FILTER_SCOPE_PREFERENCES,
   SAVED_FILTER_VISIBILITIES,
   type SavedFilter,
   type SavedFilterInput,
+  type SavedFilterScopePreference,
   type SavedFilterVisibility,
 } from "@/lib/saved-filters";
 
 import { demoBadRequest, demoNotFound } from "./envelope";
+import { demoPage } from "./pagination";
 
 const DEMO_USER_ID = "demo-user-001";
 const MAX_NAME_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 2_000;
-const MAX_DSL_LENGTH = 65_536;
 
 interface SavedFilterPreset {
   readonly name: string;
   readonly description: string;
   readonly visibility: SavedFilterVisibility;
+  readonly scopePreference?: SavedFilterScopePreference;
   readonly filterDsl: string;
   readonly ownerUserId?: string;
   readonly authorName?: string;
@@ -379,6 +383,7 @@ function seedFilters(siteId: string): SavedFilter[] {
       authorName: preset.authorName ?? "Demo User",
       isOwner: ownerUserId === DEMO_USER_ID,
       visibility: preset.visibility,
+      scopePreference: preset.scopePreference ?? "auto",
       name: preset.name,
       description: preset.description,
       filterDsl: preset.filterDsl,
@@ -409,11 +414,13 @@ function parseInput(
   const filterDsl =
     typeof record.filterDsl === "string" ? record.filterDsl : null;
   const visibility = record.visibility;
+  const scopePreference =
+    record.scopePreference === undefined ? "auto" : record.scopePreference;
   if (!name || name.length > MAX_NAME_LENGTH)
     return demoBadRequest("name is required");
   if (description === null || description.length > MAX_DESCRIPTION_LENGTH)
     return demoBadRequest("description is invalid");
-  if (filterDsl === null || filterDsl.length > MAX_DSL_LENGTH)
+  if (filterDsl === null || filterDsl.length > FILTER_DSL_MAX_LENGTH)
     return demoBadRequest("filterDsl is invalid");
   if (
     typeof visibility !== "string" ||
@@ -421,11 +428,16 @@ function parseInput(
   ) {
     return demoBadRequest("visibility is invalid");
   }
+  if (
+    typeof scopePreference !== "string" ||
+    !SAVED_FILTER_SCOPE_PREFERENCES.includes(
+      scopePreference as SavedFilterScopePreference,
+    )
+  ) {
+    return demoBadRequest("scopePreference is invalid");
+  }
   try {
-    const document = parseFilterPanelExpression(
-      filterDsl,
-      analyticsFilterRegistry,
-    );
+    const document = parseFilterDsl(filterDsl, analyticsFilterRegistry);
     if (!document.root)
       return demoBadRequest("filterDsl must contain a filter");
     assertFilterAudience(
@@ -440,6 +452,7 @@ function parseInput(
     name,
     description,
     visibility: visibility as SavedFilterVisibility,
+    scopePreference: scopePreference as SavedFilterScopePreference,
     filterDsl,
   };
 }
@@ -459,13 +472,31 @@ export function handleDemoSavedFilters(input: {
   readonly path: string;
   readonly method: string;
   readonly siteId: string;
+  readonly params?: Record<string, string | number>;
   readonly body?: unknown;
 }): unknown {
-  const { path, method, siteId, body } = input;
+  const { path, method, siteId, params = {}, body } = input;
   const filterId = routeFilterId(path);
   const filters = filtersForSite(siteId);
 
-  if (method === "GET" && !filterId) return { filters: [...filters] };
+  if (method === "GET" && !filterId) {
+    const ordered = [...filters].sort(
+      (left, right) =>
+        right.updatedAt - left.updatedAt || right.id.localeCompare(left.id),
+    );
+    return demoPage(
+      ordered,
+      params,
+      {
+        operation: "saved-filters",
+        siteId,
+        owner: DEMO_USER_ID,
+        sort: "updatedAt:desc,id:desc",
+      },
+      100,
+      500,
+    );
+  }
 
   if (method === "POST" && !filterId) {
     const parsed = parseInput(body);
@@ -474,7 +505,8 @@ export function handleDemoSavedFilters(input: {
       filters.some(
         (filter) =>
           filter.ownerUserId === DEMO_USER_ID &&
-          filter.filterDsl === parsed.filterDsl,
+          filter.filterDsl === parsed.filterDsl &&
+          filter.scopePreference === parsed.scopePreference,
       )
     ) {
       return demoBadRequest("An identical saved filter already exists");
@@ -487,6 +519,7 @@ export function handleDemoSavedFilters(input: {
       authorName: "Demo User",
       isOwner: true,
       ...parsed,
+      scopePreference: parsed.scopePreference ?? "auto",
       filterDslVersion: SAVED_FILTER_DSL_VERSION,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -511,7 +544,8 @@ export function handleDemoSavedFilters(input: {
         (filter) =>
           filter.id !== existing.id &&
           filter.ownerUserId === DEMO_USER_ID &&
-          filter.filterDsl === parsed.filterDsl,
+          filter.filterDsl === parsed.filterDsl &&
+          filter.scopePreference === parsed.scopePreference,
       )
     ) {
       return demoBadRequest("An identical saved filter already exists");

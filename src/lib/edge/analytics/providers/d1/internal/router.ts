@@ -60,11 +60,16 @@ export const DASHBOARD_QUERY_PATHS = [
   "event-type-detail",
   "event-record-detail",
   "journey-event-detail",
+  "visitor-events",
+  "visitor-sessions",
+  "session-events",
   "sessions",
   "session-detail",
   "visitor-detail",
   "visitors",
   "funnels",
+  "goal-summary",
+  "goal-timeseries",
   "team-dashboard",
 ] as const;
 
@@ -125,11 +130,14 @@ export function operationForQueryRoute(pathname: string): QueryOperation {
   if (pathname === "pages") return "pages";
   if (pathname === "pages-dashboard") return "pages-dashboard";
   if (pathname === "referrers") return "referrers";
+  if (pathname === "referrer-summary") return "referrers";
   if (pathname === "filter-values") return "filter-values";
   if (pathname === "overview-geo-points") return "geo-points";
   if (pathname === "retention") return "retention";
   if (pathname === "performance") return "performance";
   if (pathname === "funnels") return "funnel-analysis";
+  if (pathname === "goal-summary") return "goal-summary";
+  if (pathname === "goal-timeseries") return "goal-timeseries";
   if (pathname === "team-dashboard") return "team-dashboard";
   if (pathname === "events-summary") return "event-summary";
   if (pathname === "events-trend") return "event-trend";
@@ -141,6 +149,9 @@ export function operationForQueryRoute(pathname: string): QueryOperation {
   if (pathname === "events-records") return "event-records";
   if (pathname === "event-record-detail") return "event-record-detail";
   if (pathname === "journey-event-detail") return "journey-event-detail";
+  if (pathname === "visitor-events") return "visitor-events";
+  if (pathname === "visitor-sessions") return "visitor-sessions";
+  if (pathname === "session-events") return "session-events";
   if (pathname === "visitors") return "visitors";
   if (pathname === "visitor-detail") return "visitor-detail";
   if (pathname === "sessions") return "sessions";

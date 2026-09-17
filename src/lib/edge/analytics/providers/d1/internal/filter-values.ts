@@ -2,23 +2,40 @@ import { buildTrafficChannelSqlExpression } from "@/lib/analytics/traffic-channe
 import {
   analyticsFilterDefinition,
   type FilterDocument,
+  type QueryAudience,
 } from "@/lib/edge/analytics/contract";
 import type { Env } from "@/lib/edge/types";
+import { InvalidCursorError } from "@/lib/pagination";
 
 import type { DimensionRow, QueryWindow } from "./core";
 import { DIRECT_REFERRER_FILTER_VALUE } from "./core";
 import { resolveCrossBreakdownDimension } from "./core-dimensions";
 import {
+  decodeDimensionCursor,
+  decodeSessionPathDimensionCursor,
   queryDimensionFromD1,
+  queryDimensionPageFromD1,
   querySessionBoundaryDimensionFromD1,
+  querySessionPathDimensionPageFromD1,
 } from "./dimensions";
-import { queryEventTypeAggregate } from "./events-summary";
-import { queryReferrerAggregate } from "./pages";
+import {
+  decodeEventTypeCursor,
+  queryEventTypeAggregate,
+  queryEventTypePageFromD1,
+} from "./events-summary";
+import {
+  decodeReferrersCursor,
+  queryReferrerAggregate,
+  queryReferrersPageFromD1,
+} from "./pages";
+import type { PageResult } from "./pagination";
 
 export interface FilterValueRow {
   readonly value: string;
   readonly occurrences: number;
 }
+
+export type FilterValuePage = PageResult<FilterValueRow>;
 
 function matchesSearch(value: string, search?: string): boolean {
   const needle = search?.trim().toLocaleLowerCase();
@@ -49,9 +66,22 @@ export async function queryFilterValuesFromD1(
   field: string,
   limit: number,
   search?: string,
+  audience: QueryAudience = "private-dashboard",
 ): Promise<FilterValueRow[]> {
   const definition = analyticsFilterDefinition(field);
-  if (!definition || definition.source === "payload") return [];
+  if (
+    !definition ||
+    definition.source === "payload" ||
+    !definition.audiences.has(audience)
+  )
+    return [];
+  if (definition.suggestionMode === "none") return [];
+  if (definition.suggestionMode === "boolean") {
+    return ["false", "true"]
+      .filter((value) => matchesSearch(value, search))
+      .slice(0, limit)
+      .map((value) => ({ value, occurrences: 0 }));
+  }
 
   // Query a bounded superset before applying the UI search token. This keeps
   // the SQL reader shared with existing dimension contracts while preserving
@@ -120,4 +150,185 @@ export async function queryFilterValuesFromD1(
     );
   }
   return mapRows(rows, search).slice(0, limit);
+}
+
+export async function queryFilterValuesPageFromD1(
+  env: Env,
+  siteId: string,
+  window: QueryWindow,
+  filters: FilterDocument,
+  field: string,
+  limit: number,
+  cursor?: string | null,
+  search?: string,
+  audience: QueryAudience = "private-dashboard",
+): Promise<FilterValuePage> {
+  const definition = analyticsFilterDefinition(field);
+  if (
+    !definition ||
+    definition.source === "payload" ||
+    !definition.audiences.has(audience) ||
+    definition.suggestionMode === "none"
+  ) {
+    return {
+      items: [],
+      pagination: { limit, returned: 0, hasMore: false, nextCursor: null },
+    };
+  }
+  if (definition.suggestionMode === "boolean") {
+    const items = ["false", "true"]
+      .filter((value) => matchesSearch(value, search))
+      .slice(0, limit)
+      .map((value) => ({ value, occurrences: 0 }));
+    return {
+      items,
+      pagination: {
+        limit,
+        returned: items.length,
+        hasMore: false,
+        nextCursor: null,
+      },
+    };
+  }
+  if (field === "event.name") {
+    const eventCursor = await decodeEventTypeCursor(
+      env,
+      siteId,
+      window,
+      filters,
+      search,
+      cursor,
+      audience,
+    );
+    if (cursor && !eventCursor) throw new InvalidCursorError("filter-values");
+    const page = await queryEventTypePageFromD1(
+      env,
+      siteId,
+      window,
+      filters,
+      limit,
+      search,
+      eventCursor,
+      audience,
+    );
+    return {
+      items: page.items.map((row) => ({
+        value: row.value,
+        occurrences: row.views,
+      })),
+      pagination: page.pagination,
+    };
+  }
+  if (field === "referrer.domain" || field === "referrer.url") {
+    const includeFullUrl = field === "referrer.url";
+    const referrerCursor = await decodeReferrersCursor(
+      env,
+      siteId,
+      window,
+      filters,
+      includeFullUrl,
+      search,
+      cursor,
+      audience,
+    );
+    if (cursor && !referrerCursor)
+      throw new InvalidCursorError("filter-values");
+    const page = await queryReferrersPageFromD1(
+      env,
+      siteId,
+      window,
+      filters,
+      limit,
+      includeFullUrl,
+      search,
+      referrerCursor,
+      undefined,
+      audience,
+    );
+    return {
+      items: page.items
+        .map((row) => ({
+          value: row.referrer || DIRECT_REFERRER_FILTER_VALUE,
+          occurrences: row.views,
+        }))
+        .filter((row) => row.value.length > 0),
+      pagination: page.pagination,
+    };
+  }
+
+  if (field === "session.entryPath" || field === "session.exitPath") {
+    const kind = field === "session.entryPath" ? "entry" : "exit";
+    const boundaryCursor = await decodeSessionPathDimensionCursor(
+      env,
+      siteId,
+      window,
+      filters,
+      kind,
+      search,
+      cursor,
+      audience,
+    );
+    if (cursor && !boundaryCursor)
+      throw new InvalidCursorError("filter-values");
+    const page = await querySessionPathDimensionPageFromD1(
+      env,
+      siteId,
+      window,
+      filters,
+      limit,
+      kind,
+      undefined,
+      search,
+      boundaryCursor,
+      audience,
+    );
+    const items = mapRows(page.items, search);
+    return {
+      items,
+      pagination: {
+        limit,
+        returned: items.length,
+        hasMore: page.pagination.hasMore,
+        nextCursor: page.pagination.nextCursor,
+      },
+    };
+  }
+
+  const selectExpr =
+    field === "traffic.channel"
+      ? buildTrafficChannelSqlExpression()
+      : resolveCrossBreakdownDimension(field)?.labelExpr;
+  if (!selectExpr) {
+    return {
+      items: [],
+      pagination: { limit, returned: 0, hasMore: false, nextCursor: null },
+    };
+  }
+  const dimensionCursor = await decodeDimensionCursor(
+    env,
+    siteId,
+    window,
+    filters,
+    selectExpr,
+    search,
+    cursor,
+    audience,
+  );
+  if (cursor && !dimensionCursor) throw new InvalidCursorError("filter-values");
+  const page = await queryDimensionPageFromD1(
+    env,
+    siteId,
+    window,
+    filters,
+    limit,
+    selectExpr,
+    { excludeEmpty: true, search },
+    dimensionCursor,
+    undefined,
+    audience,
+  );
+  return {
+    items: mapRows(page.items, search),
+    pagination: page.pagination,
+  };
 }

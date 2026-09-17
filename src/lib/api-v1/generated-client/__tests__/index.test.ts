@@ -116,11 +116,11 @@ describe("API v1 generated client", () => {
       response({
         data: {
           items: [],
-          page: {
-            kind: "keyset",
+          pagination: {
             limit: 100,
             nextCursor: null,
             hasMore: false,
+            returned: 0,
           },
         },
         meta: { requestId: "req-1" },
@@ -132,7 +132,9 @@ describe("API v1 generated client", () => {
       bearer: () => "secret-token",
     });
 
-    await client.listSavedFilters("site/a", { cursor: "cursor with/slash" });
+    await client.listSavedFilters("site/a", {
+      page: { limit: 100, cursor: "cursor with/slash" },
+    });
 
     expect(fetcher).toHaveBeenCalledOnce();
     const [url, init] = fetcher.mock.calls[0];
@@ -151,7 +153,12 @@ describe("API v1 generated client", () => {
       response({
         data: {
           items: [],
-          page: { kind: "keyset", limit: 20, nextCursor: null, hasMore: false },
+          pagination: {
+            limit: 20,
+            nextCursor: null,
+            hasMore: false,
+            returned: 0,
+          },
         },
         meta: { requestId: "req-page" },
       }),
@@ -161,10 +168,41 @@ describe("API v1 generated client", () => {
       fetch: fetcher,
     });
 
-    await client.listSavedFilters("site-1", { limit: 20 });
+    await client.listSavedFilters("site-1", { page: { limit: 20 } });
     expect(fetcher.mock.calls[0]?.[0]).toBe(
       "https://api.test/api/v1/sites/site-1/saved-filters?limit=20",
     );
+  });
+
+  it("pages site and funnel resource collections through limit and cursor", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+      response({
+        data: {
+          items: [],
+          pagination: {
+            limit: 1,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
+        meta: { requestId: "req-resource-page" },
+      }),
+    );
+    const client = createApiV1GeneratedClient({
+      baseUrl: "https://api.test",
+      fetch: fetcher,
+    });
+
+    await client.listSites({ page: { limit: 1, cursor: "site-cursor" } });
+    await client.listFunnels("site-1", {
+      page: { limit: 1, cursor: "funnel-cursor" },
+    });
+
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      "https://api.test/api/v1/sites?limit=1&cursor=site-cursor",
+      "https://api.test/api/v1/sites/site-1/funnels?limit=1&cursor=funnel-cursor",
+    ]);
   });
 
   it("parses a successful analytics envelope and rejects unknown request fields", async () => {
@@ -360,7 +398,7 @@ describe("API v1 generated client", () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       response({
         data: {
-          sites: [
+          items: [
             {
               siteId: "site-1",
               name: "Example",
@@ -373,6 +411,12 @@ describe("API v1 generated client", () => {
               lastEventAt: null,
             },
           ],
+          pagination: {
+            limit: 20,
+            returned: 1,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta: {
           requestId: "req-team-sites",
@@ -395,7 +439,7 @@ describe("API v1 generated client", () => {
       client.teamAnalyticsSites({ timeRange: overviewInput.timeRange }),
     ).resolves.toMatchObject({
       ok: true,
-      data: { sites: [{ siteId: "site-1" }] },
+      data: { items: [{ siteId: "site-1" }] },
     });
     expect(fetcher.mock.calls[0]?.[0]).toBe(
       "https://api.test/api/v1/team/analytics/sites",
@@ -489,7 +533,15 @@ describe("API v1 generated client", () => {
   it("posts distinct typed page and referrer composite queries", async () => {
     const pagesFetch = vi.fn<typeof fetch>().mockResolvedValue(
       response({
-        data: { items: [] },
+        data: {
+          items: [],
+          pagination: {
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
         meta: {
           requestId: "req-pages",
           generatedAt: "2026-08-02T00:00:00.000Z",
@@ -518,7 +570,15 @@ describe("API v1 generated client", () => {
 
     const referrerFetch = vi.fn<typeof fetch>().mockResolvedValue(
       response({
-        data: { items: [] },
+        data: {
+          items: [],
+          pagination: {
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
         meta: {
           requestId: "req-referrers",
           generatedAt: "2026-08-02T00:00:00.000Z",
@@ -593,7 +653,12 @@ describe("API v1 generated client", () => {
         data: {
           field: "page.path",
           items: [{ value: "/pricing", label: "/pricing", occurrences: 10 }],
-          page: { limit: 50, hasMore: false, nextCursor: null },
+          pagination: {
+            limit: 50,
+            returned: 1,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta: {
           requestId: "req-filter-values",
@@ -620,7 +685,12 @@ describe("API v1 generated client", () => {
       ok: true,
       data: {
         field: "page.path",
-        page: { limit: 50, hasMore: false, nextCursor: null },
+        pagination: {
+          limit: 50,
+          returned: 1,
+          hasMore: false,
+          nextCursor: null,
+        },
       },
     });
     expect(fetcher.mock.calls[0]?.[0]).toBe(
@@ -687,20 +757,23 @@ describe("API v1 generated client", () => {
             id: "funnel-1",
             siteId: "site-1",
             name: "Checkout",
+            filterDslVersion: 1,
+            progressionScope: "session",
+            conversionWindowMs: null,
             steps: [
-              { type: "pageview", value: "/start" },
-              { type: "event", value: "purchase" },
+              { id: "start", filterDsl: 'page.path eq "/start"' },
+              { id: "purchase", filterDsl: 'event.name eq "purchase"' },
             ],
+            semanticFingerprint: "funnel-v2:test",
             createdAt: 1,
             updatedAt: 2,
           },
           analysis: {
+            progressionScope: "session",
             steps: [],
             summary: {
-              totalSessions: 0,
-              convertedSessions: 0,
-              totalVisitors: 0,
-              convertedVisitors: 0,
+              totalProgressions: 0,
+              convertedProgressions: 0,
               overallConversionRate: 0,
               largestDropOffStepIndex: null,
             },
@@ -892,7 +965,12 @@ describe("API v1 generated client", () => {
       response({
         data: {
           items: [],
-          page: { limit: 80, hasMore: false, nextCursor: null },
+          pagination: {
+            limit: 80,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta,
       }),
@@ -975,7 +1053,15 @@ describe("API v1 generated client", () => {
 
     const eventTypesFetch = vi.fn<typeof fetch>().mockResolvedValue(
       response({
-        data: { items: [], page: { limit: 20 } },
+        data: {
+          items: [],
+          pagination: {
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
         meta,
       }),
     );
@@ -994,7 +1080,16 @@ describe("API v1 generated client", () => {
 
     const eventFieldsFetch = vi.fn<typeof fetch>().mockResolvedValue(
       response({
-        data: { eventName: "signup", fields: [], page: { limit: 100 } },
+        data: {
+          eventName: "signup",
+          items: [],
+          pagination: {
+            limit: 100,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
         meta,
       }),
     );
@@ -1019,7 +1114,12 @@ describe("API v1 generated client", () => {
           fieldPath: "plan",
           fieldValueType: "string",
           items: [],
-          page: { limit: 25 },
+          pagination: {
+            limit: 25,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta,
       }),
@@ -1080,7 +1180,6 @@ describe("API v1 generated client", () => {
               organization: [],
             },
           },
-          fields: [],
         },
         meta,
       }),
@@ -1109,6 +1208,8 @@ describe("API v1 generated client", () => {
     const session = {
       sessionId: "session-1",
       visitorId: "visitor-1",
+      userId: "",
+      userName: "",
       startedAt: 1,
       endedAt: 2,
       durationMs: 1,
@@ -1141,6 +1242,8 @@ describe("API v1 generated client", () => {
           visitor: {
             visitorId: "visitor-1",
             sessionId: "session-1",
+            userId: "",
+            userName: "",
             firstSeenAt: 1,
             lastSeenAt: 2,
             views: 1,
@@ -1174,8 +1277,6 @@ describe("API v1 generated client", () => {
             conversionEvents: 0,
             avgTimeBetweenSessionsMs: 0,
           },
-          sessions: [session],
-          events: [],
           visitedPages: [],
           eventDistribution: [],
           activity: [],
@@ -1206,7 +1307,6 @@ describe("API v1 generated client", () => {
         data: {
           session,
           locationPoints: [],
-          events: [],
           visitedPages: [],
           eventDistribution: [],
           performance,
@@ -1235,7 +1335,12 @@ describe("API v1 generated client", () => {
       response({
         data: {
           items: [],
-          page: { limit: 80, hasMore: false, nextCursor: null },
+          pagination: {
+            limit: 80,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta,
       }),
@@ -1257,7 +1362,12 @@ describe("API v1 generated client", () => {
       response({
         data: {
           items: [],
-          page: { limit: 80, hasMore: false, nextCursor: null },
+          pagination: {
+            limit: 80,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         meta,
       }),
@@ -1376,9 +1486,12 @@ describe("API v1 generated client", () => {
     });
     const funnel = {
       name: "Signup",
+      filterDslVersion: 1 as const,
+      progressionScope: "session" as const,
+      conversionWindowMs: null,
       steps: [
-        { type: "pageview" as const, value: "/" },
-        { type: "event" as const, value: "signup" },
+        { id: "landing", filterDsl: 'page.path eq "/"' },
+        { id: "signup", filterDsl: 'event.name eq "signup"' },
       ],
     };
 
@@ -1411,6 +1524,158 @@ describe("API v1 generated client", () => {
     expect(mutationBodies).not.toContainEqual(
       expect.objectContaining({ funnelId: "funnel-1" }),
     );
+  });
+
+  it("exposes Goal CRUD and dedicated summary/timeseries operations", async () => {
+    const goalResource = {
+      id: "goal-1",
+      siteId: "site-1",
+      name: "Purchase completed",
+      filterDslVersion: 1,
+      filterDsl: 'event.name eq "purchase"',
+      semanticFingerprint: "goal-v1-purchase",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      links: { self: "/api/v1/sites/site-1/goals/goal-1" },
+    };
+    const analyticsGoal = {
+      id: goalResource.id,
+      siteId: goalResource.siteId,
+      name: goalResource.name,
+      filterDslVersion: goalResource.filterDslVersion,
+      filterDsl: goalResource.filterDsl,
+      semanticFingerprint: goalResource.semanticFingerprint,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const summary = {
+      goal: analyticsGoal,
+      summary: {
+        sessions: { total: 10, converted: 2, conversionRate: 0.2 },
+        visitors: { total: 8, converted: 1, conversionRate: 0.125 },
+      },
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (url, init) => {
+        const value = String(url);
+        if (value.includes("/analytics/goals/timeseries")) {
+          return response({
+            data: { goal: analyticsGoal, interval: "day", timeseries: [] },
+            meta: {
+              requestId: "req-goal",
+              generatedAt: "2026-08-02T00:00:00.000Z",
+              timeRange: {
+                from: overviewInput.timeRange.from,
+                to: overviewInput.timeRange.to,
+                timeZone: "UTC",
+              },
+              source: "raw",
+              accuracy: "exact",
+            },
+          });
+        }
+        if (value.includes("/analytics/goals/summary")) {
+          return response({
+            data: summary,
+            meta: {
+              requestId: "req-goal",
+              generatedAt: "2026-08-02T00:00:00.000Z",
+              timeRange: {
+                from: overviewInput.timeRange.from,
+                to: overviewInput.timeRange.to,
+                timeZone: "UTC",
+              },
+              source: "raw",
+              accuracy: "exact",
+            },
+          });
+        }
+        if (
+          (value.includes("/goals?") || value.endsWith("/goals")) &&
+          init?.method !== "POST"
+        ) {
+          return response({
+            data: {
+              items: [goalResource],
+              pagination: {
+                limit: 20,
+                returned: 1,
+                hasMore: false,
+                nextCursor: null,
+              },
+            },
+            meta: { requestId: "req-goal" },
+          });
+        }
+        if (value.includes("/goals/") && init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        return response({
+          data: goalResource,
+          meta: { requestId: "req-goal" },
+        });
+      });
+    const client = createApiV1GeneratedClient({
+      baseUrl: "https://api.test",
+      fetch: fetcher,
+    });
+
+    await expect(
+      client.listGoals("site-1", { page: { limit: 20 } }),
+    ).resolves.toMatchObject({
+      ok: true,
+      data: { items: [{ id: "goal-1" }] },
+    });
+    await expect(
+      client.createGoal("site-1", {
+        name: "Purchase completed",
+        filterDslVersion: 1,
+        filterDsl: 'event.name eq "purchase"',
+      }),
+    ).resolves.toMatchObject({ ok: true, data: { id: "goal-1" } });
+    await expect(client.getGoal("site-1", "goal-1")).resolves.toMatchObject({
+      ok: true,
+      data: { id: "goal-1" },
+    });
+    await expect(
+      client.updateGoal("site-1", "goal-1", { name: "Completed purchase" }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(client.deleteGoal("site-1", "goal-1")).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(
+      client.siteAnalyticsGoalSummary("site-1", {
+        goalId: "goal-1",
+        timeRange: overviewInput.timeRange,
+        filter: null,
+      }),
+    ).resolves.toMatchObject({ ok: true, data: summary });
+    await expect(
+      client.siteAnalyticsGoalTimeseries("site-1", {
+        goalId: "goal-1",
+        timeRange: overviewInput.timeRange,
+        filter: null,
+        interval: "day",
+      }),
+    ).resolves.toMatchObject({ ok: true, data: { interval: "day" } });
+
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      "https://api.test/api/v1/sites/site-1/goals?limit=20",
+      "https://api.test/api/v1/sites/site-1/goals",
+      "https://api.test/api/v1/sites/site-1/goals/goal-1",
+      "https://api.test/api/v1/sites/site-1/goals/goal-1",
+      "https://api.test/api/v1/sites/site-1/goals/goal-1",
+      "https://api.test/api/v1/sites/site-1/analytics/goals/summary",
+      "https://api.test/api/v1/sites/site-1/analytics/goals/timeseries",
+    ]);
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual(
+      expect.objectContaining({ filterDslVersion: 1 }),
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body))).toEqual({
+      name: "Completed purchase",
+      filterDslVersion: 1,
+    });
   });
 
   it("posts typed journey trajectories and realtime reads to their dedicated paths", async () => {
@@ -1512,9 +1777,9 @@ describe("API v1 generated client", () => {
         response({
           data: {
             items: [],
-            page: {
-              kind: "keyset",
+            pagination: {
               limit: 100,
+              returned: 0,
               nextCursor: null,
               hasMore: false,
             },
@@ -1546,9 +1811,9 @@ describe("API v1 generated client", () => {
           {
             data: {
               items: [],
-              page: {
-                kind: "keyset",
+              pagination: {
                 limit: 100,
+                returned: 0,
                 nextCursor: null,
                 hasMore: false,
               },

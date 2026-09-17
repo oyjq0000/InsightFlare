@@ -5,6 +5,7 @@ import {
   RiArrowDownSLine,
   RiArrowLeftSLine,
   RiArrowRightSLine,
+  RiBarChartGroupedLine,
   RiCalendarLine,
   RiCheckLine,
   RiCloseLine,
@@ -12,7 +13,13 @@ import {
   RiTimeLine,
 } from "@remixicon/react";
 
+import {
+  ComparisonPanel,
+  ComparisonPanelTitle,
+  type ComparisonSettings,
+} from "@/components/dashboard/comparison-panel";
 import { useDashboardQueryControls } from "@/components/dashboard/dashboard-query-provider";
+import { FilterActiveCountBadge } from "@/components/dashboard/filter-active-count-badge";
 import { FilterPanel } from "@/components/dashboard/filter-panel";
 import {
   RealtimeStatusDot,
@@ -72,7 +79,10 @@ import {
   useLiveSearchParams,
 } from "@/lib/client-history";
 import {
+  type DashboardComparisonSearchState,
+  parseDashboardComparisonSearchParams,
   serializeDashboardSearchParams,
+  withDashboardComparisonSearchParams,
   withDashboardFilterSearchParams,
 } from "@/lib/dashboard/filter-state";
 import { intlLocale } from "@/lib/dashboard/format";
@@ -81,12 +91,20 @@ import {
   type DashboardInterval,
   normalizeCustomDateRange,
   parseFilterDocumentFromSearchParams,
+  parseFilterScopeFromSearchParams,
   type RangePreset,
+  serializeFilterScopeToSearchParams,
 } from "@/lib/dashboard/query-state";
 import { zonedParts } from "@/lib/dashboard/time-zone";
 import {
   analyticsFilterRegistry,
+  attachFilterScopePreference,
   type FilterDocument,
+  type FilterScope,
+  type FilterScopePreference,
+  filterScopePreferenceFromDocument,
+  formatFilterDsl,
+  parseFilterDsl,
   serializeFilterParams,
 } from "@/lib/filter-contract";
 import type { Locale } from "@/lib/i18n/config";
@@ -106,8 +124,11 @@ interface DashboardHeaderControlsProps {
   siteId?: string;
   showControls: boolean;
   showFilterSheet: boolean;
+  comparisonDisabled?: boolean;
   filterDisabled?: boolean;
   filterAudience?: "private-dashboard" | "public-share";
+  /** Concrete scope selected by the active dashboard page for Auto filters. */
+  resolvedScope?: FilterScope;
   showRealtimeBadge?: boolean;
 }
 
@@ -159,7 +180,6 @@ function rangeLabel(messages: AppMessages, range: RangePreset): string {
   if (range === "90d") return messages.ranges.last90d;
   if (range === "6m") return messages.ranges.last6m;
   if (range === "12m") return messages.ranges.last12m;
-  if (range === "all") return messages.ranges.allTime;
   if (range === "custom") return messages.ranges.custom;
   return messages.ranges.last30d;
 }
@@ -267,7 +287,7 @@ const RANGE_GROUPS: ReadonlyArray<{
   },
   {
     key: "advanced",
-    items: ["all", "custom"],
+    items: ["custom"],
   },
 ];
 
@@ -346,53 +366,13 @@ function RealtimeActiveBadge({
   );
 }
 
-function FilterActiveCountBadge({ count }: { count: number }) {
-  const hasCount = count > 0;
-
-  return (
-    <AutoResizer
-      initial
-      animateWidth
-      animateHeight={false}
-      className="inline-flex shrink-0 items-center"
-    >
-      <AutoTransition
-        className="inline-block"
-        duration={0.2}
-        type="fade"
-        initial={false}
-        presenceMode="wait"
-        customVariants={{
-          initial: { opacity: 0 },
-          animate: { opacity: 1 },
-          exit: { opacity: 0 },
-        }}
-      >
-        {hasCount ? (
-          <span
-            key={`active-filter-count-${count}`}
-            className="inline-flex min-w-5 items-center justify-center rounded-full border border-primary/40 bg-primary/15 px-1.5 text-[11px] leading-4 font-semibold text-primary"
-          >
-            {count}
-          </span>
-        ) : (
-          <span
-            key="active-filter-count-empty"
-            className="inline-flex w-0 overflow-hidden"
-            aria-hidden
-          />
-        )}
-      </AutoTransition>
-    </AutoResizer>
-  );
-}
-
 function FilterTrigger({
   activeFilterCount,
   className,
   disabled,
   messages,
   onClick,
+  scopePreference,
   style,
 }: {
   activeFilterCount: number;
@@ -400,8 +380,18 @@ function FilterTrigger({
   disabled: boolean;
   messages: AppMessages;
   onClick: () => void;
+  scopePreference: FilterScopePreference;
   style?: CSSProperties;
 }) {
+  const filterButtonLabel =
+    scopePreference === "event"
+      ? messages.dashboardHeader.filterButtonEvent
+      : scopePreference === "session"
+        ? messages.dashboardHeader.filterButtonSession
+        : scopePreference === "visitor"
+          ? messages.dashboardHeader.filterButtonVisitor
+          : messages.dashboardHeader.filterButton;
+
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -411,6 +401,7 @@ function FilterTrigger({
             variant="outline"
             className={className}
             disabled={disabled}
+            aria-label={filterButtonLabel}
             onClick={onClick}
             style={style}
           >
@@ -420,7 +411,24 @@ function FilterTrigger({
                 activeFilterCount === 0 && "text-muted-foreground",
               )}
             />
-            {messages.dashboardHeader.filters}
+            <AutoResizer
+              initial
+              animateWidth
+              animateHeight={false}
+              className="-ml-2 inline-flex min-w-0 items-center sm:ml-0"
+            >
+              <AutoTransition
+                as="span"
+                className="hidden whitespace-nowrap sm:inline-block"
+                duration={0.2}
+                initial={false}
+                presenceMode="wait"
+                transitionKey={scopePreference}
+                type="fade"
+              >
+                {filterButtonLabel}
+              </AutoTransition>
+            </AutoResizer>
             <FilterActiveCountBadge count={activeFilterCount} />
           </Button>
         </span>
@@ -434,14 +442,72 @@ function FilterTrigger({
   );
 }
 
+function CompareTrigger({
+  active,
+  className,
+  disabled,
+  messages,
+  onClick,
+}: {
+  active: boolean;
+  className: string;
+  disabled: boolean;
+  messages: AppMessages;
+  onClick: () => void;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={disabled ? 0 : undefined} className="inline-flex">
+          <Button
+            type="button"
+            variant="outline"
+            className={className}
+            disabled={disabled}
+            aria-label={messages.dashboardHeader.compareButton}
+            onClick={onClick}
+          >
+            <RiBarChartGroupedLine
+              className={cn("size-4", !active && "text-muted-foreground")}
+            />
+            <span className="hidden sm:inline">
+              {messages.dashboardHeader.compareButton}
+            </span>
+          </Button>
+        </span>
+      </TooltipTrigger>
+      {disabled ? (
+        <TooltipContent side="bottom">
+          {messages.dashboardHeader.compareDisabled}
+        </TooltipContent>
+      ) : null}
+    </Tooltip>
+  );
+}
+
+function comparisonSettingsFromSearchState(
+  state: DashboardComparisonSearchState,
+  currentFilterDsl: string,
+): ComparisonSettings {
+  return {
+    period: state.mode ?? "previous",
+    filterMode: state.filterDocument.root ? "custom" : "current",
+    filterDsl: state.filterDocument.root
+      ? formatFilterDsl(state.filterDocument)
+      : currentFilterDsl,
+  };
+}
+
 export const DashboardHeaderControls = memo(function DashboardHeaderControls({
   locale,
   messages,
   siteId,
   showControls,
   showFilterSheet,
+  comparisonDisabled = false,
   filterDisabled = false,
   filterAudience = "private-dashboard",
+  resolvedScope,
   showRealtimeBadge: shouldShowRealtimeBadge = true,
 }: DashboardHeaderControlsProps) {
   const searchParams = useLiveSearchParams();
@@ -454,6 +520,8 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
     setCustomRange,
     setInterval: setDashboardInterval,
     setUiFilters,
+    scopePreference,
+    setScopePreference,
     uiFilterDsl,
     allowedIntervals,
     timeZone,
@@ -465,15 +533,37 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
       parseFilterDocumentFromSearchParams(new URLSearchParams(searchParamsKey)),
     [searchParamsKey],
   );
+  const urlScopePreference = useMemo(
+    () =>
+      parseFilterScopeFromSearchParams(new URLSearchParams(searchParamsKey)),
+    [searchParamsKey],
+  );
+  const comparisonSearchState = useMemo(
+    () =>
+      parseDashboardComparisonSearchParams(
+        new URLSearchParams(searchParamsKey),
+      ),
+    [searchParamsKey],
+  );
   const activeFilterCount = useMemo(
     () => serializeFilterParams(queryDocument, analyticsFilterRegistry).size,
     [queryDocument],
   );
+  const filterSuggestionScope =
+    resolvedScope ?? (filterDisabled ? undefined : "event");
   const hasActiveFilters = activeFilterCount > 0;
+  const headerTriggerClassName =
+    "gap-2 transition-[color,background-color,border-color,opacity]";
   const filterTriggerClassName = cn(
-    "gap-2 transition-[color,background-color,border-color,opacity]",
+    headerTriggerClassName,
     hasActiveFilters &&
       "!border-primary/60 !bg-primary/10 !text-primary hover:!bg-primary/15 hover:!text-primary aria-expanded:!bg-primary/15 dark:!border-primary/60 dark:!bg-primary/20 dark:hover:!bg-primary/25",
+  );
+  const hasActiveComparison = comparisonSearchState.mode !== undefined;
+  const comparisonTriggerClassName = cn(
+    headerTriggerClassName,
+    hasActiveComparison &&
+      "!border-compare-primary/60 !bg-compare-primary/10 !text-compare-primary hover:!bg-compare-primary/15 hover:!text-compare-primary aria-expanded:!bg-compare-primary/15 dark:!border-compare-primary/60 dark:!bg-compare-primary/20 dark:hover:!bg-compare-primary/25",
   );
   const filterTriggerStyle = hasActiveFilters
     ? {
@@ -488,6 +578,8 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
     [customRange?.from, customRange?.to, timeZone],
   );
   const [customDialogOpen, setCustomDialogOpen] = useState(false);
+  const [mobileCompareDrawerOpen, setMobileCompareDrawerOpen] = useState(false);
+  const [desktopCompareSheetOpen, setDesktopCompareSheetOpen] = useState(false);
   const [mobileFilterDrawerOpen, setMobileFilterDrawerOpen] = useState(false);
   const [desktopFilterSheetOpen, setDesktopFilterSheetOpen] = useState(false);
   const [mobileTimeDrawerOpen, setMobileTimeDrawerOpen] = useState(false);
@@ -500,6 +592,13 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
   const [pendingCustomRange, setPendingCustomRange] = useState<
     DateRange | undefined
   >(selectedDateRange);
+  const [comparisonSettings, setComparisonSettings] =
+    useState<ComparisonSettings>(() =>
+      comparisonSettingsFromSearchState(
+        comparisonSearchState,
+        uiFilterDsl ?? "",
+      ),
+    );
   const realtimeSiteId =
     siteId || (USE_REALTIME_MOCK ? "local-mock-site" : undefined);
   const showRealtimeBadge =
@@ -528,7 +627,6 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
         ...group,
         items: group.items.filter((item) => {
           if (!maxRangeDays) return true;
-          if (item === "all") return false;
           if (maxRangeDays <= 90) {
             return item !== "6m" && item !== "12m";
           }
@@ -610,8 +708,77 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
   }, []);
 
   useEffect(() => {
-    setUiFilters(queryDocument);
-  }, [queryDocument, setUiFilters]);
+    if (scopePreference !== urlScopePreference) {
+      setScopePreference(urlScopePreference);
+    }
+  }, [scopePreference, setScopePreference, urlScopePreference]);
+
+  useEffect(() => {
+    setComparisonSettings(
+      comparisonSettingsFromSearchState(
+        comparisonSearchState,
+        uiFilterDsl ?? "",
+      ),
+    );
+  }, [comparisonSearchState, uiFilterDsl]);
+
+  const handleScopeChange = useCallback(
+    (next: FilterScopePreference) => {
+      setScopePreference(next);
+      const params = queryDocument.root
+        ? serializeFilterScopeToSearchParams(searchParams, next)
+        : serializeFilterScopeToSearchParams(searchParams, "auto");
+      const updated = serializeDashboardSearchParams(params);
+      const current = serializeDashboardSearchParams(searchParams);
+      if (updated !== current) {
+        const target = updated ? `${livePathname}?${updated}` : livePathname;
+        replaceUrlWithoutNavigation(target);
+      }
+    },
+    [livePathname, queryDocument, searchParams, setScopePreference],
+  );
+
+  const handleComparisonApply = useCallback(
+    (settings: ComparisonSettings) => {
+      let comparisonFilter: FilterDocument | undefined;
+      if (settings.filterMode === "custom" && settings.filterDsl.trim()) {
+        try {
+          comparisonFilter = parseFilterDsl(
+            settings.filterDsl,
+            analyticsFilterRegistry,
+          );
+        } catch {
+          comparisonFilter = undefined;
+        }
+      }
+
+      const params = withDashboardComparisonSearchParams(
+        searchParams,
+        settings.period,
+        comparisonFilter,
+      );
+      const updated = serializeDashboardSearchParams(params);
+      const current = serializeDashboardSearchParams(searchParams);
+      if (updated !== current) {
+        const target = updated ? `${livePathname}?${updated}` : livePathname;
+        replaceUrlWithoutNavigation(target);
+      }
+      setComparisonSettings(
+        comparisonSettingsFromSearchState(
+          parseDashboardComparisonSearchParams(params),
+          uiFilterDsl ?? "",
+        ),
+      );
+      setMobileCompareDrawerOpen(false);
+      setDesktopCompareSheetOpen(false);
+    },
+    [livePathname, searchParams, uiFilterDsl],
+  );
+
+  const handleComparisonCancel = () => {
+    setMobileCompareDrawerOpen(false);
+    setDesktopCompareSheetOpen(false);
+  };
 
   useEffect(() => {
     setPeriodForwardStack([]);
@@ -623,11 +790,20 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
       rawDsl?: string,
       options?: { readonly closePanel?: boolean },
     ) => {
-      setUiFilters(nextDocument, rawDsl);
-      const params = withDashboardFilterSearchParams(
-        searchParams,
+      const nextScope =
+        filterScopePreferenceFromDocument(nextDocument) ?? scopePreference;
+      const scopedDocument = attachFilterScopePreference(
         nextDocument,
+        nextScope,
       );
+      setUiFilters(scopedDocument, rawDsl);
+      const filterParams = withDashboardFilterSearchParams(
+        searchParams,
+        scopedDocument,
+      );
+      const params = scopedDocument.root
+        ? serializeFilterScopeToSearchParams(filterParams, nextScope)
+        : serializeFilterScopeToSearchParams(filterParams, "auto");
       const updated = serializeDashboardSearchParams(params);
       const current = serializeDashboardSearchParams(searchParams);
       if (updated !== current) {
@@ -639,7 +815,7 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
         setDesktopFilterSheetOpen(false);
       }
     },
-    [livePathname, searchParams, setUiFilters],
+    [livePathname, scopePreference, searchParams, setUiFilters],
   );
 
   const queueOpenCustomDialog = () => {
@@ -712,6 +888,40 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
           ) : null}
           {showFilterSheet ? (
             <Drawer
+              open={mobileCompareDrawerOpen}
+              onOpenChange={setMobileCompareDrawerOpen}
+            >
+              <CompareTrigger
+                active={hasActiveComparison}
+                className={comparisonTriggerClassName}
+                disabled={comparisonDisabled}
+                messages={messages}
+                onClick={() => setMobileCompareDrawerOpen(true)}
+              />
+              <DrawerContent className="h-[80dvh] max-h-[80dvh] min-h-0 flex flex-col overflow-hidden">
+                <DrawerHeader className="shrink-0">
+                  <DrawerTitle>
+                    <ComparisonPanelTitle messages={messages} />
+                  </DrawerTitle>
+                  <DrawerDescription>
+                    {messages.dashboardHeader.compareSubtitle}
+                  </DrawerDescription>
+                </DrawerHeader>
+                <ComparisonPanel
+                  currentFilterDsl={uiFilterDsl ?? ""}
+                  initialSettings={comparisonSettings}
+                  messages={messages}
+                  onApply={handleComparisonApply}
+                  onCancel={handleComparisonCancel}
+                  resolvedScope={resolvedScope ?? "event"}
+                  siteId={siteId}
+                  timeWindow={window}
+                />
+              </DrawerContent>
+            </Drawer>
+          ) : null}
+          {showFilterSheet ? (
+            <Drawer
               open={mobileFilterDrawerOpen}
               onOpenChange={setMobileFilterDrawerOpen}
             >
@@ -721,6 +931,7 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
                 disabled={filterDisabled}
                 messages={messages}
                 onClick={() => setMobileFilterDrawerOpen(true)}
+                scopePreference={scopePreference}
                 style={filterTriggerStyle}
               />
               <DrawerContent className="h-[80dvh] max-h-[80dvh] flex flex-col overflow-hidden">
@@ -732,21 +943,21 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
                     {messages.dashboardHeader.filterSubtitle}
                   </DrawerDescription>
                 </DrawerHeader>
-                <DrawerScrollArea
-                  className="overflow-hidden"
-                  contentClassName="px-4"
-                >
+                <div className="min-h-0 flex-1 px-4">
                   <FilterPanel
                     audience={filterAudience}
                     document={queryDocument}
                     expressionText={uiFilterDsl}
                     messages={messages}
                     open={mobileFilterDrawerOpen}
+                    resolvedScope={filterSuggestionScope}
                     siteId={siteId}
+                    scopePreference={scopePreference}
                     window={window}
                     onApply={applyFilterDocument}
+                    onScopeChange={handleScopeChange}
                   />
-                </DrawerScrollArea>
+                </div>
               </DrawerContent>
             </Drawer>
           ) : null}
@@ -826,31 +1037,47 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
 
                 <div className="space-y-2">
                   <Label>{messages.dashboardHeader.interval}</Label>
-                  <div className="grid grid-cols-3 gap-2">
+                  <div className="grid grid-cols-5 gap-1">
                     {INTERVAL_ORDER.map((item) => {
                       const enabled = orderedAllowedIntervals.includes(item);
-                      return (
+                      const disabledReason = enabled
+                        ? undefined
+                        : intervalDisabledReason(messages, item);
+                      const intervalButton = (
                         <Button
-                          key={item}
                           type="button"
                           size="sm"
                           variant={
                             window.interval === item ? "default" : "outline"
                           }
-                          className="justify-start px-2"
+                          className="w-full justify-center gap-1 overflow-hidden px-1"
                           disabled={!enabled}
-                          title={
-                            enabled
-                              ? undefined
-                              : intervalDisabledReason(messages, item)
-                          }
                           onClick={() => {
                             handleIntervalValueChange(item);
                           }}
                         >
                           <RiTimeLine className="size-3.5" />
-                          <span>{intervalLabel(messages, item)}</span>
+                          <span className="min-w-0 truncate">
+                            {intervalLabel(messages, item)}
+                          </span>
                         </Button>
+                      );
+
+                      return disabledReason ? (
+                        <Tooltip key={item}>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex w-full" tabIndex={0}>
+                              {intervalButton}
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            {disabledReason}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : (
+                        <span key={item} className="inline-flex w-full">
+                          {intervalButton}
+                        </span>
                       );
                     })}
                   </div>
@@ -882,6 +1109,44 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
           {showFilterSheet ? (
             <Sheet
               modal={false}
+              open={desktopCompareSheetOpen}
+              onOpenChange={setDesktopCompareSheetOpen}
+            >
+              <CompareTrigger
+                active={hasActiveComparison}
+                className={comparisonTriggerClassName}
+                disabled={comparisonDisabled}
+                messages={messages}
+                onClick={() => setDesktopCompareSheetOpen(true)}
+              />
+              <SheetContent
+                side="right"
+                className="flex h-[100dvh] max-h-[100dvh] min-h-0 w-full flex-col overflow-hidden sm:max-w-md"
+              >
+                <SheetHeader className="shrink-0">
+                  <SheetTitle>
+                    <ComparisonPanelTitle messages={messages} />
+                  </SheetTitle>
+                  <SheetDescription>
+                    {messages.dashboardHeader.compareSubtitle}
+                  </SheetDescription>
+                </SheetHeader>
+                <ComparisonPanel
+                  currentFilterDsl={uiFilterDsl ?? ""}
+                  initialSettings={comparisonSettings}
+                  messages={messages}
+                  onApply={handleComparisonApply}
+                  onCancel={handleComparisonCancel}
+                  resolvedScope={resolvedScope ?? "event"}
+                  siteId={siteId}
+                  timeWindow={window}
+                />
+              </SheetContent>
+            </Sheet>
+          ) : null}
+          {showFilterSheet ? (
+            <Sheet
+              modal={false}
               open={desktopFilterSheetOpen}
               onOpenChange={setDesktopFilterSheetOpen}
             >
@@ -891,6 +1156,7 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
                 disabled={filterDisabled}
                 messages={messages}
                 onClick={() => setDesktopFilterSheetOpen(true)}
+                scopePreference={scopePreference}
                 style={filterTriggerStyle}
               />
               <SheetContent
@@ -913,9 +1179,12 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
                     expressionText={uiFilterDsl}
                     messages={messages}
                     open={desktopFilterSheetOpen}
+                    resolvedScope={filterSuggestionScope}
                     siteId={siteId}
+                    scopePreference={scopePreference}
                     window={window}
                     onApply={applyFilterDocument}
+                    onScopeChange={handleScopeChange}
                   />
                 </div>
               </SheetContent>
@@ -962,7 +1231,7 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
-                className="min-w-[156px] justify-between bg-background"
+                className="min-w-[156px] justify-between"
               >
                 <span className="inline-flex items-center gap-2">
                   <RiCalendarLine className="size-4 text-muted-foreground" />
@@ -999,7 +1268,7 @@ export const DashboardHeaderControls = memo(function DashboardHeaderControls({
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
-                className="min-w-[96px] justify-between bg-background"
+                className="min-w-[96px] justify-between"
               >
                 <span className="inline-flex items-center gap-2">
                   <RiTimeLine className="size-4 text-muted-foreground" />

@@ -29,7 +29,6 @@ import {
   EVENT_CONTEXT_CARD_KEYS,
   type EventContextCardKey,
 } from "@/lib/edge/analytics/providers/d1/internal/events-context";
-import { parseEventRecordCursor } from "@/lib/edge/analytics/providers/d1/internal/events-records";
 import { toQueryTime } from "@/lib/edge/analytics/providers/d1/operations/overview-reader";
 import type { Env } from "@/lib/edge/types";
 
@@ -43,14 +42,21 @@ export async function handleEventTypesContract(
   const window = parseWindow(url);
   if (!window) return badRequest("Invalid time window");
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
-  const result = await createD1SiteQueryRuntime({ env, siteId }).execute<
-    ReturnType<typeof mapTabs>
-  >("event-types", {
+  const result = await createD1SiteQueryRuntime({ env, siteId }).execute<{
+    readonly items: ReturnType<typeof mapTabs>;
+    readonly pagination: {
+      readonly limit: number;
+      readonly returned: number;
+      readonly hasMore: boolean;
+      readonly nextCursor: string | null;
+    };
+  }>("event-types", {
     context: queryContext,
     time: toQueryTime(window),
     filters,
     limit: parseLimit(url, 20, 200),
     search: url.searchParams.get("search")?.trim() ?? "",
+    cursor: url.searchParams.get("cursor") ?? "",
   });
   if (!result.ok) return queryErrorResponse(result.error);
   return jsonResponseWith(ctx!, { ok: true, data: result.data });
@@ -108,7 +114,7 @@ export async function handleEventsTrendContract(
     eventName: parseEventName(url) ?? "",
   });
   if (!result.ok) return queryErrorResponse(result.error);
-  return jsonResponseWith(ctx!, { ok: true, ...result.data });
+  return jsonResponseWith(ctx!, { ok: true, data: result.data });
 }
 
 export async function handleEventRecordsContract(
@@ -120,16 +126,14 @@ export async function handleEventRecordsContract(
 ): Promise<Response> {
   const window = parseWindow(url);
   if (!window) return badRequest("Invalid time window");
-  const pageSize = parseQueryLimit(url, "pageSize", 80, 1, 1_000);
+  const limit = parseQueryLimit(url, "limit", 80, 1, 1_000);
   const sort = parseEventRecordSort(url);
   const rawCursor = url.searchParams.get("cursor");
-  const cursor = rawCursor ? parseEventRecordCursor(rawCursor, sort) : null;
-  if (rawCursor && !cursor) return badRequest("Invalid cursor");
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const result = await createD1SiteQueryRuntime({ env, siteId }).execute<{
-    readonly data: Array<ReturnType<typeof mapEventRecord>>;
-    readonly meta: {
-      readonly pageSize: number;
+    readonly items: Array<ReturnType<typeof mapEventRecord>>;
+    readonly pagination: {
+      readonly limit: number;
       readonly returned: number;
       readonly hasMore: boolean;
       readonly nextCursor: string | null;
@@ -138,14 +142,13 @@ export async function handleEventRecordsContract(
     context: queryContext,
     time: toQueryTime(window),
     filters,
-    pageSize,
+    page: { limit, cursor: rawCursor },
     sort,
     search: parseListSearch(url) ?? "",
     eventName: parseEventName(url) ?? "",
-    cursor,
   });
   if (!result.ok) return queryErrorResponse(result.error);
-  return jsonResponseWith(ctx!, { ok: true, ...result.data });
+  return jsonResponseWith(ctx!, { ok: true, data: result.data });
 }
 
 export async function handleEventFieldValuesContract(
@@ -166,7 +169,15 @@ export async function handleEventFieldValuesContract(
   const result = await createD1SiteQueryRuntime({ env, siteId }).execute<{
     readonly fieldPath: string;
     readonly fieldValueType: string;
-    readonly data: Array<ReturnType<typeof mapEventFieldValue>>;
+    readonly data: {
+      readonly items: Array<ReturnType<typeof mapEventFieldValue>>;
+      readonly pagination: {
+        readonly limit: number;
+        readonly returned: number;
+        readonly hasMore: boolean;
+        readonly nextCursor: string | null;
+      };
+    };
   }>("event-field-values", {
     context: queryContext,
     time: toQueryTime(window),
@@ -176,6 +187,7 @@ export async function handleEventFieldValuesContract(
     fieldValueType,
     limit: parseLimit(url, 25, 100),
     search: parseListSearch(url) ?? "",
+    cursor: url.searchParams.get("cursor") ?? "",
   });
   if (!result.ok) return queryErrorResponse(result.error);
   return jsonResponseWith(ctx!, { ok: true, ...result.data });
@@ -210,13 +222,22 @@ export async function handleEventTypeFieldsContract(
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const result = await createD1SiteQueryRuntime({ env, siteId }).execute<{
     readonly eventName: string;
-    readonly fields: Array<ReturnType<typeof mapEventField>>;
+    readonly data: {
+      readonly items: Array<ReturnType<typeof mapEventField>>;
+      readonly pagination: {
+        readonly limit: number;
+        readonly returned: number;
+        readonly hasMore: boolean;
+        readonly nextCursor: string | null;
+      };
+    };
   }>("event-fields", {
     context: queryContext,
     time: toQueryTime(window),
     filters,
     eventName: eventName ?? "",
-    limit: 100,
+    limit: parseLimit(url, 100, 200),
+    cursor: url.searchParams.get("cursor") ?? "",
   });
   if (!result.ok) return queryErrorResponse(result.error);
   return jsonResponseWith(ctx!, { ok: true, ...result.data });
@@ -260,7 +281,6 @@ export async function handleEventTypeDetailContract(
   options?: {
     includeContext?: boolean;
     includeBreakdowns?: boolean;
-    includeFields?: boolean;
   },
 ): Promise<Response> {
   const eventName = parseEventName(url);
@@ -270,7 +290,6 @@ export async function handleEventTypeDetailContract(
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const includeContext = options?.includeContext ?? true;
   const includeBreakdowns = options?.includeBreakdowns ?? true;
-  const includeFields = options?.includeFields ?? true;
   const result = await createD1SiteQueryRuntime({ env, siteId }).execute<{
     readonly eventName: string;
     readonly summary: Record<string, unknown>;
@@ -282,7 +301,6 @@ export async function handleEventTypeDetailContract(
       readonly browsers: ReturnType<typeof mapTabs>;
     };
     readonly cards: ReturnType<typeof mapEventAnalyticsContextCards>;
-    readonly fields: Array<ReturnType<typeof mapEventField>>;
   }>("event-type-detail", {
     context: queryContext,
     time: toQueryTime(window),
@@ -291,7 +309,6 @@ export async function handleEventTypeDetailContract(
     interval: parseInterval(url),
     includeContext,
     includeBreakdowns,
-    includeFields,
   });
   if (!result.ok) return queryErrorResponse(result.error);
   return jsonResponseWith(ctx!, { ok: true, ...result.data });

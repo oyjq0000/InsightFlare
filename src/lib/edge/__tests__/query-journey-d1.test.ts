@@ -9,19 +9,20 @@ import {
   handleVisitorDetailContract as handleVisitorDetail,
   handleVisitorsContract as handleVisitors,
 } from "@/lib/edge/analytics/composition/protocol/journeys-contract-adapter";
-import { EMPTY_FILTER_DOCUMENT } from "@/lib/edge/analytics/contract";
+import {
+  createQueryTime,
+  EMPTY_FILTER_DOCUMENT,
+  type FilterDocument,
+  type FilterExpression,
+  prepareScopedQuery,
+  siteQueryContext,
+} from "@/lib/edge/analytics/contract";
 import type { QueryWindow } from "@/lib/edge/analytics/providers/d1/internal/core";
 import {
   buildSessionAggregationSql,
   buildVisitorAggregationSql,
 } from "@/lib/edge/analytics/providers/d1/internal/journey-aggregation-sql";
-import {
-  parseSessionListCursor,
-  parseVisitorListCursor,
-  querySessionsFromD1,
-  serializeSessionListCursor,
-  serializeVisitorListCursor,
-} from "@/lib/edge/analytics/providers/d1/internal/journey-list-queries";
+import { querySessionsFromD1 } from "@/lib/edge/analytics/providers/d1/internal/journey-list-queries";
 import {
   queryGeoPointAggregate,
   queryGeoPointsFromD1,
@@ -31,7 +32,6 @@ import {
   querySessionDetailFromD1,
   querySessionLocationPointsFromD1,
   querySessionsForDetailFromD1,
-  queryVisitorAggregate,
   queryVisitorDetailFromD1,
   queryVisitorForDetailFromD1,
   queryVisitorsFromD1,
@@ -97,6 +97,7 @@ function createSqliteDetailEnv(): {
     "migrations/0008_rebuild_analytics.sql",
     "migrations/0013_add_visit_performance_metrics.sql",
     "migrations/0017_structured_custom_events.sql",
+    "migrations/0019_add_user_identity.sql",
   ]) {
     database.exec(readFileSync(migration, "utf8"));
   }
@@ -169,6 +170,39 @@ function visitBindings(window: QueryWindow): QueryBinding[] {
 
 function eventBindings(window: QueryWindow): QueryBinding[] {
   return [siteId, window.startMs, window.endExclusiveMs];
+}
+
+function condition(
+  field: string,
+  value: string,
+  operator: "eq" | "neq" = "eq",
+): FilterExpression {
+  return {
+    kind: "condition",
+    target: { kind: "field", field: field as never },
+    operator,
+    value,
+  };
+}
+
+function prepareScopedFilters(
+  operation: "sessions" | "visitors",
+  scope: "session" | "visitor",
+  root: FilterExpression,
+  targetWindow: QueryWindow,
+): FilterDocument {
+  const prepared = prepareScopedQuery(operation, {
+    context: siteQueryContext(siteId, "private-dashboard"),
+    time: createQueryTime(
+      targetWindow.startMs,
+      targetWindow.endExclusiveMs,
+      targetWindow.timeZone,
+      targetWindow.nowMs,
+    ),
+    filters: { version: 1, root },
+    scopePreference: scope,
+  } as never);
+  return prepared.filters!;
 }
 
 function url(path: string, params: Record<string, string | number | boolean>) {
@@ -792,6 +826,521 @@ describe("edge journey detail D1 queries", () => {
     }
   });
 
+  it("uses custom-event time for event-only scoped session and visitor rows", async () => {
+    const sqlite = createSqliteDetailEnv();
+    const targetWindow = queryWindow();
+    const eventAt = baseMs + 30_000;
+    try {
+      sqlite.database
+        .prepare(
+          `INSERT INTO visits (
+            visit_id, site_id, visitor_id, session_id, status, started_at,
+            last_activity_at, pathname, hostname, user_id, user_name
+          ) VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "event-only-visit",
+          siteId,
+          "event-only-visitor",
+          "event-only-session",
+          baseMs - 60 * 60 * 1000,
+          baseMs - 60 * 60 * 1000,
+          "/event-only",
+          "example.test",
+          "event-user",
+          "Event User",
+        );
+      sqlite.database
+        .prepare(
+          "INSERT INTO custom_event_names (id, site_id, name, last_seen_at) VALUES (?, ?, ?, ?)",
+        )
+        .run(1, siteId, "signup", eventAt);
+      sqlite.database
+        .prepare(
+          `INSERT INTO custom_events (
+            event_pk, event_id, site_id, visit_id, event_name_id, occurred_at,
+            received_at, sequence, node_count, value_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          1,
+          "event-only-event",
+          siteId,
+          "event-only-visit",
+          1,
+          eventAt,
+          eventAt,
+          0,
+          0,
+          0,
+        );
+
+      const eventFilter = condition("event.name", "signup");
+      const sessionRows = await querySessionsFromD1(
+        sqlite.env,
+        siteId,
+        targetWindow,
+        prepareScopedFilters("sessions", "session", eventFilter, targetWindow),
+        10,
+      );
+      const visitorRows = await queryVisitorsFromD1(
+        sqlite.env,
+        siteId,
+        targetWindow,
+        prepareScopedFilters("visitors", "visitor", eventFilter, targetWindow),
+        10,
+      );
+
+      expect(sessionRows).toHaveLength(1);
+      expect(sessionRows[0]).toMatchObject({
+        sessionId: "event-only-session",
+        startedAt: eventAt,
+        endedAt: eventAt,
+        views: 0,
+        events: 1,
+        bounce: false,
+        userId: "event-user",
+        userName: "Event User",
+      });
+      expect(sessionRows[0]?.startedAt).not.toBe(0);
+      expect(visitorRows).toHaveLength(1);
+      expect(visitorRows[0]).toMatchObject({
+        visitorId: "event-only-visitor",
+        firstSeenAt: eventAt,
+        lastSeenAt: eventAt,
+        views: 0,
+        sessions: 1,
+        events: 1,
+        userId: "event-user",
+        userName: "Event User",
+      });
+      expect(visitorRows[0]?.firstSeenAt).not.toBe(0);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("keeps identity pairs consistent, ignores anonymous rows, and searches identity", async () => {
+    const sqlite = createSqliteDetailEnv();
+    const targetWindow = queryWindow();
+    try {
+      const insertVisit = sqlite.database.prepare(`
+        INSERT INTO visits (
+          visit_id, site_id, visitor_id, session_id, status, started_at,
+          last_activity_at, pathname, hostname, user_id, user_name
+        ) VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, 'example.test', ?, ?)
+      `);
+      const addVisit = (
+        visitId: string,
+        visitorId: string,
+        sessionId: string,
+        pathname: string,
+        offset: number,
+        userId: string,
+        userName: string,
+      ) => {
+        const startedAt = baseMs + offset;
+        insertVisit.run(
+          visitId,
+          siteId,
+          visitorId,
+          sessionId,
+          startedAt,
+          startedAt,
+          pathname,
+          userId,
+          userName,
+        );
+      };
+
+      addVisit(
+        "identity-first",
+        "identity-visitor",
+        "identity-session",
+        "/first",
+        1_000,
+        "user-z",
+        "Old User",
+      );
+      addVisit(
+        "identity-paired",
+        "identity-visitor",
+        "identity-session",
+        "/identified",
+        2_000,
+        "user-a",
+        "New User",
+      );
+      addVisit(
+        "identity-tie-a",
+        "identity-visitor",
+        "identity-session",
+        "/tie-a",
+        2_000,
+        "user-tie-a",
+        "Tie A",
+      );
+      addVisit(
+        "identity-tie-z",
+        "identity-visitor",
+        "identity-session",
+        "/tie-z",
+        2_000,
+        "user-tie-z",
+        "Tie Z",
+      );
+      addVisit(
+        "identity-latest-anonymous",
+        "identity-visitor",
+        "identity-session",
+        "/latest",
+        3_000,
+        "",
+        "Stale Name",
+      );
+      addVisit(
+        "anonymous-only",
+        "anonymous-visitor",
+        "anonymous-session",
+        "/anonymous",
+        4_000,
+        "",
+        "",
+      );
+
+      const visitors = await queryVisitorsFromD1(
+        sqlite.env,
+        siteId,
+        targetWindow,
+        EMPTY_FILTER_DOCUMENT,
+        10,
+      );
+      const sessions = await querySessionsFromD1(
+        sqlite.env,
+        siteId,
+        targetWindow,
+        EMPTY_FILTER_DOCUMENT,
+        10,
+      );
+      expect(visitors).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            visitorId: "identity-visitor",
+            userId: "user-tie-z",
+            userName: "Tie Z",
+            firstSeenAt: baseMs + 1_000,
+            lastSeenAt: baseMs + 3_000,
+          }),
+          expect.objectContaining({
+            visitorId: "anonymous-visitor",
+            userId: "",
+            userName: "",
+          }),
+        ]),
+      );
+      expect(sessions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sessionId: "identity-session",
+            userId: "user-tie-z",
+            userName: "Tie Z",
+            entryPath: "/first",
+            exitPath: "/latest",
+          }),
+          expect.objectContaining({
+            sessionId: "anonymous-session",
+            userId: "",
+            userName: "",
+          }),
+        ]),
+      );
+
+      await expect(
+        queryVisitorsFromD1(
+          sqlite.env,
+          siteId,
+          targetWindow,
+          EMPTY_FILTER_DOCUMENT,
+          10,
+          undefined,
+          undefined,
+          "new user",
+        ),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          visitorId: "identity-visitor",
+          userId: "user-tie-z",
+          userName: "Tie Z",
+        }),
+      ]);
+      await expect(
+        querySessionsFromD1(
+          sqlite.env,
+          siteId,
+          targetWindow,
+          EMPTY_FILTER_DOCUMENT,
+          10,
+          undefined,
+          undefined,
+          "new user",
+        ),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          sessionId: "identity-session",
+          userId: "user-tie-z",
+          userName: "Tie Z",
+        }),
+      ]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("evaluates Session and Visitor AND/OR/NOT membership on real SQLite data", async () => {
+    const sqlite = createSqliteDetailEnv();
+    const targetWindow = queryWindow();
+    try {
+      const insertVisit = sqlite.database.prepare(`
+        INSERT INTO visits (
+          visit_id, site_id, visitor_id, session_id, status, started_at,
+          last_activity_at, pathname, hostname
+        ) VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, 'example.test')
+      `);
+      const insertEvent = sqlite.database.prepare(`
+        INSERT INTO custom_events (
+          event_pk, event_id, site_id, visit_id, event_name_id, occurred_at,
+          received_at, sequence, node_count, value_count
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0)
+      `);
+      sqlite.database
+        .prepare(
+          "INSERT INTO custom_event_names (id, site_id, name, last_seen_at) VALUES (?, ?, ?, ?)",
+        )
+        .run(1, siteId, "signup", baseMs);
+
+      const addVisit = (
+        visitId: string,
+        visitorId: string,
+        sessionId: string,
+        pathname: string,
+        offset: number,
+      ) => {
+        const startedAt = baseMs + offset;
+        insertVisit.run(
+          visitId,
+          siteId,
+          visitorId,
+          sessionId,
+          startedAt,
+          startedAt,
+          pathname,
+        );
+      };
+      const addEvent = (eventPk: number, eventId: string, visitId: string) => {
+        const occurredAt = baseMs + 10_000 + eventPk;
+        insertEvent.run(
+          eventPk,
+          eventId,
+          siteId,
+          visitId,
+          occurredAt,
+          occurredAt,
+          eventPk,
+        );
+      };
+
+      // Sessions: A is /a, B is signup.
+      addVisit("session-a-visit", "visitor-a", "session-a", "/a", 1_000);
+      addEvent(1, "session-a-event", "session-a-visit");
+      addVisit("session-b-visit", "visitor-b", "session-b", "/a", 2_000);
+      addVisit("session-c-visit", "visitor-c", "session-c", "/c", 3_000);
+      addEvent(2, "session-c-event", "session-c-visit");
+      addVisit("session-d-visit", "visitor-d", "session-d", "/d", 4_000);
+
+      const sessionA = condition("page.path", "/a");
+      const sessionB = condition("event.name", "signup");
+      const sessionIds = async (root: FilterExpression) =>
+        (
+          await querySessionsFromD1(
+            sqlite.env,
+            siteId,
+            targetWindow,
+            prepareScopedFilters("sessions", "session", root, targetWindow),
+            20,
+          )
+        ).map((row) => row.sessionId);
+
+      await expect(
+        sessionIds({ kind: "and", children: [sessionA, sessionB] }),
+      ).resolves.toEqual(["session-a"]);
+      await expect(
+        sessionIds({ kind: "or", children: [sessionA, sessionB] }),
+      ).resolves.toEqual(["session-c", "session-b", "session-a"]);
+      await expect(
+        sessionIds({ kind: "not", child: sessionB }),
+      ).resolves.toEqual(["session-d", "session-b"]);
+      await expect(
+        sessionIds({ kind: "and", children: [sessionA, sessionA] }),
+      ).resolves.toEqual(["session-b", "session-a"]);
+
+      // Visitors: A and B deliberately occur in different sessions for the
+      // same visitor, while visitor-c only has B and visitor-d has neither.
+      addVisit(
+        "visitor-a-first",
+        "visitor-1",
+        "visitor-session-a",
+        "/a",
+        5_000,
+      );
+      addVisit(
+        "visitor-a-second",
+        "visitor-1",
+        "visitor-session-b",
+        "/neutral",
+        6_000,
+      );
+      addEvent(3, "visitor-a-event", "visitor-a-second");
+      addVisit(
+        "visitor-b-only-a",
+        "visitor-2",
+        "visitor-session-c",
+        "/a",
+        7_000,
+      );
+      addVisit(
+        "visitor-c-only-b",
+        "visitor-3",
+        "visitor-session-d",
+        "/c",
+        8_000,
+      );
+      addEvent(4, "visitor-c-event", "visitor-c-only-b");
+      addVisit(
+        "visitor-d-neither",
+        "visitor-4",
+        "visitor-session-e",
+        "/d",
+        9_000,
+      );
+
+      const visitorA = condition("page.path", "/a");
+      const visitorB = condition("event.name", "signup");
+      const visitorIds = async (root: FilterExpression) =>
+        (
+          await queryVisitorsFromD1(
+            sqlite.env,
+            siteId,
+            targetWindow,
+            prepareScopedFilters("visitors", "visitor", root, targetWindow),
+            20,
+          )
+        ).map((row) => row.visitorId);
+
+      await expect(
+        visitorIds({ kind: "and", children: [visitorA, visitorB] }),
+      ).resolves.toEqual(["visitor-1", "visitor-a"]);
+      await expect(
+        visitorIds({ kind: "or", children: [visitorA, visitorB] }),
+      ).resolves.toEqual([
+        "visitor-3",
+        "visitor-2",
+        "visitor-1",
+        "visitor-c",
+        "visitor-b",
+        "visitor-a",
+      ]);
+      await expect(
+        visitorIds({ kind: "not", child: visitorA }),
+      ).resolves.toEqual(["visitor-4", "visitor-3", "visitor-d", "visitor-c"]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("distinguishes neq from NOT(eq) for Session and Visitor scopes on real SQLite data", async () => {
+    const sqlite = createSqliteDetailEnv();
+    const targetWindow = queryWindow();
+    try {
+      const insertVisit = sqlite.database.prepare(`
+        INSERT INTO visits (
+          visit_id, site_id, visitor_id, session_id, status, started_at,
+          last_activity_at, pathname, hostname
+        ) VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, 'example.test')
+      `);
+      const addVisit = (
+        visitId: string,
+        visitorId: string,
+        sessionId: string,
+        pathname: string,
+        offset: number,
+      ) => {
+        const startedAt = baseMs + offset;
+        insertVisit.run(
+          visitId,
+          siteId,
+          visitorId,
+          sessionId,
+          startedAt,
+          startedAt,
+          pathname,
+        );
+      };
+
+      // Visitor A / Session A has both observations. Visitor B / Session B
+      // has only /home, so the entity-level predicates have different sets.
+      addVisit("neq-not-a-home", "visitor-a", "session-a", "/home", 1_000);
+      addVisit(
+        "neq-not-a-pricing",
+        "visitor-a",
+        "session-a",
+        "/pricing",
+        2_000,
+      );
+      addVisit("neq-not-b-home", "visitor-b", "session-b", "/home", 3_000);
+
+      const neqRoot = condition("page.path", "/pricing", "neq");
+      const notEqRoot: FilterExpression = {
+        kind: "not",
+        child: condition("page.path", "/pricing"),
+      };
+      const sessionIds = async (root: FilterExpression) =>
+        (
+          await querySessionsFromD1(
+            sqlite.env,
+            siteId,
+            targetWindow,
+            prepareScopedFilters("sessions", "session", root, targetWindow),
+            20,
+          )
+        ).map((row) => row.sessionId);
+      const visitorIds = async (root: FilterExpression) =>
+        (
+          await queryVisitorsFromD1(
+            sqlite.env,
+            siteId,
+            targetWindow,
+            prepareScopedFilters("visitors", "visitor", root, targetWindow),
+            20,
+          )
+        ).map((row) => row.visitorId);
+
+      const neqSessionIds = await sessionIds(neqRoot);
+      expect(neqSessionIds).toEqual(
+        expect.arrayContaining(["session-a", "session-b"]),
+      );
+      expect(neqSessionIds).toHaveLength(2);
+      await expect(sessionIds(notEqRoot)).resolves.toEqual(["session-b"]);
+      const neqVisitorIds = await visitorIds(neqRoot);
+      expect(neqVisitorIds).toEqual(
+        expect.arrayContaining(["visitor-a", "visitor-b"]),
+      );
+      expect(neqVisitorIds).toHaveLength(2);
+      await expect(visitorIds(notEqRoot)).resolves.toEqual(["visitor-b"]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
   it("keeps pageview metrics when a visitor has no session or custom event", async () => {
     const { env } = createD1Env([
       [
@@ -976,19 +1525,19 @@ describe("edge journey detail D1 queries", () => {
 });
 
 describe("edge journey list D1 queries", () => {
-  it("passes default aggregate arguments through to the visitor list query", async () => {
+  it("uses the canonical visitor list query with default sorting", async () => {
     const window = queryWindow();
     const { env, calls } = createD1Env([
       [visitorRow({ visitorId: "visitor-2" })],
     ]);
 
     await expect(
-      queryVisitorAggregate(env, siteId, window, EMPTY_FILTER_DOCUMENT, 6),
+      queryVisitorsFromD1(env, siteId, window, EMPTY_FILTER_DOCUMENT, 6),
     ).resolves.toMatchObject([{ visitorId: "visitor-2" }]);
 
     expect(calls[0].sql).toContain("ORDER BY lastSeenAt DESC");
-    expect(calls[0].bindings.at(-2)).toBe(6);
-    expect(calls[0].bindings.at(-1)).toBe(0);
+    expect(calls[0].bindings.at(-2)).toBe(window.endExclusiveMs);
+    expect(calls[0].bindings.at(-1)).toBe(7);
   });
 
   it("builds visitor list SQL with target, search, sorting, and pagination", async () => {
@@ -1003,22 +1552,21 @@ describe("edge journey list D1 queries", () => {
         filterFixture({ country: "US" }),
         5,
         "123",
-        10,
         { key: "views", direction: "asc" },
         "Chrome",
       ),
     ).resolves.toMatchObject([{ visitorId: "123", views: 3 }]);
 
-    expect(calls[0].sql).toContain("matched_visitors");
+    expect(calls[0].sql).not.toContain("matched_visitors");
     expect(calls[0].sql).toContain("ORDER BY views ASC");
     expect(calls[0].bindings.slice(0, 8)).toEqual([
       ...visitBindings(window),
       ...eventBindings(window),
-      "123",
       "us",
+      window.startMs,
     ]);
-    expect(calls[0].bindings.at(-2)).toBe(5);
-    expect(calls[0].bindings.at(-1)).toBe(10);
+    expect(calls[0].bindings.at(-2)).toBe("%chrome%");
+    expect(calls[0].bindings.at(-1)).toBe(6);
   });
 
   it("builds session list SQL with session target and search filters", async () => {
@@ -1033,13 +1581,12 @@ describe("edge journey list D1 queries", () => {
         filterFixture({ device: "desktop" }),
         7,
         { type: "session", value: "session-1" },
-        2,
         { key: "durationMs", direction: "asc" },
         "pricing",
       ),
     ).resolves.toMatchObject([{ sessionId: "session-1", durationMs: 60_000 }]);
 
-    expect(calls[0].sql).toContain("matched_sessions");
+    expect(calls[0].sql).not.toContain("matched_sessions");
     expect(calls[0].sql).toContain("ORDER BY totalDurationMs ASC");
     expect(calls[0].bindings.slice(0, 8)).toEqual([
       ...visitBindings(window),
@@ -1047,8 +1594,8 @@ describe("edge journey list D1 queries", () => {
       "session-1",
       "desktop",
     ]);
-    expect(calls[0].bindings.at(-2)).toBe(7);
-    expect(calls[0].bindings.at(-1)).toBe(2);
+    expect(calls[0].bindings.at(-2)).toBe("%pricing%");
+    expect(calls[0].bindings.at(-1)).toBe(8);
   });
 
   it("queries a target journey event list with visit filters and limit", async () => {
@@ -1075,7 +1622,10 @@ describe("edge journey list D1 queries", () => {
       ...eventBindings(window),
       "session-1",
       "/pricing",
-      20,
+      window.startMs,
+      window.endExclusiveMs,
+      "/pricing",
+      21,
     ]);
   });
 });
@@ -1403,7 +1953,7 @@ describe("edge journey handlers", () => {
       url("/visitors", {
         from: window.startMs,
         to: window.endExclusiveMs,
-        pageSize: 1,
+        limit: 1,
         sortBy: "views",
         sortDir: "asc",
         search: "Chrome",
@@ -1412,12 +1962,14 @@ describe("edge journey handlers", () => {
 
     await expect(response.json()).resolves.toMatchObject({
       ok: true,
-      data: [{ visitorId: "visitor-1", views: 3, sessions: 2 }],
-      meta: {
-        pageSize: 1,
-        returned: 1,
-        hasMore: true,
-        nextCursor: expect.any(String),
+      data: {
+        items: [{ visitorId: "visitor-1", views: 3, sessions: 2 }],
+        pagination: {
+          limit: 1,
+          returned: 1,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
     expect(calls[0].sql).toContain("ORDER BY views ASC");
@@ -1429,20 +1981,8 @@ describe("edge journey handlers", () => {
     const window = queryWindow();
     const visitors = createD1Env([]);
     const sessions = createD1Env([]);
-    const visitorCursor = serializeVisitorListCursor({
-      sortKey: "views",
-      sortDirection: "asc",
-      sortValue: 3,
-      lastSeenAt: baseMs,
-      visitorId: "visitor-1",
-    });
-    const sessionCursor = serializeSessionListCursor({
-      sortKey: "views",
-      sortDirection: "asc",
-      sortValue: 2,
-      startedAt: baseMs,
-      sessionId: "session-1",
-    });
+    const visitorCursor = "invalid-visitor-cursor";
+    const sessionCursor = "invalid-session-cursor";
 
     await expect(
       handleVisitors(
@@ -1451,7 +1991,7 @@ describe("edge journey handlers", () => {
         url("/visitors", {
           from: window.startMs,
           to: window.endExclusiveMs,
-          pageSize: 120,
+          limit: 120,
           cursor: visitorCursor,
           sortBy: "sessions",
         }),
@@ -1464,7 +2004,7 @@ describe("edge journey handlers", () => {
         url("/sessions", {
           from: window.startMs,
           to: window.endExclusiveMs,
-          pageSize: 120,
+          limit: 120,
           cursor: sessionCursor,
           sortBy: "durationMs",
         }),
@@ -1491,16 +2031,18 @@ describe("edge journey handlers", () => {
 
     await expect(response.json()).resolves.toMatchObject({
       ok: true,
-      data: [{ sessionId: "session-1", visitorId: "visitor-1" }],
-      meta: {
-        pageSize: 3,
-        returned: 1,
-        hasMore: false,
-        nextCursor: null,
+      data: {
+        items: [{ sessionId: "session-1", visitorId: "visitor-1" }],
+        pagination: {
+          limit: 3,
+          returned: 1,
+          hasMore: false,
+          nextCursor: null,
+        },
       },
     });
-    expect(calls[0].bindings.at(-2)).toBe(3);
-    expect(calls[0].bindings.at(-1)).toBe(0);
+    expect(calls[0].bindings.at(-2)).toBe("%pricing%");
+    expect(calls[0].bindings.at(-1)).toBe(4);
   });
 
   it("paginates sessions with a keyset cursor and trims the extra row", async () => {
@@ -1518,7 +2060,7 @@ describe("edge journey handlers", () => {
       url("/sessions", {
         from: window.startMs,
         to: window.endExclusiveMs,
-        pageSize: 1,
+        limit: 1,
         sortBy: "views",
         sortDir: "asc",
       }),
@@ -1526,12 +2068,14 @@ describe("edge journey handlers", () => {
 
     await expect(response.json()).resolves.toMatchObject({
       ok: true,
-      data: [{ sessionId: "session-1" }],
-      meta: {
-        pageSize: 1,
-        returned: 1,
-        hasMore: true,
-        nextCursor: expect.any(String),
+      data: {
+        items: [{ sessionId: "session-1" }],
+        pagination: {
+          limit: 1,
+          returned: 1,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
     expect(calls[0].sql).toContain("ORDER BY views ASC");
@@ -1544,13 +2088,7 @@ describe("edge journey handlers", () => {
     const { env, calls } = createD1Env([
       [visitorRow({ visitorId: "visitor-2" })],
     ]);
-    const cursor = serializeVisitorListCursor({
-      sortKey: "views",
-      sortDirection: "asc",
-      sortValue: 3,
-      lastSeenAt: baseMs + 60_000,
-      visitorId: "visitor-1",
-    });
+    const cursor = "invalid-visitor-cursor";
 
     await expect(
       handleVisitors(
@@ -1559,52 +2097,14 @@ describe("edge journey handlers", () => {
         url("/visitors", {
           from: window.startMs,
           to: window.endExclusiveMs,
-          pageSize: 1,
+          limit: 1,
           cursor,
           sortBy: "views",
           sortDir: "asc",
         }),
       ),
-    ).resolves.toMatchObject({ status: 200 });
-
-    expect(calls[0].sql).toContain("vm.views > ?");
-    expect(calls[0].sql).toContain("vm.lastSeenAt < ?");
-    expect(calls[0].sql).not.toContain("OFFSET");
-    expect(calls[0].bindings.at(-6)).toBe(3);
-    expect(calls[0].bindings.at(-1)).toBe(2);
-  });
-
-  it("serializes Journey cursors only for their matching sort", () => {
-    const visitor = serializeVisitorListCursor({
-      sortKey: "views",
-      sortDirection: "asc",
-      sortValue: 3,
-      lastSeenAt: baseMs,
-      visitorId: "visitor-1",
-    });
-    const session = serializeSessionListCursor({
-      sortKey: "durationMs",
-      sortDirection: "desc",
-      sortValue: 60_000,
-      startedAt: baseMs,
-      sessionId: "session-1",
-    });
-
-    expect(
-      parseVisitorListCursor(visitor, { key: "views", direction: "asc" }),
-    ).toMatchObject({ visitorId: "visitor-1", sortValue: 3 });
-    expect(
-      parseVisitorListCursor(visitor, { key: "sessions", direction: "asc" }),
-    ).toBeNull();
-    expect(
-      parseSessionListCursor(session, {
-        key: "durationMs",
-        direction: "desc",
-      }),
-    ).toMatchObject({ sessionId: "session-1", sortValue: 60_000 });
-    expect(
-      parseSessionListCursor(session, { key: "durationMs", direction: "asc" }),
-    ).toBeNull();
+    ).resolves.toMatchObject({ status: 400 });
+    expect(calls).toEqual([]);
   });
 
   it("rejects invalid list windows before querying D1", async () => {

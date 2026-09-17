@@ -4,7 +4,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import { Icon } from "@iconify/react";
@@ -12,8 +11,10 @@ import {
   RiArrowDownLine,
   RiArrowRightUpLine,
   RiArrowUpLine,
+  RiBarChartLine,
   RiLineChartLine,
   RiSearchLine,
+  RiUserLine,
 } from "@remixicon/react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
@@ -37,6 +38,7 @@ import { PageHeading } from "@/components/dashboard/page-heading";
 import {
   TabbedDataTableCard,
   type TabbedDataTableColumn,
+  type TabbedDataTableLoader,
   type TabbedDataTableRowAdapter,
   type TabbedDataTableTab,
 } from "@/components/dashboard/tabbed-data-table-card";
@@ -46,6 +48,11 @@ import { AutoTransition } from "@/components/ui/auto-transition";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Clickable } from "@/components/ui/clickable";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   TRAFFIC_CHANNEL_IDS,
   type TrafficChannelId,
@@ -57,12 +64,17 @@ import {
 import {
   fetchOverview,
   fetchOverviewClientDimensionTab,
-  fetchOverviewGeoDimensionTab,
+  fetchOverviewGeoDimensionTabPage,
   fetchOverviewPageCardTab,
   fetchOverviewSourceCardTab,
   fetchTrend,
   type OverviewTabRows,
 } from "@/lib/dashboard/client-data";
+import {
+  type DashboardComparisonQuery,
+  resolveDashboardComparisonQuery,
+} from "@/lib/dashboard/comparison-query";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import {
   type DashboardFilterControlKey,
   dashboardFilterValue,
@@ -91,12 +103,24 @@ import {
   normalizePagePath,
 } from "@/lib/dashboard/page-detail";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
+import { loadLocalTablePage } from "@/lib/dashboard/table-loader";
 import {
   addZonedInterval,
   startOfZonedInterval,
 } from "@/lib/dashboard/time-zone";
 import { decodeUrlDisplayValue } from "@/lib/dashboard/url-display";
-import type { OverviewData, TrendData } from "@/lib/edge-client";
+import type {
+  OverviewData,
+  OverviewTabData,
+  TrendData,
+} from "@/lib/edge-client";
+import {
+  attachFilterScopePreference,
+  type FilterScope,
+  filterScopePreferenceFromDocument,
+  parseFilterScopePreference,
+  resolveFilterScope,
+} from "@/lib/filter-contract";
 import {
   analyticsFilterRegistry,
   type FilterDocument,
@@ -161,6 +185,7 @@ function fallbackUnlessAborted<T>(error: unknown, fallback: () => T): T {
 }
 
 const METRIC_AREA_COLOR = "var(--color-chart-1)";
+const COMPARISON_AREA_COLOR = "var(--color-compare-chart-1)";
 const MAX_TREND_PLACEHOLDER_POINTS = 120;
 
 function trendStepMs(interval: TimeWindow["interval"]): number {
@@ -344,29 +369,60 @@ const ChangeRateInline = memo(function ChangeRateInline({
 });
 
 type PageCardTab = "path" | "query" | "title" | "hostname" | "entry" | "exit";
-type PageCardSortKey = "views" | "visitors";
+type OverviewComparisonMetric = "views" | "visitors";
+type PageCardSortKey =
+  "views" | "visitors" | "current" | "reference" | "change";
 type PageCardNavigableTab = "path" | "query" | "hostname" | "entry" | "exit";
 type PageCardDetailTab = "path" | "entry" | "exit";
 type SourceCardTab = "domain" | "link" | "channel";
 type OverviewPagesSectionCardKind = "page" | "source" | "client" | "geo";
 type ClientDimensionCardTab =
-  | "browser"
-  | "osVersion"
-  | "deviceType"
-  | "language"
-  | "screenSize";
+  "browser" | "osVersion" | "deviceType" | "language" | "screenSize";
 type GeoDimensionCardTab =
-  | "country"
-  | "region"
-  | "city"
-  | "continent"
-  | "timezone"
-  | "organization";
+  "country" | "region" | "city" | "continent" | "timezone" | "organization";
 type GeoLocationTab = Extract<
   GeoDimensionCardTab,
   "country" | "region" | "city"
 >;
-type OverviewCardTabCache<T extends string> = Record<T, OverviewTabRows | null>;
+function overviewTabData(
+  value: OverviewTabRows | OverviewTabData["data"],
+): OverviewTabData["data"] {
+  if (!Array.isArray(value)) return value;
+  return {
+    items: value,
+    pagination: {
+      limit: value.length,
+      returned: value.length,
+      hasMore: false,
+      nextCursor: null,
+    },
+  };
+}
+
+function loadLocalOverviewTablePage(
+  rows: readonly OverviewTabRows[number][],
+  sort: { key: PageCardSortKey; direction: "asc" | "desc" },
+  tab: string,
+  limit: number,
+  cursor: string | null,
+  search: string,
+): OverviewTabData["data"] {
+  const metric = sort.key === "visitors" ? "visitors" : "views";
+  const page = loadLocalTablePage({
+    rows: [...rows],
+    sort: { key: metric, direction: sort.direction },
+    columns: [
+      { key: "views", getValue: (row) => row.views },
+      { key: "visitors", getValue: (row) => row.visitors },
+    ],
+    tab,
+    limit,
+    cursor,
+    search,
+    getSearchText: (row) => row.label,
+  });
+  return { ...page, items: [...page.items] };
+}
 
 export interface OverviewPagesSectionCardData {
   page: {
@@ -411,7 +467,23 @@ type PageCardTabFetcher = (
   siteId: string,
   window: TimeWindow,
   filters: FilterDocument,
-) => Promise<OverviewTabRows>;
+  resolvedScope?: FilterScope,
+  options?: {
+    limit?: number;
+    cursor?: string | null;
+    search?: string;
+    sort?: "views" | "visitors" | "sessions";
+    direction?: "asc" | "desc";
+    comparisonMetric?: "views" | "visitors";
+    comparisonSortBy?: "current" | "reference" | "change";
+    comparison?: {
+      mode: "same" | "previous";
+      window: TimeWindow;
+      filters: FilterDocument;
+    } | null;
+    signal?: AbortSignal;
+  },
+) => Promise<OverviewTabRows | OverviewTabData["data"]>;
 
 type PageCardTargetUrlResolver = (params: {
   tab: PageCardTab;
@@ -439,6 +511,16 @@ interface PageCardRow {
   rawLabel?: string;
   views: number;
   visitors: number;
+  reference?: {
+    views: number;
+    sessions: number;
+    visitors: number;
+  };
+  change?: {
+    views: { absolute: number; relative: number | null };
+    sessions: { absolute: number; relative: number | null };
+    visitors: { absolute: number; relative: number | null };
+  };
   mono: boolean;
   iconName?: string | null;
   filterValue?: string;
@@ -463,6 +545,96 @@ interface PageCardRow {
   };
 }
 
+function createOverviewComparisonColumns(
+  metric: OverviewComparisonMetric,
+  comparisonLabel: string,
+  locale: Locale,
+  messages: AppMessages,
+): readonly TabbedDataTableColumn<PageCardRow, PageCardSortKey, string>[] {
+  return [
+    {
+      key: "reference",
+      label: comparisonLabel,
+      getValue: (row) => row.reference?.[metric] ?? 0,
+      sortValue: (row) => row.reference?.[metric] ?? 0,
+      format: (value) => numberFormat(locale, value),
+    },
+    {
+      key: "current",
+      label:
+        metric === "views" ? messages.common.views : messages.common.visitors,
+      getValue: (row) => row[metric],
+      sortValue: (row) => row[metric],
+      format: (value) => numberFormat(locale, value),
+    },
+    {
+      key: "change",
+      label: messages.common.change,
+      getValue: (row) => row.change?.[metric].absolute ?? 0,
+      sortValue: (row) => row.change?.[metric].relative ?? Infinity,
+      format: (_value, row) => {
+        const change = row.change?.[metric];
+        if (!change) {
+          return <span className="text-muted-foreground">—</span>;
+        }
+        if (change.relative === null) {
+          return (
+            <span className={changeRateClass(row[metric] > 0 ? 100 : null)}>
+              {row[metric] > 0 ? messages.common.new : "—"}
+            </span>
+          );
+        }
+        const percentage = change.relative * 100;
+        return (
+          <span className={changeRateClass(percentage)}>
+            {formatChangeRate(percentage) ?? "0.0%"}
+          </span>
+        );
+      },
+    },
+  ];
+}
+
+const ComparisonMetricToggle = memo(function ComparisonMetricToggle({
+  metric,
+  messages,
+  onMetricChange,
+}: {
+  metric: OverviewComparisonMetric;
+  messages: AppMessages;
+  onMetricChange: (metric: OverviewComparisonMetric) => void;
+}) {
+  const nextMetric: OverviewComparisonMetric =
+    metric === "views" ? "visitors" : "views";
+  const label =
+    metric === "views" ? messages.common.views : messages.common.visitors;
+  const Icon = metric === "views" ? RiBarChartLine : RiUserLine;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Clickable
+          className="size-6 text-muted-foreground hover:text-foreground"
+          aria-label={label}
+          onClick={() => onMetricChange(nextMetric)}
+        >
+          <AutoTransition
+            as="span"
+            type="crossFade"
+            duration={0.18}
+            initial={false}
+            transitionKey={metric}
+            className="inline-flex size-4 items-center justify-center"
+          >
+            <Icon key={metric} className="size-4" aria-hidden="true" />
+          </AutoTransition>
+        </Clickable>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+});
+
 interface SourceCardRow {
   key: string;
   label: string;
@@ -471,18 +643,261 @@ interface SourceCardRow {
   targetUrl: string | null;
   views: number;
   visitors: number;
+  reference?: PageCardRow["reference"];
+  change?: PageCardRow["change"];
   mono: boolean;
   channelId?: TrafficChannelId;
 }
 
-const ALL_PAGE_CARD_TABS: PageCardTab[] = [
-  "path",
-  "query",
-  "title",
-  "hostname",
-  "entry",
-  "exit",
-];
+function buildPageCardExportRows(
+  tab: PageCardTab,
+  items: OverviewTabRows,
+  messages: AppMessages,
+  fallbackLabel?: string,
+): PageCardRow[] {
+  return items.map((item, index) => {
+    const rawLabel = String(item.label ?? "").trim();
+    const label =
+      rawLabel ||
+      (fallbackLabel ??
+        (tab === "query"
+          ? messages.pages.noQuery
+          : tab === "title" || tab === "hostname"
+            ? messages.common.unknown
+            : "/"));
+    return {
+      key: item.key ?? `${tab}-${label}-${index}`,
+      label,
+      displayLabel: decodeUrlDisplayValue(label),
+      views: Math.max(0, Number(item.views ?? 0)),
+      visitors: Math.max(0, Number(item.visitors ?? 0)),
+      reference: item.reference,
+      change: item.change,
+      mono: tab !== "title",
+      filterValue: rawLabel || label,
+    };
+  });
+}
+
+function buildSourceCardExportRows(
+  tab: SourceCardTab,
+  items: OverviewTabRows,
+  directLabel: string,
+  channelLabels: Record<TrafficChannelId, string>,
+): SourceCardRow[] {
+  return items.map((item, index) => {
+    const raw = String(item.label ?? "").trim();
+    if (tab === "channel") {
+      const channelId = TRAFFIC_CHANNEL_IDS.includes(raw as TrafficChannelId)
+        ? (raw as TrafficChannelId)
+        : "other";
+      return {
+        key: item.key ?? `channel-${channelId}-${index}`,
+        label: channelLabels[channelId],
+        filterValue: channelId,
+        targetUrl: null,
+        views: Math.max(0, Number(item.views ?? 0)),
+        visitors: Math.max(0, Number(item.visitors ?? 0)),
+        reference: item.reference,
+        change: item.change,
+        mono: false,
+        channelId,
+      };
+    }
+
+    const domain =
+      tab === "domain" && raw !== DIRECT_REFERRER_FILTER_VALUE
+        ? sanitizeHostname(raw)
+        : "";
+    const targetUrl = tab === "link" && raw ? toAbsoluteHttpsUrl(raw) : null;
+    const filterValue =
+      tab === "domain"
+        ? domain || DIRECT_REFERRER_FILTER_VALUE
+        : raw || DIRECT_REFERRER_FILTER_VALUE;
+    const label =
+      tab === "domain"
+        ? domain || directLabel
+        : raw
+          ? (targetUrl ?? raw)
+          : directLabel;
+    return {
+      key: item.key ?? `${tab}-${filterValue}-${index}`,
+      label,
+      displayLabel: decodeUrlDisplayValue(label),
+      filterValue,
+      targetUrl,
+      views: Math.max(0, Number(item.views ?? 0)),
+      visitors: Math.max(0, Number(item.visitors ?? 0)),
+      reference: item.reference,
+      change: item.change,
+      mono: true,
+    };
+  });
+}
+
+function buildClientDimensionRows(
+  tab: ClientDimensionCardTab,
+  items: OverviewTabRows,
+  locale: Locale,
+  messages: AppMessages,
+): PageCardRow[] {
+  const options: {
+    mono?: boolean;
+    screenSize?: boolean;
+    transformLabel?: (value: string) => string;
+    resolveIconName?: (value: string) => string | null;
+    resolveFilterValue?: (rawValue: string, normalizedLabel: string) => string;
+  } = {
+    browser: { resolveIconName: resolveBrowserLogoIconName },
+    osVersion: { resolveIconName: resolveOsLogoIconName },
+    deviceType: {
+      transformLabel: (value: string) =>
+        resolveDeviceTypeMeta(
+          value,
+          messages.common.deviceLabels,
+          messages.common.unknown,
+        ).label,
+    },
+    language: {
+      transformLabel: (value: string) =>
+        resolveLanguageLabel(value, locale, messages.common.unknown).label,
+      resolveFilterValue: (rawValue: string, normalizedLabel: string) =>
+        rawValue.trim() || normalizedLabel,
+    },
+    screenSize: { mono: true, screenSize: true },
+  }[tab];
+
+  return items.map((item, index) => {
+    const rawValue = String(item.label ?? "");
+    const rawLabel = normalizeDimensionLabel(
+      rawValue,
+      messages.common.unknown,
+      { screenSize: options.screenSize },
+    );
+    const label = options.transformLabel
+      ? options.transformLabel(rawLabel)
+      : rawLabel;
+    const filterValue =
+      options.resolveFilterValue?.(rawValue, rawLabel) ?? rawLabel;
+    return {
+      key: item.key ?? `${label}-${index}`,
+      label,
+      rawLabel: rawValue.trim() || rawLabel,
+      views: Math.max(0, Number(item.views ?? 0)),
+      visitors: Math.max(0, Number(item.visitors ?? 0)),
+      reference: item.reference,
+      change: item.change,
+      mono: options.mono ?? false,
+      iconName: options.resolveIconName?.(rawLabel) ?? null,
+      filterValue,
+    };
+  });
+}
+
+function buildGeoDimensionRows(
+  tab: GeoDimensionCardTab,
+  items: OverviewTabRows,
+  locale: Locale,
+  messages: AppMessages,
+  timezoneReferenceTimestampMs: number,
+): PageCardRow[] {
+  if (tab === "region") {
+    return items.map((item, index) => {
+      const value = resolveGeoDimensionRowRawValue(item);
+      const regionData = resolveGeoRegionBreadcrumbData(
+        value,
+        locale,
+        messages.common.unknown,
+      );
+      return {
+        key: item.key ?? `${regionData.displayLabel}-${index}`,
+        label: regionData.displayLabel,
+        rawLabel: value.trim() || regionData.filterValue,
+        views: Math.max(0, Number(item.views ?? 0)),
+        visitors: Math.max(0, Number(item.visitors ?? 0)),
+        reference: item.reference,
+        change: item.change,
+        mono: false,
+        iconName: null,
+        filterValue: regionData.filterValue,
+        regionBreadcrumb: regionData.breadcrumb,
+      };
+    });
+  }
+
+  if (tab === "city") {
+    return items.map((item, index) => {
+      const value = resolveGeoDimensionRowRawValue(item);
+      const cityData = resolveGeoCityBreadcrumbData(
+        value,
+        locale,
+        messages.common.unknown,
+      );
+      return {
+        key: item.key ?? `${cityData.displayLabel}-${index}`,
+        label: cityData.displayLabel,
+        rawLabel: value.trim() || cityData.filterValue,
+        views: Math.max(0, Number(item.views ?? 0)),
+        visitors: Math.max(0, Number(item.visitors ?? 0)),
+        reference: item.reference,
+        change: item.change,
+        mono: false,
+        iconName: null,
+        filterValue: cityData.filterValue,
+        cityBreadcrumb: cityData.breadcrumb ?? undefined,
+      };
+    });
+  }
+
+  return items.map((item, index) => {
+    const originalValue = String(item.label ?? "");
+    const rawLabel = normalizeDimensionLabel(
+      originalValue,
+      messages.common.unknown,
+    );
+    let label = rawLabel;
+    let iconName: string | null = null;
+
+    if (tab === "country") {
+      const country = resolveCountryLabel(
+        rawLabel,
+        locale,
+        messages.common.unknown,
+      );
+      label = country.label;
+      const flagCode = resolveCountryFlagCode(country.code, locale);
+      iconName = flagCode ? `flagpack:${flagCode.toLowerCase()}` : null;
+    } else if (tab === "continent") {
+      label = resolveContinentLabel(
+        rawLabel,
+        messages.common.unknown,
+        messages.common.continentLabels,
+      );
+    } else if (tab === "timezone") {
+      label = resolveTimezoneDisplayLabel({
+        value: rawLabel,
+        locale,
+        unknownLabel: messages.common.unknown,
+        timestampMs: timezoneReferenceTimestampMs,
+        timezoneDeltaVsLocal: messages.geo.timezoneDeltaVsLocal,
+      });
+    }
+
+    return {
+      key: item.key ?? `${label}-${index}`,
+      label,
+      rawLabel: originalValue.trim() || rawLabel,
+      views: Math.max(0, Number(item.views ?? 0)),
+      visitors: Math.max(0, Number(item.visitors ?? 0)),
+      reference: item.reference,
+      change: item.change,
+      mono: false,
+      iconName,
+      filterValue: originalValue.trim() || rawLabel,
+    };
+  });
+}
+
 const PAGE_CARD_TABS: PageCardTab[] = [
   "path",
   "title",
@@ -558,15 +973,6 @@ const GEO_AUX_FILTER_CONTROL_BY_TAB: Record<
 const DIRECT_REFERRER_FILTER_VALUE = "__direct__";
 const GEO_REGION_VALUE_SEPARATOR = "::";
 
-function createOverviewCardTabCache<T extends string>(
-  tabs: readonly T[],
-): OverviewCardTabCache<T> {
-  return tabs.reduce((acc, tab) => {
-    acc[tab] = null;
-    return acc;
-  }, {} as OverviewCardTabCache<T>);
-}
-
 function sanitizeHostname(value: string): string {
   return value
     .trim()
@@ -633,7 +1039,10 @@ function extractGeoCountryCodeFromFilterValue(
 export function parseOverviewCardFilters(
   searchParams: URLSearchParams,
 ): FilterDocument {
-  return parseFilterParams(searchParams, analyticsFilterRegistry);
+  return attachFilterScopePreference(
+    parseFilterParams(searchParams, analyticsFilterRegistry),
+    parseFilterScopePreference(searchParams),
+  );
 }
 
 function isGeoLocationTab(tab: GeoDimensionCardTab): tab is GeoLocationTab {
@@ -1619,8 +2028,11 @@ function resolvePageCardTargetUrl(params: {
 
 interface OverviewPagesSectionProps extends OverviewClientPageProps {
   filters: FilterDocument;
+  resolvedScope?: FilterScope;
   loading?: boolean;
   cardDataOverride?: OverviewPagesSectionCardData | null;
+  comparisonEnabled?: boolean;
+  tableContentTransitionKey?: string | number;
   visibleCards?: readonly OverviewPagesSectionCardKind[];
   pageCardTabs?: readonly PageCardTab[];
   pageCardTabMetaOverride?: Partial<
@@ -1657,8 +2069,10 @@ export function OverviewPagesSection({
   siteDomain,
   pathname,
   filters,
-  loading = false,
+  resolvedScope,
   cardDataOverride,
+  comparisonEnabled = true,
+  tableContentTransitionKey,
   visibleCards,
   showSourceLinkTab = true,
   pageCardTabs,
@@ -1682,6 +2096,11 @@ export function OverviewPagesSection({
   const searchParams = useLiveSearchParams();
   const livePathname = usePathname() || pathname;
   const { window } = useDashboardQuery();
+  const comparisonQuery = useOverviewComparisonQuery(
+    window,
+    filters,
+    comparisonEnabled,
+  );
   const resolvedPageCardTabs = useMemo(
     () => pageCardTabs ?? PAGE_CARD_TABS,
     [pageCardTabs],
@@ -1700,40 +2119,28 @@ export function OverviewPagesSection({
     if (to <= from) return Math.max(0, Math.floor(from));
     return Math.floor(from + (to - from) / 2);
   }, [window.from, window.to]);
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
-  const pageCardFetchersRef = useRef(pageCardFetchers);
-  pageCardFetchersRef.current = pageCardFetchers;
-  const sourceCardFetchersRef = useRef(sourceCardFetchers);
-  sourceCardFetchersRef.current = sourceCardFetchers;
-  const clientCardFetchersRef = useRef(clientCardFetchers);
-  clientCardFetchersRef.current = clientCardFetchers;
-  const geoCardFetchersRef = useRef(geoCardFetchers);
-  geoCardFetchersRef.current = geoCardFetchers;
-  const [pageCardTabData, setPageCardTabData] = useState<
-    OverviewCardTabCache<PageCardTab>
-  >(() => createOverviewCardTabCache(ALL_PAGE_CARD_TABS));
-  const [sourceCardTabData, setSourceCardTabData] = useState<
-    OverviewCardTabCache<SourceCardTab>
-  >(() => createOverviewCardTabCache(SOURCE_CARD_TABS));
-  const [clientDimensionCardTabData, setClientDimensionCardTabData] = useState<
-    OverviewCardTabCache<ClientDimensionCardTab>
-  >(() => createOverviewCardTabCache(CLIENT_DIMENSION_CARD_TABS));
-  const [geoDimensionCardTabData, setGeoDimensionCardTabData] = useState<
-    OverviewCardTabCache<GeoDimensionCardTab>
-  >(() => createOverviewCardTabCache(GEO_DIMENSION_CARD_TABS));
-  const [pageCardTab, setPageCardTab] = useState<PageCardTab>("path");
-  const [sourceCardTab, setSourceCardTab] = useState<SourceCardTab>("domain");
-  const [clientDimensionCardTab, setClientDimensionCardTab] =
-    useState<ClientDimensionCardTab>("browser");
-  const [geoDimensionCardTab, setGeoDimensionCardTab] =
-    useState<GeoDimensionCardTab>("country");
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
+  const comparisonKey = useMemo(
+    () =>
+      comparisonQuery
+        ? `${comparisonQuery.mode}:${comparisonQuery.window.from}:${comparisonQuery.window.to}:${filterQueryKey(comparisonQuery.filters)}`
+        : "none",
+    [comparisonQuery],
+  );
+  const entityScopedOutput =
+    resolvedScope === "session" ||
+    resolvedScope === "visitor" ||
+    (resolvedScope === undefined &&
+      (filterScopePreferenceFromDocument(filters) === "session" ||
+        filterScopePreferenceFromDocument(filters) === "visitor"));
   const hasCardDataOverride = Boolean(cardDataOverride);
-  const resolvedPageCardTabData = cardDataOverride?.page ?? pageCardTabData;
-  const resolvedSourceCardTabData =
-    cardDataOverride?.source ?? sourceCardTabData;
+  const cardDataOverrideKey = useMemo(
+    () => (cardDataOverride ? JSON.stringify(cardDataOverride) : "remote"),
+    [cardDataOverride],
+  );
   const resolvedSourceCardTabs = useMemo(() => {
     const hasChannelData =
-      resolvedSourceCardTabData.channel !== undefined ||
+      cardDataOverride?.source.channel !== undefined ||
       Boolean(sourceCardFetchers?.channel) ||
       (!hasCardDataOverride && !sourceCardFetchers);
     const tabs = hasChannelData
@@ -1741,21 +2148,11 @@ export function OverviewPagesSection({
       : SOURCE_CARD_TABS.filter((tab) => tab !== "channel");
     return showSourceLinkTab ? tabs : tabs.filter((tab) => tab !== "link");
   }, [
+    cardDataOverride?.source.channel,
     hasCardDataOverride,
-    resolvedSourceCardTabData.channel,
     showSourceLinkTab,
     sourceCardFetchers,
   ]);
-  const resolvedClientDimensionCardTabData =
-    cardDataOverride?.client ?? clientDimensionCardTabData;
-  const resolvedGeoDimensionCardTabData =
-    cardDataOverride?.geo ?? geoDimensionCardTabData;
-  const activePageCardTabData = resolvedPageCardTabData[pageCardTab];
-  const activeSourceCardTabData = resolvedSourceCardTabData[sourceCardTab];
-  const activeClientDimensionCardTabData =
-    resolvedClientDimensionCardTabData[clientDimensionCardTab];
-  const activeGeoDimensionCardTabData =
-    resolvedGeoDimensionCardTabData[geoDimensionCardTab];
   const resolvedPageCardNavigableTabs = useMemo(
     () =>
       new Set<PageCardNavigableTab>(
@@ -1782,244 +2179,6 @@ export function OverviewPagesSection({
     }),
     [pageCardFilterEnabledOverride],
   );
-
-  useEffect(() => {
-    if (resolvedPageCardTabs.includes(pageCardTab)) return;
-    setPageCardTab(resolvedPageCardTabs[0] ?? "path");
-  }, [pageCardTab, resolvedPageCardTabs]);
-
-  useEffect(() => {
-    if (resolvedSourceCardTabs.includes(sourceCardTab)) return;
-    setSourceCardTab(resolvedSourceCardTabs[0] ?? "domain");
-  }, [resolvedSourceCardTabs, sourceCardTab]);
-
-  useEffect(() => {
-    if (hasCardDataOverride) return;
-    setPageCardTabData(createOverviewCardTabCache(ALL_PAGE_CARD_TABS));
-    setSourceCardTabData(createOverviewCardTabCache(SOURCE_CARD_TABS));
-    setClientDimensionCardTabData(
-      createOverviewCardTabCache(CLIENT_DIMENSION_CARD_TABS),
-    );
-    setGeoDimensionCardTabData(
-      createOverviewCardTabCache(GEO_DIMENSION_CARD_TABS),
-    );
-  }, [
-    filtersKey,
-    siteId,
-    window.from,
-    window.to,
-    window.interval,
-    window.timeZone,
-    hasCardDataOverride,
-  ]);
-
-  useEffect(() => {
-    if (hasCardDataOverride) return;
-    if (activePageCardTabData !== null) return;
-    let active = true;
-
-    const loadPageCardTab =
-      pageCardFetchersRef.current?.[pageCardTab] ??
-      ((
-        requestedSiteId: string,
-        requestedWindow: TimeWindow,
-        requestedFilters: FilterDocument,
-      ) =>
-        fetchOverviewPageCardTab(
-          requestedSiteId,
-          requestedWindow,
-          pageCardTab,
-          requestedFilters,
-          {
-            limit: 100,
-          },
-        ));
-
-    loadPageCardTab(siteId, window, filters)
-      .then((data) => {
-        if (!active) return;
-        setPageCardTabData((prev) => ({
-          ...prev,
-          [pageCardTab]: data,
-        }));
-      })
-      .catch(() => {
-        if (!active) return;
-        setPageCardTabData((prev) => ({
-          ...prev,
-          [pageCardTab]: [],
-        }));
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    activePageCardTabData,
-    filtersKey,
-    pageCardTab,
-    siteId,
-    window.from,
-    window.interval,
-    window.to,
-    window.timeZone,
-    hasCardDataOverride,
-  ]);
-
-  useEffect(() => {
-    if (hasCardDataOverride) return;
-    if (!resolvedSourceCardTabs.includes(sourceCardTab)) return;
-    if (activeSourceCardTabData !== null) return;
-    let active = true;
-
-    const loadSourceCardTab =
-      sourceCardFetchersRef.current?.[sourceCardTab] ??
-      ((
-        requestedSiteId: string,
-        requestedWindow: TimeWindow,
-        requestedFilters: FilterDocument,
-      ) =>
-        fetchOverviewSourceCardTab(
-          requestedSiteId,
-          requestedWindow,
-          sourceCardTab,
-          requestedFilters,
-          { limit: 100 },
-        ));
-
-    loadSourceCardTab(siteId, window, filters)
-      .then((data) => {
-        if (!active) return;
-        setSourceCardTabData((prev) => ({
-          ...prev,
-          [sourceCardTab]: data,
-        }));
-      })
-      .catch(() => {
-        if (!active) return;
-        setSourceCardTabData((prev) => ({
-          ...prev,
-          [sourceCardTab]: [],
-        }));
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    activeSourceCardTabData,
-    filtersKey,
-    siteId,
-    sourceCardTab,
-    resolvedSourceCardTabs,
-    window.from,
-    window.interval,
-    window.to,
-    window.timeZone,
-    hasCardDataOverride,
-  ]);
-
-  useEffect(() => {
-    if (hasCardDataOverride) return;
-    if (activeClientDimensionCardTabData !== null) return;
-    let active = true;
-
-    const loadClientCardTab =
-      clientCardFetchersRef.current?.[clientDimensionCardTab] ??
-      ((
-        requestedSiteId: string,
-        requestedWindow: TimeWindow,
-        requestedFilters: FilterDocument,
-      ) =>
-        fetchOverviewClientDimensionTab(
-          requestedSiteId,
-          requestedWindow,
-          clientDimensionCardTab,
-          requestedFilters,
-          { limit: 100 },
-        ));
-
-    loadClientCardTab(siteId, window, filters)
-      .then((data) => {
-        if (!active) return;
-        setClientDimensionCardTabData((prev) => ({
-          ...prev,
-          [clientDimensionCardTab]: data,
-        }));
-      })
-      .catch(() => {
-        if (!active) return;
-        setClientDimensionCardTabData((prev) => ({
-          ...prev,
-          [clientDimensionCardTab]: [],
-        }));
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    activeClientDimensionCardTabData,
-    clientDimensionCardTab,
-    filtersKey,
-    siteId,
-    window.from,
-    window.interval,
-    window.to,
-    window.timeZone,
-    hasCardDataOverride,
-  ]);
-
-  useEffect(() => {
-    if (hasCardDataOverride) return;
-    if (activeGeoDimensionCardTabData !== null) return;
-    let active = true;
-
-    const loadGeoCardTab =
-      geoCardFetchersRef.current?.[geoDimensionCardTab] ??
-      ((
-        requestedSiteId: string,
-        requestedWindow: TimeWindow,
-        requestedFilters: FilterDocument,
-      ) =>
-        fetchOverviewGeoDimensionTab(
-          requestedSiteId,
-          requestedWindow,
-          geoDimensionCardTab,
-          requestedFilters,
-          { limit: 100 },
-        ));
-
-    loadGeoCardTab(siteId, window, filters)
-      .then((data) => {
-        if (!active) return;
-        setGeoDimensionCardTabData((prev) => ({
-          ...prev,
-          [geoDimensionCardTab]: data,
-        }));
-      })
-      .catch(() => {
-        if (!active) return;
-        setGeoDimensionCardTabData((prev) => ({
-          ...prev,
-          [geoDimensionCardTab]: [],
-        }));
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    activeGeoDimensionCardTabData,
-    filtersKey,
-    geoDimensionCardTab,
-    siteId,
-    window.from,
-    window.interval,
-    window.to,
-    window.timeZone,
-    hasCardDataOverride,
-  ]);
 
   const noDataText = messages.common.noData;
 
@@ -2078,133 +2237,11 @@ export function OverviewPagesSection({
       pageCardTabMetaOverride,
     ],
   );
-  const pathRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.path ?? []).map((item, index) => {
-        const rawLabel = String(item.label || "").trim();
-        const fallbackLabel =
-          pageCardTabMeta.path.label === messages.pages.hashTab
-            ? messages.pages.noHash
-            : "/";
-        const label = rawLabel || fallbackLabel;
-        return {
-          key: `${label || fallbackLabel}-${index}`,
-          label,
-          displayLabel: decodeUrlDisplayValue(label),
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: pageCardTabMeta.path.mono,
-        };
-      }),
-    [
-      messages.pages.hashTab,
-      messages.pages.noHash,
-      pageCardTabMeta.path.label,
-      pageCardTabMeta.path.mono,
-      resolvedPageCardTabData.path,
-    ],
-  );
-  const queryRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.query ?? []).map((item, index) => {
-        const label = String(item.label || "").trim();
-        const fallbackLabel = messages.pages.noQuery;
-        const resolvedLabel = label || fallbackLabel;
-        return {
-          key: `query-${label || fallbackLabel}-${index}`,
-          label: resolvedLabel,
-          displayLabel: decodeUrlDisplayValue(resolvedLabel),
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: pageCardTabMeta.query.mono,
-        };
-      }),
-    [
-      messages.pages.noQuery,
-      pageCardTabMeta.query.mono,
-      resolvedPageCardTabData.query,
-    ],
-  );
-  const titleRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.title ?? []).map((item) => {
-        const normalized = String(item.label || "").trim();
-        const label =
-          normalized.length > 0 ? normalized : messages.common.unknown;
-        return {
-          key: label,
-          label,
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: false,
-        };
-      }),
-    [messages.common.unknown, resolvedPageCardTabData.title],
-  );
-  const hostnameRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.hostname ?? []).map((item) => {
-        const normalized = String(item.label || "").trim();
-        const label =
-          normalized.length > 0 ? normalized : messages.common.unknown;
-        return {
-          key: label,
-          label,
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: true,
-        };
-      }),
-    [messages.common.unknown, resolvedPageCardTabData.hostname],
-  );
-  const entryRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.entry ?? []).map((item) => {
-        const label = String(item.label || "").trim() || "/";
-        return {
-          key: label,
-          label,
-          displayLabel: decodeUrlDisplayValue(label),
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: true,
-        };
-      }),
-    [resolvedPageCardTabData.entry],
-  );
-  const exitRows = useMemo<PageCardRow[]>(
-    () =>
-      (resolvedPageCardTabData.exit ?? []).map((item) => {
-        const label = String(item.label || "").trim() || "/";
-        return {
-          key: label,
-          label,
-          displayLabel: decodeUrlDisplayValue(label),
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: true,
-        };
-      }),
-    [resolvedPageCardTabData.exit],
-  );
-  const pageCardRows = useMemo<Record<PageCardTab, PageCardRow[]>>(
-    () => ({
-      path: pathRows,
-      query: queryRows,
-      title: titleRows,
-      hostname: hostnameRows,
-      entry: entryRows,
-      exit: exitRows,
-    }),
-    [pathRows, queryRows, titleRows, hostnameRows, entryRows, exitRows],
-  );
-  const activePageCardFilterValue = useMemo(
-    () =>
-      dashboardFilterValue(
-        filters,
-        PAGE_CARD_FILTER_CONTROL_BY_TAB[pageCardTab],
-      ) ?? null,
-    [filters, pageCardTab],
+  const pageCardFilterValue = useCallback(
+    (tab: PageCardTab) =>
+      dashboardFilterValue(filters, PAGE_CARD_FILTER_CONTROL_BY_TAB[tab]) ??
+      null,
+    [filters],
   );
   const pageCardDefaultHostname = useMemo(() => {
     const filteredHostname = sanitizeHostname(
@@ -2215,12 +2252,8 @@ export function OverviewPagesSection({
     const configuredHostname = sanitizeHostname(siteDomain);
     if (configuredHostname.length > 0) return configuredHostname;
 
-    for (const row of hostnameRows) {
-      const hostname = sanitizeHostname(row.label);
-      if (hostname.length > 0) return hostname;
-    }
     return "";
-  }, [filters, hostnameRows, siteDomain]);
+  }, [filters, siteDomain]);
   const pageDetailBasePath = useMemo(
     () => buildPagesPagePath(pathname),
     [pathname],
@@ -2260,76 +2293,12 @@ export function OverviewPagesSection({
       messages.overview.sourceTab,
     ],
   );
-  const sourceCardDirectLabel = messages.overview.direct;
-  const sourceDomainRows = useMemo<SourceCardRow[]>(() => {
-    return (resolvedSourceCardTabData.domain ?? []).map((item, index) => {
-      const raw = String(item.label || "").trim();
-      const domain = raw.length > 0 ? sanitizeHostname(raw) : "";
-      const filterValue = domain || DIRECT_REFERRER_FILTER_VALUE;
-      const label = domain || sourceCardDirectLabel;
-      return {
-        key: `domain-${filterValue}-${index}`,
-        label,
-        filterValue,
-        targetUrl: domain ? toAbsoluteHttpsUrl(domain) : null,
-        views: Math.max(0, Number(item.views || 0)),
-        visitors: Math.max(0, Number(item.visitors || 0)),
-        mono: true,
-      };
-    });
-  }, [sourceCardDirectLabel, resolvedSourceCardTabData.domain]);
-  const sourceLinkRows = useMemo<SourceCardRow[]>(() => {
-    return (resolvedSourceCardTabData.link ?? []).map((item, index) => {
-      const raw = String(item.label || "").trim();
-      const targetUrl = raw.length > 0 ? toAbsoluteHttpsUrl(raw) : null;
-      const filterValue = raw.length > 0 ? raw : DIRECT_REFERRER_FILTER_VALUE;
-      const label = raw.length > 0 ? (targetUrl ?? raw) : sourceCardDirectLabel;
-      return {
-        key: `link-${filterValue}-${index}`,
-        label,
-        displayLabel: decodeUrlDisplayValue(label),
-        filterValue,
-        targetUrl,
-        views: Math.max(0, Number(item.views || 0)),
-        visitors: Math.max(0, Number(item.visitors || 0)),
-        mono: true,
-      };
-    });
-  }, [sourceCardDirectLabel, resolvedSourceCardTabData.link]);
-  const sourceChannelRows = useMemo<SourceCardRow[]>(() => {
-    return (resolvedSourceCardTabData.channel ?? []).map((item, index) => {
-      const raw = String(item.label || "").trim();
-      const channelId = TRAFFIC_CHANNEL_IDS.includes(raw as TrafficChannelId)
-        ? (raw as TrafficChannelId)
-        : "other";
-      return {
-        key: `channel-${channelId}-${index}`,
-        label: messages.overview.channelLabels[channelId],
-        filterValue: channelId,
-        targetUrl: null,
-        views: Math.max(0, Number(item.views || 0)),
-        visitors: Math.max(0, Number(item.visitors || 0)),
-        mono: false,
-        channelId,
-      };
-    });
-  }, [messages.overview.channelLabels, resolvedSourceCardTabData.channel]);
-  const sourceCardRows = useMemo<Record<SourceCardTab, SourceCardRow[]>>(
-    () => ({
-      domain: sourceDomainRows,
-      link: sourceLinkRows,
-      channel: sourceChannelRows,
-    }),
-    [sourceChannelRows, sourceDomainRows, sourceLinkRows],
+  const sourceCardFilterValue = useCallback(
+    (tab: SourceCardTab) =>
+      dashboardFilterValue(filters, SOURCE_CARD_FILTER_CONTROL_BY_TAB[tab]) ??
+      null,
+    [filters],
   );
-  const activeSourceCardFilterValue = useMemo(() => {
-    return (
-      dashboardFilterValue(
-        filters,
-        SOURCE_CARD_FILTER_CONTROL_BY_TAB[sourceCardTab],
-      ) ?? null
-    );
-  }, [filters, sourceCardTab]);
   const clientDimensionCardTabMeta = useMemo<
     Record<
       ClientDimensionCardTab,
@@ -2418,226 +2387,36 @@ export function OverviewPagesSection({
       messages.geo.regionLabel,
     ],
   );
-  const clientDimensionCardRows = useMemo<
-    Record<ClientDimensionCardTab, PageCardRow[]>
-  >(() => {
-    const toRows = (
-      rows: Array<{ label: string; views: number; visitors: number }>,
-      options?: {
-        mono?: boolean;
-        screenSize?: boolean;
-        transformLabel?: (value: string) => string;
-        resolveIconName?: (value: string) => string | null;
-        resolveFilterValue?: (
-          rawValue: string,
-          normalizedLabel: string,
-        ) => string;
-      },
-    ): PageCardRow[] =>
-      rows.map((item, index) => {
-        const rawValue = String(item.label || "");
-        const rawLabel = normalizeDimensionLabel(
-          rawValue,
-          messages.common.unknown,
-          { screenSize: options?.screenSize },
-        );
-        const label = options?.transformLabel
-          ? options.transformLabel(rawLabel)
-          : rawLabel;
-        const filterValue =
-          options?.resolveFilterValue?.(rawValue, rawLabel) ?? rawLabel;
-        return {
-          key: `${label}-${index}`,
-          label,
-          rawLabel: rawValue.trim() || rawLabel,
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: options?.mono ?? false,
-          iconName: options?.resolveIconName?.(rawLabel) ?? null,
-          filterValue,
-        };
-      });
-
-    return {
-      browser: toRows(resolvedClientDimensionCardTabData.browser ?? [], {
-        resolveIconName: resolveBrowserLogoIconName,
-      }),
-      osVersion: toRows(resolvedClientDimensionCardTabData.osVersion ?? [], {
-        resolveIconName: resolveOsLogoIconName,
-      }),
-      deviceType: toRows(resolvedClientDimensionCardTabData.deviceType ?? [], {
-        transformLabel: (value) =>
-          resolveDeviceTypeMeta(
-            value,
-            messages.common.deviceLabels,
-            messages.common.unknown,
-          ).label,
-      }),
-      language: toRows(resolvedClientDimensionCardTabData.language ?? [], {
-        transformLabel: (value) =>
-          resolveLanguageLabel(value, locale, messages.common.unknown).label,
-        resolveFilterValue: (rawValue, normalizedLabel) =>
-          rawValue.trim() || normalizedLabel,
-      }),
-      screenSize: toRows(resolvedClientDimensionCardTabData.screenSize ?? [], {
-        mono: true,
-        screenSize: true,
-      }),
-    };
-  }, [resolvedClientDimensionCardTabData, locale, messages.common.unknown]);
-  const geoDimensionCardRows = useMemo<
-    Record<GeoDimensionCardTab, PageCardRow[]>
-  >(() => {
-    const toRows = (
-      rows: Array<{ label: string; views: number; visitors: number }>,
-      options?: {
-        transformLabel?: (value: string) => string;
-        resolveIconName?: (value: string) => string | null;
-        resolveFilterValue?: (value: string) => string;
-      },
-    ): PageCardRow[] =>
-      rows.map((item, index) => {
-        const originalValue = String(item.label || "");
-        const rawLabel = normalizeDimensionLabel(
-          originalValue,
-          messages.common.unknown,
-        );
-        const label = options?.transformLabel
-          ? options.transformLabel(rawLabel)
-          : rawLabel;
-        return {
-          key: `${label}-${index}`,
-          label,
-          rawLabel: originalValue.trim() || rawLabel,
-          views: Math.max(0, Number(item.views || 0)),
-          visitors: Math.max(0, Number(item.visitors || 0)),
-          mono: false,
-          iconName: options?.resolveIconName?.(rawLabel) ?? null,
-          filterValue: options?.resolveFilterValue?.(originalValue) ?? rawLabel,
-        };
-      });
-
-    const regionRows: PageCardRow[] = (
-      resolvedGeoDimensionCardTabData.region ?? []
-    ).map((item, index) => {
-      const value = resolveGeoDimensionRowRawValue(item);
-      const regionData = resolveGeoRegionBreadcrumbData(
-        value,
-        locale,
-        messages.common.unknown,
-      );
-
-      return {
-        key: `${regionData.displayLabel}-${index}`,
-        label: regionData.displayLabel,
-        rawLabel: value.trim() || regionData.filterValue,
-        views: Math.max(0, Number(item.views || 0)),
-        visitors: Math.max(0, Number(item.visitors || 0)),
-        mono: false,
-        iconName: null,
-        filterValue: regionData.filterValue,
-        regionBreadcrumb: regionData.breadcrumb,
-      };
-    });
-    const cityRows: PageCardRow[] = (
-      resolvedGeoDimensionCardTabData.city ?? []
-    ).map((item, index) => {
-      const value = resolveGeoDimensionRowRawValue(item);
-      const cityData = resolveGeoCityBreadcrumbData(
-        value,
-        locale,
-        messages.common.unknown,
-      );
-
-      return {
-        key: `${cityData.displayLabel}-${index}`,
-        label: cityData.displayLabel,
-        rawLabel: value.trim() || cityData.filterValue,
-        views: Math.max(0, Number(item.views || 0)),
-        visitors: Math.max(0, Number(item.visitors || 0)),
-        mono: false,
-        iconName: null,
-        filterValue: cityData.filterValue,
-        cityBreadcrumb: cityData.breadcrumb ?? undefined,
-      };
-    });
-
-    return {
-      country: toRows(resolvedGeoDimensionCardTabData.country ?? [], {
-        transformLabel: (value) =>
-          resolveCountryLabel(value, locale, messages.common.unknown).label,
-        resolveIconName: (value) => {
-          const { code } = resolveCountryLabel(
-            value,
-            locale,
-            messages.common.unknown,
-          );
-          const flagCode = resolveCountryFlagCode(code, locale);
-          return flagCode ? `flagpack:${flagCode.toLowerCase()}` : null;
-        },
-      }),
-      region: regionRows,
-      city: cityRows,
-      continent: toRows(resolvedGeoDimensionCardTabData.continent ?? [], {
-        transformLabel: (value) =>
-          resolveContinentLabel(
-            value,
-            messages.common.unknown,
-            messages.common.continentLabels,
-          ),
-      }),
-      timezone: toRows(resolvedGeoDimensionCardTabData.timezone ?? [], {
-        transformLabel: (value) =>
-          resolveTimezoneDisplayLabel({
-            value,
-            locale,
-            unknownLabel: messages.common.unknown,
-            timestampMs: timezoneReferenceTimestampMs,
-            timezoneDeltaVsLocal: messages.geo.timezoneDeltaVsLocal,
-          }),
-      }),
-      organization: toRows(resolvedGeoDimensionCardTabData.organization ?? []),
-    };
-  }, [
-    resolvedGeoDimensionCardTabData,
-    locale,
-    messages.common.continentLabels,
-    messages.common.unknown,
-    messages.geo.timezoneDeltaVsLocal,
-    timezoneReferenceTimestampMs,
-  ]);
   const resolvedPrimaryMetricLabel =
     primaryMetricLabel ?? messages.common.views;
-  const activeClientDimensionCardFilterValue = useMemo(() => {
-    return (
+  const clientDimensionCardFilterValue = useCallback(
+    (tab: ClientDimensionCardTab) =>
       dashboardFilterValue(
         filters,
-        CLIENT_DIMENSION_CARD_FILTER_CONTROL_BY_TAB[clientDimensionCardTab],
-      ) ?? null
-    );
-  }, [clientDimensionCardTab, filters]);
-  const activeGeoDimensionCardFilterValue = useMemo(() => {
-    if (isGeoLocationTab(geoDimensionCardTab)) {
+        CLIENT_DIMENSION_CARD_FILTER_CONTROL_BY_TAB[tab],
+      ) ?? null,
+    [filters],
+  );
+  const geoDimensionCardFilterValue = useCallback(
+    (tab: GeoDimensionCardTab) => {
+      if (isGeoLocationTab(tab)) {
+        return canonicalizeGeoFilterValue(dashboardFilterValue(filters, "geo"));
+      }
       return (
-        canonicalizeGeoFilterValue(dashboardFilterValue(filters, "geo")) ?? null
+        dashboardFilterValue(filters, GEO_AUX_FILTER_CONTROL_BY_TAB[tab]) ??
+        null
       );
-    }
-    return (
-      dashboardFilterValue(
-        filters,
-        GEO_AUX_FILTER_CONTROL_BY_TAB[geoDimensionCardTab],
-      ) ?? null
-    );
-  }, [filters, geoDimensionCardTab]);
+    },
+    [filters],
+  );
 
   const setPageCardFilter = useCallback(
-    (next: { tab: PageCardTab; value: string } | null) => {
-      const activeTab = next?.tab ?? pageCardTab;
-      if (!pageCardFilterEnabledByTab[activeTab]) return;
+    (tab: PageCardTab, value: string | null) => {
+      if (!pageCardFilterEnabledByTab[tab]) return;
       const nextFilters = setDashboardFilterValue(
         filters,
-        PAGE_CARD_FILTER_CONTROL_BY_TAB[activeTab],
-        next?.value,
+        PAGE_CARD_FILTER_CONTROL_BY_TAB[tab],
+        value,
       );
       const params = withDashboardFilterSearchParams(searchParams, nextFilters);
       const current = serializeDashboardSearchParams(searchParams);
@@ -2646,21 +2425,14 @@ export function OverviewPagesSection({
       const target = updated ? `${livePathname}?${updated}` : livePathname;
       replaceUrlWithoutNavigation(target);
     },
-    [
-      filters,
-      livePathname,
-      pageCardFilterEnabledByTab,
-      pageCardTab,
-      searchParams,
-    ],
+    [filters, livePathname, pageCardFilterEnabledByTab, searchParams],
   );
   const setSourceCardFilter = useCallback(
-    (next: { tab: SourceCardTab; value: string } | null) => {
-      const activeTab = next?.tab ?? sourceCardTab;
+    (tab: SourceCardTab, value: string | null) => {
       const nextFilters = setDashboardFilterValue(
         filters,
-        SOURCE_CARD_FILTER_CONTROL_BY_TAB[activeTab],
-        next?.value,
+        SOURCE_CARD_FILTER_CONTROL_BY_TAB[tab],
+        value,
       );
       const params = withDashboardFilterSearchParams(searchParams, nextFilters);
       const current = serializeDashboardSearchParams(searchParams);
@@ -2669,15 +2441,14 @@ export function OverviewPagesSection({
       const target = updated ? `${livePathname}?${updated}` : livePathname;
       replaceUrlWithoutNavigation(target);
     },
-    [filters, livePathname, searchParams, sourceCardTab],
+    [filters, livePathname, searchParams],
   );
   const setClientDimensionCardFilter = useCallback(
-    (next: { tab: ClientDimensionCardTab; value: string } | null) => {
-      const activeTab = next?.tab ?? clientDimensionCardTab;
+    (tab: ClientDimensionCardTab, value: string | null) => {
       const nextFilters = setDashboardFilterValue(
         filters,
-        CLIENT_DIMENSION_CARD_FILTER_CONTROL_BY_TAB[activeTab],
-        next?.value,
+        CLIENT_DIMENSION_CARD_FILTER_CONTROL_BY_TAB[tab],
+        value,
       );
       const params = withDashboardFilterSearchParams(searchParams, nextFilters);
       const current = serializeDashboardSearchParams(searchParams);
@@ -2686,18 +2457,17 @@ export function OverviewPagesSection({
       const target = updated ? `${livePathname}?${updated}` : livePathname;
       replaceUrlWithoutNavigation(target);
     },
-    [clientDimensionCardTab, filters, livePathname, searchParams],
+    [filters, livePathname, searchParams],
   );
   const setGeoDimensionCardFilter = useCallback(
-    (next: { tab: GeoDimensionCardTab; value: string } | null) => {
-      const activeTab = next?.tab ?? geoDimensionCardTab;
-      const filterControl = isGeoLocationTab(activeTab)
+    (tab: GeoDimensionCardTab, value: string | null) => {
+      const filterControl = isGeoLocationTab(tab)
         ? "geo"
-        : GEO_AUX_FILTER_CONTROL_BY_TAB[activeTab];
+        : GEO_AUX_FILTER_CONTROL_BY_TAB[tab];
       const filterValue =
-        next && isGeoLocationTab(next.tab)
-          ? canonicalizeGeoFilterValue(next.value)
-          : next?.value;
+        value !== null && isGeoLocationTab(tab)
+          ? canonicalizeGeoFilterValue(value)
+          : value;
       const nextFilters = setDashboardFilterValue(
         filters,
         filterControl,
@@ -2710,30 +2480,7 @@ export function OverviewPagesSection({
       const target = updated ? `${livePathname}?${updated}` : livePathname;
       replaceUrlWithoutNavigation(target);
     },
-    [filters, geoDimensionCardTab, livePathname, searchParams],
-  );
-  const handlePageCardTabChange = useCallback(
-    (tab: PageCardTab) => {
-      if (tab !== pageCardTab) {
-        setPageCardTab(tab);
-      }
-    },
-    [pageCardTab],
-  );
-  const handleSourceCardTabChange = useCallback((tab: SourceCardTab) => {
-    setSourceCardTab(tab);
-  }, []);
-  const handleClientDimensionCardTabChange = useCallback(
-    (tab: ClientDimensionCardTab) => {
-      setClientDimensionCardTab(tab);
-    },
-    [],
-  );
-  const handleGeoDimensionCardTabChange = useCallback(
-    (tab: GeoDimensionCardTab) => {
-      setGeoDimensionCardTab(tab);
-    },
-    [],
+    [filters, livePathname, searchParams],
   );
   const openPageCardRowTarget = useCallback(
     (targetUrl: string, event: MouseEvent<HTMLElement>) => {
@@ -2767,98 +2514,54 @@ export function OverviewPagesSection({
     },
     [router],
   );
-  const pageCardRowsForTable = useMemo<
-    Record<PageCardTab, PageCardRow[] | null>
-  >(
-    () => ({
-      path: resolvedPageCardTabData.path === null ? null : pageCardRows.path,
-      query: resolvedPageCardTabData.query === null ? null : pageCardRows.query,
-      title: resolvedPageCardTabData.title === null ? null : pageCardRows.title,
-      hostname:
-        resolvedPageCardTabData.hostname === null
-          ? null
-          : pageCardRows.hostname,
-      entry: resolvedPageCardTabData.entry === null ? null : pageCardRows.entry,
-      exit: resolvedPageCardTabData.exit === null ? null : pageCardRows.exit,
-    }),
-    [pageCardRows, resolvedPageCardTabData],
+  const [pageComparisonMetric, setPageComparisonMetric] =
+    useState<OverviewComparisonMetric>("views");
+  const [sourceComparisonMetric, setSourceComparisonMetric] =
+    useState<OverviewComparisonMetric>("views");
+  const [clientComparisonMetric, setClientComparisonMetric] =
+    useState<OverviewComparisonMetric>("views");
+  const [geoComparisonMetric, setGeoComparisonMetric] =
+    useState<OverviewComparisonMetric>("views");
+  const comparisonLabel = comparisonLabelForQuery(messages, comparisonQuery);
+  const pageComparisonColumns = useMemo(
+    () =>
+      createOverviewComparisonColumns(
+        pageComparisonMetric,
+        comparisonLabel,
+        locale,
+        messages,
+      ),
+    [comparisonLabel, locale, messages, pageComparisonMetric],
   );
-  const sourceCardRowsForTable = useMemo<
-    Record<SourceCardTab, SourceCardRow[] | null>
-  >(
-    () => ({
-      domain:
-        resolvedSourceCardTabData.domain === null
-          ? null
-          : sourceCardRows.domain,
-      link:
-        resolvedSourceCardTabData.link === null ? null : sourceCardRows.link,
-      channel:
-        resolvedSourceCardTabData.channel === undefined
-          ? null
-          : resolvedSourceCardTabData.channel === null
-            ? null
-            : sourceCardRows.channel,
-    }),
-    [resolvedSourceCardTabData, sourceCardRows],
+  const sourceComparisonColumns = useMemo(
+    () =>
+      createOverviewComparisonColumns(
+        sourceComparisonMetric,
+        comparisonLabel,
+        locale,
+        messages,
+      ),
+    [comparisonLabel, locale, messages, sourceComparisonMetric],
   );
-  const clientDimensionCardRowsForTable = useMemo<
-    Record<ClientDimensionCardTab, PageCardRow[] | null>
-  >(
-    () => ({
-      browser:
-        resolvedClientDimensionCardTabData.browser === null
-          ? null
-          : clientDimensionCardRows.browser,
-      osVersion:
-        resolvedClientDimensionCardTabData.osVersion === null
-          ? null
-          : clientDimensionCardRows.osVersion,
-      deviceType:
-        resolvedClientDimensionCardTabData.deviceType === null
-          ? null
-          : clientDimensionCardRows.deviceType,
-      language:
-        resolvedClientDimensionCardTabData.language === null
-          ? null
-          : clientDimensionCardRows.language,
-      screenSize:
-        resolvedClientDimensionCardTabData.screenSize === null
-          ? null
-          : clientDimensionCardRows.screenSize,
-    }),
-    [clientDimensionCardRows, resolvedClientDimensionCardTabData],
+  const clientComparisonColumns = useMemo(
+    () =>
+      createOverviewComparisonColumns(
+        clientComparisonMetric,
+        comparisonLabel,
+        locale,
+        messages,
+      ),
+    [clientComparisonMetric, comparisonLabel, locale, messages],
   );
-  const geoDimensionCardRowsForTable = useMemo<
-    Record<GeoDimensionCardTab, PageCardRow[] | null>
-  >(
-    () => ({
-      country:
-        resolvedGeoDimensionCardTabData.country === null
-          ? null
-          : geoDimensionCardRows.country,
-      region:
-        resolvedGeoDimensionCardTabData.region === null
-          ? null
-          : geoDimensionCardRows.region,
-      city:
-        resolvedGeoDimensionCardTabData.city === null
-          ? null
-          : geoDimensionCardRows.city,
-      continent:
-        resolvedGeoDimensionCardTabData.continent === null
-          ? null
-          : geoDimensionCardRows.continent,
-      timezone:
-        resolvedGeoDimensionCardTabData.timezone === null
-          ? null
-          : geoDimensionCardRows.timezone,
-      organization:
-        resolvedGeoDimensionCardTabData.organization === null
-          ? null
-          : geoDimensionCardRows.organization,
-    }),
-    [geoDimensionCardRows, resolvedGeoDimensionCardTabData],
+  const geoComparisonColumns = useMemo(
+    () =>
+      createOverviewComparisonColumns(
+        geoComparisonMetric,
+        comparisonLabel,
+        locale,
+        messages,
+      ),
+    [comparisonLabel, geoComparisonMetric, locale, messages],
   );
   const overviewMetricColumns = useMemo<
     readonly TabbedDataTableColumn<PageCardRow, PageCardSortKey, string>[]
@@ -2889,6 +2592,7 @@ export function OverviewPagesSection({
     >[]
   >(
     () => (tab) => {
+      if (comparisonQuery) return pageComparisonColumns;
       const viewsColumn = {
         key: "views" as const,
         label:
@@ -2908,10 +2612,12 @@ export function OverviewPagesSection({
       ];
     },
     [
+      comparisonQuery,
       locale,
       messages.common.visitors,
       pageCardShowVisitors,
       pageCardTabMeta,
+      pageComparisonColumns,
       resolvedPrimaryMetricLabel,
     ],
   );
@@ -2966,56 +2672,379 @@ export function OverviewPagesSection({
       ],
     [geoDimensionCardTabMeta],
   );
-  const loadingByPageCardTab = useMemo(
-    () =>
-      Object.fromEntries(
-        ALL_PAGE_CARD_TABS.map((tab) => [
+  const sourceCardDirectLabel = messages.overview.direct;
+  const pageCardLoader = useCallback<
+    TabbedDataTableLoader<PageCardTab, PageCardRow, PageCardSortKey>
+  >(
+    async ({ tab, cursor, limit, search, sort, signal }) => {
+      const requestMetric = comparisonQuery
+        ? pageComparisonMetric
+        : sort.key === "visitors"
+          ? "visitors"
+          : "views";
+      const comparisonSortBy =
+        comparisonQuery &&
+        (sort.key === "current" ||
+          sort.key === "reference" ||
+          sort.key === "change")
+          ? sort.key
+          : undefined;
+      const rawPage =
+        cardDataOverride && !comparisonQuery
+          ? loadLocalOverviewTablePage(
+              cardDataOverride.page[tab],
+              sort,
+              tab,
+              limit,
+              cursor,
+              search,
+            )
+          : await (
+              pageCardFetchers?.[tab] ??
+              ((
+                requestedSiteId: string,
+                requestedWindow: TimeWindow,
+                requestedFilters: FilterDocument,
+                scope?: FilterScope,
+                options?: {
+                  limit?: number;
+                  cursor?: string | null;
+                  search?: string;
+                  sort?: "views" | "visitors" | "sessions";
+                  direction?: "asc" | "desc";
+                  comparisonMetric?: "views" | "visitors";
+                  comparisonSortBy?: "current" | "reference" | "change";
+                  comparison?: {
+                    mode: "same" | "previous";
+                    window: TimeWindow;
+                    filters: FilterDocument;
+                  } | null;
+                  signal?: AbortSignal;
+                },
+              ) =>
+                fetchOverviewPageCardTab(
+                  requestedSiteId,
+                  requestedWindow,
+                  tab,
+                  requestedFilters,
+                  { ...options, resolvedScope: scope },
+                ))
+            )(siteId, window, filters, resolvedScope, {
+              limit,
+              cursor,
+              search,
+              sort: requestMetric,
+              direction: sort.direction,
+              comparison: comparisonQuery,
+              comparisonMetric: comparisonQuery
+                ? pageComparisonMetric
+                : undefined,
+              comparisonSortBy,
+              signal,
+            });
+      const page = overviewTabData(rawPage);
+      const fallbackLabel =
+        pageCardTabMeta[tab].label === messages.pages.hashTab
+          ? messages.pages.noHash
+          : undefined;
+      return {
+        items: buildPageCardExportRows(
           tab,
-          loading ||
-            (!hasCardDataOverride && resolvedPageCardTabData[tab] === null),
-        ]),
-      ) as Record<PageCardTab, boolean>,
-    [hasCardDataOverride, loading, resolvedPageCardTabData],
-  );
-  const loadingBySourceCardTab = useMemo(
-    () =>
-      Object.fromEntries(
-        resolvedSourceCardTabs.map((tab) => [
-          tab,
-          loading ||
-            (!hasCardDataOverride && resolvedSourceCardTabData[tab] === null),
-        ]),
-      ) as Record<SourceCardTab, boolean>,
+          page.items,
+          messages,
+          fallbackLabel,
+        ),
+        pagination: page.pagination,
+      };
+    },
     [
-      hasCardDataOverride,
-      loading,
-      resolvedSourceCardTabData,
-      resolvedSourceCardTabs,
+      cardDataOverride,
+      filters,
+      messages,
+      pageCardFetchers,
+      pageCardTabMeta,
+      comparisonQuery,
+      pageComparisonMetric,
+      resolvedScope,
+      siteId,
+      window,
     ],
   );
-  const loadingByClientDimensionCardTab = useMemo(
-    () =>
-      Object.fromEntries(
-        CLIENT_DIMENSION_CARD_TABS.map((tab) => [
+  const sourceCardLoader = useCallback<
+    TabbedDataTableLoader<SourceCardTab, SourceCardRow, PageCardSortKey>
+  >(
+    async ({ tab, cursor, limit, search, sort, signal }) => {
+      const requestMetric = comparisonQuery
+        ? sourceComparisonMetric
+        : sort.key === "visitors"
+          ? "visitors"
+          : "views";
+      const comparisonSortBy =
+        comparisonQuery &&
+        (sort.key === "current" ||
+          sort.key === "reference" ||
+          sort.key === "change")
+          ? sort.key
+          : undefined;
+      const rawPage =
+        cardDataOverride && !comparisonQuery
+          ? loadLocalOverviewTablePage(
+              cardDataOverride.source[tab] ?? [],
+              sort,
+              tab,
+              limit,
+              cursor,
+              search,
+            )
+          : await (
+              sourceCardFetchers?.[tab] ??
+              ((
+                requestedSiteId: string,
+                requestedWindow: TimeWindow,
+                requestedFilters: FilterDocument,
+                scope?: FilterScope,
+                options?: {
+                  limit?: number;
+                  cursor?: string | null;
+                  search?: string;
+                  sort?: "views" | "visitors" | "sessions";
+                  direction?: "asc" | "desc";
+                  comparisonMetric?: "views" | "visitors";
+                  comparisonSortBy?: "current" | "reference" | "change";
+                  comparison?: {
+                    mode: "same" | "previous";
+                    window: TimeWindow;
+                    filters: FilterDocument;
+                  } | null;
+                  signal?: AbortSignal;
+                },
+              ) =>
+                fetchOverviewSourceCardTab(
+                  requestedSiteId,
+                  requestedWindow,
+                  tab,
+                  requestedFilters,
+                  { ...options, resolvedScope: scope },
+                ))
+            )(siteId, window, filters, resolvedScope, {
+              limit,
+              cursor,
+              search,
+              sort: requestMetric,
+              direction: sort.direction,
+              comparison: comparisonQuery,
+              comparisonMetric: comparisonQuery
+                ? sourceComparisonMetric
+                : undefined,
+              comparisonSortBy,
+              signal,
+            });
+      const page = overviewTabData(rawPage);
+      return {
+        items: buildSourceCardExportRows(
           tab,
-          loading ||
-            (!hasCardDataOverride &&
-              resolvedClientDimensionCardTabData[tab] === null),
-        ]),
-      ) as Record<ClientDimensionCardTab, boolean>,
-    [hasCardDataOverride, loading, resolvedClientDimensionCardTabData],
+          page.items,
+          sourceCardDirectLabel,
+          messages.overview.channelLabels,
+        ),
+        pagination: page.pagination,
+      };
+    },
+    [
+      cardDataOverride,
+      filters,
+      messages.overview.channelLabels,
+      comparisonQuery,
+      sourceComparisonMetric,
+      resolvedScope,
+      siteId,
+      sourceCardDirectLabel,
+      sourceCardFetchers,
+      window,
+    ],
   );
-  const loadingByGeoDimensionCardTab = useMemo(
-    () =>
-      Object.fromEntries(
-        GEO_DIMENSION_CARD_TABS.map((tab) => [
+  const clientDimensionCardLoader = useCallback<
+    TabbedDataTableLoader<ClientDimensionCardTab, PageCardRow, PageCardSortKey>
+  >(
+    async ({ tab, cursor, limit, search, sort, signal }) => {
+      const requestMetric = comparisonQuery
+        ? clientComparisonMetric
+        : sort.key === "visitors"
+          ? "visitors"
+          : "views";
+      const comparisonSortBy =
+        comparisonQuery &&
+        (sort.key === "current" ||
+          sort.key === "reference" ||
+          sort.key === "change")
+          ? sort.key
+          : undefined;
+      const rawPage =
+        cardDataOverride && !comparisonQuery
+          ? loadLocalOverviewTablePage(
+              cardDataOverride.client[tab],
+              sort,
+              tab,
+              limit,
+              cursor,
+              search,
+            )
+          : await (
+              clientCardFetchers?.[tab] ??
+              ((
+                requestedSiteId: string,
+                requestedWindow: TimeWindow,
+                requestedFilters: FilterDocument,
+                scope?: FilterScope,
+                options?: {
+                  limit?: number;
+                  cursor?: string | null;
+                  search?: string;
+                  sort?: "views" | "visitors" | "sessions";
+                  direction?: "asc" | "desc";
+                  comparisonMetric?: "views" | "visitors";
+                  comparisonSortBy?: "current" | "reference" | "change";
+                  comparison?: {
+                    mode: "same" | "previous";
+                    window: TimeWindow;
+                    filters: FilterDocument;
+                  } | null;
+                  signal?: AbortSignal;
+                },
+              ) =>
+                fetchOverviewClientDimensionTab(
+                  requestedSiteId,
+                  requestedWindow,
+                  tab,
+                  requestedFilters,
+                  { ...options, resolvedScope: scope },
+                ))
+            )(siteId, window, filters, resolvedScope, {
+              limit,
+              cursor,
+              search,
+              sort: requestMetric,
+              direction: sort.direction,
+              comparison: comparisonQuery,
+              comparisonMetric: comparisonQuery
+                ? clientComparisonMetric
+                : undefined,
+              comparisonSortBy,
+              signal,
+            });
+      const page = overviewTabData(rawPage);
+      return {
+        items: buildClientDimensionRows(tab, page.items, locale, messages),
+        pagination: page.pagination,
+      };
+    },
+    [
+      cardDataOverride,
+      clientCardFetchers,
+      filters,
+      locale,
+      messages,
+      comparisonQuery,
+      clientComparisonMetric,
+      resolvedScope,
+      siteId,
+      window,
+    ],
+  );
+  const geoDimensionCardLoader = useCallback<
+    TabbedDataTableLoader<GeoDimensionCardTab, PageCardRow, PageCardSortKey>
+  >(
+    async ({ tab, cursor, limit, search, sort, signal }) => {
+      const requestMetric = comparisonQuery
+        ? geoComparisonMetric
+        : sort.key === "visitors"
+          ? "visitors"
+          : "views";
+      const comparisonSortBy =
+        comparisonQuery &&
+        (sort.key === "current" ||
+          sort.key === "reference" ||
+          sort.key === "change")
+          ? sort.key
+          : undefined;
+      const rawPage =
+        cardDataOverride && !comparisonQuery
+          ? loadLocalOverviewTablePage(
+              cardDataOverride.geo[tab],
+              sort,
+              tab,
+              limit,
+              cursor,
+              search,
+            )
+          : await (
+              geoCardFetchers?.[tab] ??
+              ((
+                requestedSiteId: string,
+                requestedWindow: TimeWindow,
+                requestedFilters: FilterDocument,
+                scope?: FilterScope,
+                options?: {
+                  limit?: number;
+                  cursor?: string | null;
+                  search?: string;
+                  sort?: "views" | "visitors" | "sessions";
+                  direction?: "asc" | "desc";
+                  comparisonMetric?: "views" | "visitors";
+                  comparisonSortBy?: "current" | "reference" | "change";
+                  comparison?: {
+                    mode: "same" | "previous";
+                    window: TimeWindow;
+                    filters: FilterDocument;
+                  } | null;
+                  signal?: AbortSignal;
+                },
+              ) =>
+                fetchOverviewGeoDimensionTabPage(
+                  requestedSiteId,
+                  requestedWindow,
+                  tab,
+                  requestedFilters,
+                  { ...options, resolvedScope: scope },
+                ))
+            )(siteId, window, filters, resolvedScope, {
+              limit,
+              cursor,
+              search,
+              sort: requestMetric,
+              direction: sort.direction,
+              comparison: comparisonQuery,
+              comparisonMetric: comparisonQuery
+                ? geoComparisonMetric
+                : undefined,
+              comparisonSortBy,
+              signal,
+            });
+      const page = overviewTabData(rawPage);
+      return {
+        items: buildGeoDimensionRows(
           tab,
-          loading ||
-            (!hasCardDataOverride &&
-              resolvedGeoDimensionCardTabData[tab] === null),
-        ]),
-      ) as Record<GeoDimensionCardTab, boolean>,
-    [hasCardDataOverride, loading, resolvedGeoDimensionCardTabData],
+          page.items,
+          locale,
+          messages,
+          timezoneReferenceTimestampMs,
+        ),
+        pagination: page.pagination,
+      };
+    },
+    [
+      cardDataOverride,
+      comparisonQuery,
+      geoComparisonMetric,
+      filters,
+      geoCardFetchers,
+      locale,
+      messages,
+      resolvedScope,
+      siteId,
+      timezoneReferenceTimestampMs,
+      window,
+    ],
   );
   const searchConfig = useMemo(
     () => ({
@@ -3024,25 +3053,6 @@ export function OverviewPagesSection({
         formatI18nTemplate(messages.overview.searchInTab, { tab: tab.label }),
     }),
     [messages.common.search, messages.overview.searchInTab],
-  );
-  const comparePageRows = useCallback(
-    (
-      left: PageCardRow,
-      right: PageCardRow,
-      { sort }: { sort: { key: PageCardSortKey; direction: "asc" | "desc" } },
-    ) => {
-      const primary =
-        (left[sort.key] - right[sort.key]) *
-        (sort.direction === "asc" ? 1 : -1);
-      if (primary !== 0) return primary;
-      if (right.views !== left.views) return right.views - left.views;
-      if (right.visitors !== left.visitors)
-        return right.visitors - left.visitors;
-      return (left.displayLabel ?? left.label).localeCompare(
-        right.displayLabel ?? right.label,
-      );
-    },
-    [],
   );
   const pageCardLabel = useCallback(
     (item: PageCardRow, tab: PageCardTab) => {
@@ -3096,39 +3106,57 @@ export function OverviewPagesSection({
             unknownLabel={messages.common.unknown}
           />
           {rowTargetUrl ? (
-            <Clickable
-              className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
-              onClick={(event) => openPageCardRowTarget(rowTargetUrl, event)}
-              aria-label={displayLabel}
-              title={displayLabel}
-            >
-              <RiArrowRightUpLine size="1.4em" />
-            </Clickable>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Clickable
+                  className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
+                  onClick={(event) =>
+                    openPageCardRowTarget(rowTargetUrl, event)
+                  }
+                  aria-label={`${messages.common.open}: ${displayLabel}`}
+                >
+                  <RiArrowRightUpLine size="1.4em" />
+                </Clickable>
+              </TooltipTrigger>
+              <TooltipContent>
+                {`${messages.common.open}: ${displayLabel}`}
+              </TooltipContent>
+            </Tooltip>
           ) : null}
           {rowDetailAction && rowDetailParams ? (
-            <Clickable
-              className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
-              onClick={(event) =>
-                openPageCardRowDetailAction(
-                  rowDetailAction,
-                  rowDetailParams,
-                  event,
-                )
-              }
-              aria-label={messages.common.search}
-              title={messages.common.search}
-            >
-              <RiSearchLine size="1.2em" />
-            </Clickable>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Clickable
+                  className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
+                  onClick={(event) =>
+                    openPageCardRowDetailAction(
+                      rowDetailAction,
+                      rowDetailParams,
+                      event,
+                    )
+                  }
+                  aria-label={messages.common.search}
+                >
+                  <RiSearchLine size="1.2em" />
+                </Clickable>
+              </TooltipTrigger>
+              <TooltipContent>{messages.common.search}</TooltipContent>
+            </Tooltip>
           ) : rowDetailHref ? (
-            <Clickable
-              className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
-              onClick={(event) => openPageCardRowDetail(rowDetailHref, event)}
-              aria-label={messages.common.search}
-              title={messages.common.search}
-            >
-              <RiSearchLine size="1.2em" />
-            </Clickable>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Clickable
+                  className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
+                  onClick={(event) =>
+                    openPageCardRowDetail(rowDetailHref, event)
+                  }
+                  aria-label={messages.common.search}
+                >
+                  <RiSearchLine size="1.2em" />
+                </Clickable>
+              </TooltipTrigger>
+              <TooltipContent>{messages.common.search}</TooltipContent>
+            </Tooltip>
           ) : null}
         </span>
       );
@@ -3162,48 +3190,49 @@ export function OverviewPagesSection({
     [geoPageBasePathname, livePathname, messages.common.unknown],
   );
   const filterPageCardRows = useCallback(
-    (rows: readonly PageCardRow[]) =>
-      activePageCardFilterValue
-        ? rows.filter(
-            (row) =>
-              (row.filterValue ?? row.label) === activePageCardFilterValue,
-          )
-        : [...rows],
-    [activePageCardFilterValue],
+    (rows: readonly PageCardRow[], tab: PageCardTab) => {
+      const filterValue = pageCardFilterValue(tab);
+      return !entityScopedOutput &&
+        pageCardFilterEnabledByTab[tab] &&
+        filterValue
+        ? rows.filter((row) => (row.filterValue ?? row.label) === filterValue)
+        : [...rows];
+    },
+    [entityScopedOutput, pageCardFilterEnabledByTab, pageCardFilterValue],
   );
   const filterSourceCardRows = useCallback(
-    (rows: readonly SourceCardRow[]) =>
-      activeSourceCardFilterValue
-        ? rows.filter((row) => row.filterValue === activeSourceCardFilterValue)
-        : [...rows],
-    [activeSourceCardFilterValue],
+    (rows: readonly SourceCardRow[], tab: SourceCardTab) => {
+      const filterValue = sourceCardFilterValue(tab);
+      return !entityScopedOutput && filterValue
+        ? rows.filter((row) => row.filterValue === filterValue)
+        : [...rows];
+    },
+    [entityScopedOutput, sourceCardFilterValue],
   );
   const filterClientDimensionCardRows = useCallback(
-    (rows: readonly PageCardRow[]) =>
-      activeClientDimensionCardFilterValue
-        ? rows.filter(
-            (row) =>
-              (row.filterValue ?? row.label) ===
-              activeClientDimensionCardFilterValue,
-          )
-        : [...rows],
-    [activeClientDimensionCardFilterValue],
+    (rows: readonly PageCardRow[], tab: ClientDimensionCardTab) => {
+      const filterValue = clientDimensionCardFilterValue(tab);
+      return !entityScopedOutput && filterValue
+        ? rows.filter((row) => (row.filterValue ?? row.label) === filterValue)
+        : [...rows];
+    },
+    [clientDimensionCardFilterValue, entityScopedOutput],
   );
   const filterGeoDimensionCardRows = useCallback(
     (rows: readonly PageCardRow[], tab: GeoDimensionCardTab) => {
-      if (!activeGeoDimensionCardFilterValue) return [...rows];
+      const filterValue = geoDimensionCardFilterValue(tab);
+      if (entityScopedOutput || !filterValue) {
+        return [...rows];
+      }
       const activeGeoFilterValue = isGeoLocationTab(tab)
-        ? resolveGeoLocationHighlightValue(
-            tab,
-            activeGeoDimensionCardFilterValue,
-          )
-        : activeGeoDimensionCardFilterValue;
+        ? resolveGeoLocationHighlightValue(tab, filterValue)
+        : filterValue;
       if (!activeGeoFilterValue) return [...rows];
       return rows.filter(
         (row) => (row.filterValue ?? row.label) === activeGeoFilterValue,
       );
     },
-    [activeGeoDimensionCardFilterValue],
+    [entityScopedOutput, geoDimensionCardFilterValue],
   );
   const tableExport = useMemo(
     () => ({ labels: messages.common.tableExport }),
@@ -3232,8 +3261,8 @@ export function OverviewPagesSection({
         ),
       getSearchText: (row) => row.label,
       getExportLabel: (row) => row.label,
-      getActive: (row) =>
-        activePageCardFilterValue === (row.filterValue ?? row.label),
+      getActive: (row, tab) =>
+        pageCardFilterValue(tab) === (row.filterValue ?? row.label),
       getInteractive: (row, tab) =>
         pageCardFilterEnabledByTab[tab] ||
         Boolean(
@@ -3252,9 +3281,8 @@ export function OverviewPagesSection({
         if (pageCardFilterEnabledByTab[tab]) {
           const normalized = rowFilterValue.trim();
           setPageCardFilter(
-            activePageCardFilterValue === normalized
-              ? null
-              : { tab, value: normalized },
+            tab,
+            pageCardFilterValue(tab) === normalized ? null : normalized,
           );
           return;
         }
@@ -3303,7 +3331,6 @@ export function OverviewPagesSection({
       },
     }),
     [
-      activePageCardFilterValue,
       messages.common.unknown,
       pageCardDefaultHostname,
       pageCardDetailClickResolvers,
@@ -3313,6 +3340,7 @@ export function OverviewPagesSection({
       pageCardTabMeta,
       pageCardTargetUrlResolvers,
       pageDetailBasePath,
+      pageCardFilterValue,
       resolvedPageCardDetailTabs,
       resolvedPageCardNavigableTabs,
       router,
@@ -3352,8 +3380,7 @@ export function OverviewPagesSection({
                 onClick={(event) =>
                   openPageCardRowTarget(row.targetUrl!, event)
                 }
-                aria-label={displayLabel}
-                title={displayLabel}
+                aria-label={`${messages.common.open}: ${displayLabel}`}
               >
                 <RiArrowRightUpLine size="1.4em" />
               </Clickable>
@@ -3363,23 +3390,22 @@ export function OverviewPagesSection({
       },
       getSearchText: (row) => row.label,
       getExportLabel: (row) => row.label,
-      getActive: (row) =>
-        activeSourceCardFilterValue !== null &&
-        activeSourceCardFilterValue === row.filterValue,
+      getActive: (row, tab) =>
+        sourceCardFilterValue(tab) !== null &&
+        sourceCardFilterValue(tab) === row.filterValue,
       getInteractive: () => true,
       onClick: (row, { tab }) => {
         const normalized = row.filterValue.trim();
         setSourceCardFilter(
-          activeSourceCardFilterValue === normalized
-            ? null
-            : { tab, value: normalized },
+          tab,
+          sourceCardFilterValue(tab) === normalized ? null : normalized,
         );
       },
     }),
     [
-      activeSourceCardFilterValue,
       openPageCardRowTarget,
       setSourceCardFilter,
+      sourceCardFilterValue,
       sourceCardDirectLabel,
       sourceCardTabMeta,
     ],
@@ -3413,20 +3439,21 @@ export function OverviewPagesSection({
         ),
       getSearchText: (row) => row.rawLabel?.trim() || row.label,
       getExportLabel: (row) => row.rawLabel?.trim() || row.label,
-      getActive: (row) =>
-        activeClientDimensionCardFilterValue === (row.filterValue ?? row.label),
+      getActive: (row, tab) =>
+        clientDimensionCardFilterValue(tab) === (row.filterValue ?? row.label),
       getInteractive: () => true,
       onClick: (row, { tab }) => {
         const normalized = (row.filterValue ?? row.label).trim();
         setClientDimensionCardFilter(
-          activeClientDimensionCardFilterValue === normalized
+          tab,
+          clientDimensionCardFilterValue(tab) === normalized
             ? null
-            : { tab, value: normalized },
+            : normalized,
         );
       },
     }),
     [
-      activeClientDimensionCardFilterValue,
+      clientDimensionCardFilterValue,
       messages.common.deviceLabels,
       messages.common.unknown,
       setClientDimensionCardFilter,
@@ -3478,16 +3505,20 @@ export function OverviewPagesSection({
               <LabelWithLeadingIcon label={row.label} iconName={row.iconName} />
             )}
             {rowLocationTarget ? (
-              <Clickable
-                className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
-                onClick={(event) =>
-                  openGeoDimensionLocationTarget(rowLocationTarget, event)
-                }
-                aria-label={messages.common.search}
-                title={messages.common.search}
-              >
-                <RiSearchLine size="1.2em" />
-              </Clickable>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Clickable
+                    className="inline-flex text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-foreground"
+                    onClick={(event) =>
+                      openGeoDimensionLocationTarget(rowLocationTarget, event)
+                    }
+                    aria-label={messages.common.search}
+                  >
+                    <RiSearchLine size="1.2em" />
+                  </Clickable>
+                </TooltipTrigger>
+                <TooltipContent>{messages.common.search}</TooltipContent>
+              </Tooltip>
             ) : null}
           </span>
         );
@@ -3495,27 +3526,24 @@ export function OverviewPagesSection({
       getSearchText: (row) => row.rawLabel?.trim() || row.label,
       getExportLabel: (row) => row.rawLabel?.trim() || row.label,
       getActive: (row, tab) => {
+        const filterValue = geoDimensionCardFilterValue(tab);
         const activeGeoHighlightValue = isGeoLocationTab(tab)
-          ? resolveGeoLocationHighlightValue(
-              tab,
-              activeGeoDimensionCardFilterValue,
-            )
-          : activeGeoDimensionCardFilterValue;
+          ? resolveGeoLocationHighlightValue(tab, filterValue)
+          : filterValue;
         return activeGeoHighlightValue === (row.filterValue ?? row.label);
       },
       getInteractive: () => true,
       onClick: (row, { tab }) => {
         const normalized = (row.filterValue ?? row.label).trim();
         setGeoDimensionCardFilter(
-          activeGeoDimensionCardFilterValue === normalized
-            ? null
-            : { tab, value: normalized },
+          tab,
+          geoDimensionCardFilterValue(tab) === normalized ? null : normalized,
         );
       },
     }),
     [
-      activeGeoDimensionCardFilterValue,
       geoDimensionRowLocationTarget,
+      geoDimensionCardFilterValue,
       locale,
       messages.common.search,
       openGeoDimensionLocationTarget,
@@ -3533,19 +3561,34 @@ export function OverviewPagesSection({
         {resolvedVisibleCards.has("page") ? (
           <div className="min-w-0">
             <TabbedDataTableCard<PageCardTab, PageCardRow, PageCardSortKey>
-              value={pageCardTab}
-              onValueChange={handlePageCardTabChange}
               tabs={pageCardTableTabs}
-              rowsByTab={pageCardRowsForTable}
-              loadingByTab={loadingByPageCardTab}
+              loader={pageCardLoader}
+              contentTransitionKey={tableContentTransitionKey}
+              defaultSort={
+                comparisonQuery
+                  ? { key: "current", direction: "desc" }
+                  : undefined
+              }
+              requestKey={`${siteId}:${window.from}:${window.to}:${window.interval}:${window.timeZone}:${filtersKey}:${comparisonKey}:${locale}:page:${pageComparisonMetric}:${hasCardDataOverride ? cardDataOverrideKey : "remote"}`}
               columns={pageCardMetricColumns}
               rowAdapter={pageCardRowAdapter}
               filterRows={filterPageCardRows}
-              compareRows={comparePageRows}
+              sortActionLabel={(label) =>
+                formatI18nTemplate(messages.common.sortBy, { label })
+              }
               loadingLabel={messages.common.loading}
               emptyLabel={noDataText}
               search={searchConfig}
               export={tableExport}
+              headerRight={
+                comparisonQuery ? (
+                  <ComparisonMetricToggle
+                    metric={pageComparisonMetric}
+                    messages={messages}
+                    onMetricChange={setPageComparisonMetric}
+                  />
+                ) : null
+              }
               className="h-full"
             />
           </div>
@@ -3554,19 +3597,38 @@ export function OverviewPagesSection({
         {resolvedVisibleCards.has("source") ? (
           <div className="min-w-0">
             <TabbedDataTableCard<SourceCardTab, SourceCardRow, PageCardSortKey>
-              value={sourceCardTab}
-              onValueChange={handleSourceCardTabChange}
               tabs={sourceCardTableTabs}
-              rowsByTab={sourceCardRowsForTable}
-              loadingByTab={loadingBySourceCardTab}
-              columns={overviewMetricColumns}
+              loader={sourceCardLoader}
+              contentTransitionKey={tableContentTransitionKey}
+              defaultSort={
+                comparisonQuery
+                  ? { key: "current", direction: "desc" }
+                  : undefined
+              }
+              requestKey={`${siteId}:${window.from}:${window.to}:${window.interval}:${window.timeZone}:${filtersKey}:${comparisonKey}:${locale}:source:${sourceComparisonMetric}:${hasCardDataOverride ? cardDataOverrideKey : "remote"}`}
+              columns={
+                comparisonQuery
+                  ? sourceComparisonColumns
+                  : overviewMetricColumns
+              }
               rowAdapter={sourceCardRowAdapter}
               filterRows={filterSourceCardRows}
-              compareRows={comparePageRows}
+              sortActionLabel={(label) =>
+                formatI18nTemplate(messages.common.sortBy, { label })
+              }
               loadingLabel={messages.common.loading}
               emptyLabel={noDataText}
               search={searchConfig}
               export={tableExport}
+              headerRight={
+                comparisonQuery ? (
+                  <ComparisonMetricToggle
+                    metric={sourceComparisonMetric}
+                    messages={messages}
+                    onMetricChange={setSourceComparisonMetric}
+                  />
+                ) : null
+              }
               className="h-full"
             />
           </div>
@@ -3579,19 +3641,38 @@ export function OverviewPagesSection({
               PageCardRow,
               PageCardSortKey
             >
-              value={clientDimensionCardTab}
-              onValueChange={handleClientDimensionCardTabChange}
               tabs={clientDimensionCardTableTabs}
-              rowsByTab={clientDimensionCardRowsForTable}
-              loadingByTab={loadingByClientDimensionCardTab}
-              columns={overviewMetricColumns}
+              loader={clientDimensionCardLoader}
+              contentTransitionKey={tableContentTransitionKey}
+              defaultSort={
+                comparisonQuery
+                  ? { key: "current", direction: "desc" }
+                  : undefined
+              }
+              requestKey={`${siteId}:${window.from}:${window.to}:${window.interval}:${window.timeZone}:${filtersKey}:${comparisonKey}:${locale}:client:${clientComparisonMetric}:${hasCardDataOverride ? cardDataOverrideKey : "remote"}`}
+              columns={
+                comparisonQuery
+                  ? clientComparisonColumns
+                  : overviewMetricColumns
+              }
               rowAdapter={clientDimensionCardRowAdapter}
               filterRows={filterClientDimensionCardRows}
-              compareRows={comparePageRows}
+              sortActionLabel={(label) =>
+                formatI18nTemplate(messages.common.sortBy, { label })
+              }
               loadingLabel={messages.common.loading}
               emptyLabel={noDataText}
               search={searchConfig}
               export={tableExport}
+              headerRight={
+                comparisonQuery ? (
+                  <ComparisonMetricToggle
+                    metric={clientComparisonMetric}
+                    messages={messages}
+                    onMetricChange={setClientComparisonMetric}
+                  />
+                ) : null
+              }
               className="h-full"
             />
           </div>
@@ -3604,19 +3685,36 @@ export function OverviewPagesSection({
               PageCardRow,
               PageCardSortKey
             >
-              value={geoDimensionCardTab}
-              onValueChange={handleGeoDimensionCardTabChange}
               tabs={geoDimensionCardTableTabs}
-              rowsByTab={geoDimensionCardRowsForTable}
-              loadingByTab={loadingByGeoDimensionCardTab}
-              columns={overviewMetricColumns}
+              loader={geoDimensionCardLoader}
+              contentTransitionKey={tableContentTransitionKey}
+              defaultSort={
+                comparisonQuery
+                  ? { key: "current", direction: "desc" }
+                  : undefined
+              }
+              requestKey={`${siteId}:${window.from}:${window.to}:${window.interval}:${window.timeZone}:${filtersKey}:${comparisonKey}:${locale}:geo:${geoComparisonMetric}:${hasCardDataOverride ? cardDataOverrideKey : "remote"}`}
+              columns={
+                comparisonQuery ? geoComparisonColumns : overviewMetricColumns
+              }
               rowAdapter={geoDimensionCardRowAdapter}
               filterRows={filterGeoDimensionCardRows}
-              compareRows={comparePageRows}
+              sortActionLabel={(label) =>
+                formatI18nTemplate(messages.common.sortBy, { label })
+              }
               loadingLabel={messages.common.loading}
               emptyLabel={noDataText}
               search={searchConfig}
               export={tableExport}
+              headerRight={
+                comparisonQuery ? (
+                  <ComparisonMetricToggle
+                    metric={geoComparisonMetric}
+                    messages={messages}
+                    onMetricChange={setGeoComparisonMetric}
+                  />
+                ) : null
+              }
               className="h-full"
             />
           </div>
@@ -3634,12 +3732,146 @@ interface OverviewDataSectionProps {
   filters: FilterDocument;
 }
 
+type OverviewMetricKey =
+  | "views"
+  | "visitors"
+  | "sessions"
+  | "bounceRate"
+  | "pagesPerSession"
+  | "avgDuration";
+
+type OverviewMetricSeries = Record<
+  OverviewMetricKey,
+  ReadonlyArray<MetricAreaPoint>
+>;
+
+function buildOverviewMetricSeries(
+  detailSeries: TrendData["data"],
+): OverviewMetricSeries {
+  const views: MetricAreaPoint[] = [];
+  const visitors: MetricAreaPoint[] = [];
+  const sessions: MetricAreaPoint[] = [];
+  const bounceRate: MetricAreaPoint[] = [];
+  const pagesPerSession: MetricAreaPoint[] = [];
+  const avgDuration: MetricAreaPoint[] = [];
+
+  for (const point of detailSeries) {
+    const { timestampMs } = point;
+    views.push({ timestampMs, value: point.views });
+    visitors.push({ timestampMs, value: point.visitors });
+    sessions.push({ timestampMs, value: point.sessions });
+
+    if (point.sessions > 0) {
+      bounceRate.push({
+        timestampMs,
+        value: point.bounces / point.sessions,
+      });
+      pagesPerSession.push({
+        timestampMs,
+        value: point.views / point.sessions,
+      });
+    }
+
+    if (point.views > 0) {
+      avgDuration.push({ timestampMs, value: point.avgDurationMs });
+    }
+  }
+
+  return {
+    views,
+    visitors,
+    sessions,
+    bounceRate,
+    pagesPerSession,
+    avgDuration,
+  };
+}
+
+function comparisonLabelForQuery(
+  messages: AppMessages,
+  comparisonQuery: DashboardComparisonQuery | null,
+): string {
+  return comparisonQuery?.mode === "previous" && !comparisonQuery.filters.root
+    ? messages.dashboardHeader.previousPeriod
+    : messages.dashboardHeader.compareButton;
+}
+
+function useOverviewComparisonQuery(
+  timeWindow: TimeWindow,
+  filters: FilterDocument,
+  enabled = true,
+): DashboardComparisonQuery | null {
+  const searchParams = useLiveSearchParams();
+  const searchParamsKey = searchParams.toString();
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
+
+  return useMemo(
+    () =>
+      enabled
+        ? resolveDashboardComparisonQuery(
+            new URLSearchParams(searchParamsKey),
+            timeWindow,
+            filters,
+          )
+        : null,
+    [
+      enabled,
+      filters,
+      filtersKey,
+      searchParamsKey,
+      timeWindow.from,
+      timeWindow.interval,
+      timeWindow.timeZone,
+      timeWindow.to,
+    ],
+  );
+}
+
 function useOverviewSummaryQuery({
   siteId,
   window: timeWindow,
   filters,
-}: Pick<OverviewDataSectionProps, "siteId" | "window" | "filters">) {
-  const filtersKey = useMemo(() => JSON.stringify(filters), [filters]);
+  comparisonQuery,
+}: Pick<OverviewDataSectionProps, "siteId" | "window" | "filters"> & {
+  comparisonQuery: DashboardComparisonQuery | null;
+}) {
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
+  const comparisonFiltersKey = useMemo(
+    () => (comparisonQuery ? filterQueryKey(comparisonQuery.filters) : "none"),
+    [comparisonQuery],
+  );
+  const comparisonKey = comparisonQuery
+    ? [
+        comparisonQuery.mode,
+        comparisonQuery.window.from,
+        comparisonQuery.window.to,
+        comparisonQuery.window.interval,
+        comparisonQuery.window.timeZone,
+        comparisonFiltersKey,
+      ]
+    : ["none"];
+
+  const resolveTrendData = async (
+    overview: OverviewData,
+    trendWindow: TimeWindow,
+    trendFilters: FilterDocument,
+    signal: AbortSignal,
+  ): Promise<TrendData> => {
+    if (overview.detail) {
+      return {
+        ok: overview.ok,
+        interval: overview.detail.interval,
+        data: overview.detail.data,
+      };
+    }
+
+    return fetchTrend(siteId, trendWindow, trendFilters, { signal }).catch(
+      (error) =>
+        fallbackUnlessAborted(error, () =>
+          emptyTrendData(trendWindow.interval),
+        ),
+    );
+  };
 
   return useQuery({
     queryKey: [
@@ -3651,8 +3883,53 @@ function useOverviewSummaryQuery({
       timeWindow.interval,
       timeWindow.timeZone,
       filtersKey,
+      "comparison",
+      ...comparisonKey,
     ],
     queryFn: async ({ signal }) => {
+      if (comparisonQuery) {
+        const [current, comparison] = await Promise.all([
+          fetchOverview(siteId, timeWindow, filters, {
+            includeChange: false,
+            includeDetail: true,
+            signal,
+          }).catch((error) => fallbackUnlessAborted(error, emptyOverviewData)),
+          fetchOverview(
+            siteId,
+            comparisonQuery.window,
+            comparisonQuery.filters,
+            {
+              includeChange: false,
+              includeDetail: true,
+              signal,
+            },
+          ).catch((error) => fallbackUnlessAborted(error, emptyOverviewData)),
+        ]);
+        const [trend, comparisonTrend] = await Promise.all([
+          resolveTrendData(current, timeWindow, filters, signal),
+          resolveTrendData(
+            comparison,
+            comparisonQuery.window,
+            comparisonQuery.filters,
+            signal,
+          ),
+        ]);
+
+        return {
+          overview: current,
+          previousOverview: emptyOverviewData(),
+          trendData: trend,
+          comparisonOverview: comparison,
+          comparisonTrendData: comparisonTrend,
+          dataWindow: {
+            from: timeWindow.from,
+            to: timeWindow.to,
+            interval: timeWindow.interval,
+            timeZone: timeWindow.timeZone,
+          },
+        };
+      }
+
       const current = await fetchOverview(siteId, timeWindow, filters, {
         includeChange: true,
         includeDetail: true,
@@ -3714,15 +3991,24 @@ export function OverviewMetricsSection({
   window,
   filters,
 }: OverviewDataSectionProps) {
+  const comparisonQuery = useOverviewComparisonQuery(window, filters);
   const {
     data: metricsData,
     isFetching,
     isPending,
-  } = useOverviewSummaryQuery({ siteId, window, filters });
+  } = useOverviewSummaryQuery({
+    siteId,
+    window,
+    filters,
+    comparisonQuery,
+  });
   const loading = isPending || isFetching;
   const overview = metricsData?.overview ?? emptyOverviewData();
   const previousOverview = metricsData?.previousOverview ?? emptyOverviewData();
   const detailSeries = metricsData?.trendData.data ?? EMPTY_TREND_POINTS;
+  const comparisonOverview = metricsData?.comparisonOverview;
+  const comparisonDetailSeries =
+    metricsData?.comparisonTrendData?.data ?? EMPTY_TREND_POINTS;
 
   const pagesPerSessionFormatter = useMemo(
     () =>
@@ -3739,108 +4025,108 @@ export function OverviewMetricsSection({
   const previousPagesPerSession =
     previous.sessions > 0 ? previous.views / previous.sessions : 0;
 
-  const metricSeries = useMemo(() => {
-    const views: MetricAreaPoint[] = [];
-    const visitors: MetricAreaPoint[] = [];
-    const sessions: MetricAreaPoint[] = [];
-    const bounceRate: MetricAreaPoint[] = [];
-    const pagesPerSession: MetricAreaPoint[] = [];
-    const avgDuration: MetricAreaPoint[] = [];
-
-    for (const point of detailSeries) {
-      const { timestampMs } = point;
-      views.push({ timestampMs, value: point.views });
-      visitors.push({ timestampMs, value: point.visitors });
-      sessions.push({ timestampMs, value: point.sessions });
-
-      if (point.sessions > 0) {
-        bounceRate.push({
-          timestampMs,
-          value: point.bounces / point.sessions,
-        });
-        pagesPerSession.push({
-          timestampMs,
-          value: point.views / point.sessions,
-        });
-      }
-
-      if (point.views > 0) {
-        avgDuration.push({ timestampMs, value: point.avgDurationMs });
-      }
-    }
-
-    return {
-      views,
-      visitors,
-      sessions,
-      bounceRate,
-      pagesPerSession,
-      avgDuration,
-    };
-  }, [detailSeries]);
+  const metricSeries = useMemo(
+    () => buildOverviewMetricSeries(detailSeries),
+    [detailSeries],
+  );
+  const comparisonMetricSeries = useMemo(
+    () => buildOverviewMetricSeries(comparisonDetailSeries),
+    [comparisonDetailSeries],
+  );
+  const comparison = comparisonOverview?.data ?? emptyOverviewData().data;
+  const comparisonPagesPerSession =
+    comparison.sessions > 0 ? comparison.views / comparison.sessions : 0;
   const metricChartAnimationKey = useMemo(() => {
     const firstTimestamp = detailSeries[0]?.timestampMs ?? 0;
     const lastTimestamp =
       detailSeries[detailSeries.length - 1]?.timestampMs ?? 0;
-    return `${detailSeries.length}:${firstTimestamp}:${lastTimestamp}`;
-  }, [detailSeries]);
+    const comparisonFirstTimestamp =
+      comparisonDetailSeries[0]?.timestampMs ?? 0;
+    const comparisonLastTimestamp =
+      comparisonDetailSeries[comparisonDetailSeries.length - 1]?.timestampMs ??
+      0;
+    return `${detailSeries.length}:${firstTimestamp}:${lastTimestamp}:${comparisonQuery?.mode ?? "none"}:${comparisonDetailSeries.length}:${comparisonFirstTimestamp}:${comparisonLastTimestamp}`;
+  }, [comparisonDetailSeries, comparisonQuery?.mode, detailSeries]);
+  const comparisonLabel = comparisonLabelForQuery(messages, comparisonQuery);
+  const hasComparisonData = Boolean(
+    comparisonQuery &&
+    metricsData?.comparisonOverview &&
+    metricsData.comparisonTrendData,
+  );
+  const reference = comparisonQuery ? comparison : previous;
+  const referencePagesPerSession = comparisonQuery
+    ? comparisonPagesPerSession
+    : previousPagesPerSession;
 
   const metrics = useMemo(
     () => [
       {
+        key: "views" as const,
         label: messages.common.views,
         value: numberFormat(locale, overview.data.views),
-        delta: toDeltaPercent(overview.data.views, previous.views),
+        delta: toDeltaPercent(overview.data.views, reference.views),
         trend: metricSeries.views,
+        comparisonTrend: comparisonMetricSeries.views,
         formatTrendValue: (value: number) =>
           numberFormat(locale, Math.round(value)),
       },
       {
+        key: "visitors" as const,
         label: messages.common.visitors,
         value: numberFormat(locale, overview.data.visitors),
-        delta: toDeltaPercent(overview.data.visitors, previous.visitors),
+        delta: toDeltaPercent(overview.data.visitors, reference.visitors),
         trend: metricSeries.visitors,
+        comparisonTrend: comparisonMetricSeries.visitors,
         formatTrendValue: (value: number) =>
           numberFormat(locale, Math.round(value)),
       },
       {
+        key: "sessions" as const,
         label: messages.common.sessions,
         value: numberFormat(locale, overview.data.sessions),
-        delta: toDeltaPercent(overview.data.sessions, previous.sessions),
+        delta: toDeltaPercent(overview.data.sessions, reference.sessions),
         trend: metricSeries.sessions,
+        comparisonTrend: comparisonMetricSeries.sessions,
         formatTrendValue: (value: number) =>
           numberFormat(locale, Math.round(value)),
       },
       {
+        key: "bounceRate" as const,
         label: messages.common.bounceRate,
         value: percentFormat(locale, overview.data.bounceRate),
-        delta: toDeltaPercent(overview.data.bounceRate, previous.bounceRate),
+        delta: toDeltaPercent(overview.data.bounceRate, reference.bounceRate),
         lowerIsBetter: true,
         trend: metricSeries.bounceRate,
+        comparisonTrend: comparisonMetricSeries.bounceRate,
         formatTrendValue: (value: number) => percentFormat(locale, value),
       },
       {
+        key: "pagesPerSession" as const,
         label: messages.teamManagement.sites.pagesPerSession,
         value: pagesPerSessionFormatter.format(currentPagesPerSession),
-        delta: toDeltaPercent(currentPagesPerSession, previousPagesPerSession),
+        delta: toDeltaPercent(currentPagesPerSession, referencePagesPerSession),
         trend: metricSeries.pagesPerSession,
+        comparisonTrend: comparisonMetricSeries.pagesPerSession,
         formatTrendValue: (value: number) =>
           pagesPerSessionFormatter.format(value),
       },
       {
+        key: "avgDuration" as const,
         label: messages.common.avgDuration,
         value: durationFormat(locale, overview.data.avgDurationMs),
         delta: toDeltaPercent(
           overview.data.avgDurationMs,
-          previous.avgDurationMs,
+          reference.avgDurationMs,
         ),
         trend: metricSeries.avgDuration,
+        comparisonTrend: comparisonMetricSeries.avgDuration,
         formatTrendValue: (value: number) =>
           durationFormat(locale, Math.max(0, Math.round(value))),
       },
     ],
     [
       currentPagesPerSession,
+      comparisonMetricSeries,
       locale,
       messages.common.avgDuration,
       messages.common.bounceRate,
@@ -3855,12 +4141,12 @@ export function OverviewMetricsSection({
       overview.data.visitors,
       overview.data.views,
       pagesPerSessionFormatter,
-      previous.avgDurationMs,
-      previous.bounceRate,
-      previous.sessions,
-      previous.visitors,
-      previous.views,
-      previousPagesPerSession,
+      reference.avgDurationMs,
+      reference.bounceRate,
+      reference.sessions,
+      reference.visitors,
+      reference.views,
+      referencePagesPerSession,
     ],
   );
 
@@ -3872,6 +4158,9 @@ export function OverviewMetricsSection({
             const hasDelta =
               typeof item.delta === "number" && Number.isFinite(item.delta);
             const effectiveDelta = hasDelta ? (item.delta ?? 0) : null;
+            const comparisonPoints = hasComparisonData
+              ? item.comparisonTrend
+              : undefined;
 
             return (
               <div key={item.label} className={metricCellBorderClasses(index)}>
@@ -3886,6 +4175,9 @@ export function OverviewMetricsSection({
                       label={item.label}
                       formatValue={item.formatTrendValue}
                       animationKey={metricChartAnimationKey}
+                      comparisonPoints={comparisonPoints}
+                      comparisonColor={COMPARISON_AREA_COLOR}
+                      comparisonLabel={comparisonLabel}
                     />
                   </div>
                   <div className="pointer-events-none relative z-10 flex min-h-[74px] min-w-0 flex-col justify-between px-3 py-2.5">
@@ -3935,6 +4227,7 @@ export function OverviewTrendSection({
   window,
   filters,
 }: OverviewDataSectionProps) {
+  const comparisonQuery = useOverviewComparisonQuery(window, filters);
   const currentDataWindow = useMemo(
     () => ({
       from: window.from,
@@ -3948,7 +4241,12 @@ export function OverviewTrendSection({
     data: trendQueryData,
     isFetching,
     isPending,
-  } = useOverviewSummaryQuery({ siteId, window, filters });
+  } = useOverviewSummaryQuery({
+    siteId,
+    window,
+    filters,
+    comparisonQuery,
+  });
   const loading = isPending || isFetching;
   const trendData =
     trendQueryData?.trendData ?? emptyTrendData(window.interval);
@@ -3969,6 +4267,16 @@ export function OverviewTrendSection({
     isPending,
     trendData.data,
   ]);
+  const comparisonTrendDisplayData = useMemo(() => {
+    if (!comparisonQuery || !trendQueryData?.comparisonTrendData) {
+      return undefined;
+    }
+    return normalizeTrendData(
+      comparisonQuery.window,
+      trendQueryData.comparisonTrendData.data,
+    );
+  }, [comparisonQuery, trendQueryData?.comparisonTrendData]);
+  const comparisonLabel = comparisonLabelForQuery(messages, comparisonQuery);
   return (
     <Card className="overflow-visible">
       <CardHeader className="flex flex-row items-center justify-between">
@@ -3994,6 +4302,11 @@ export function OverviewTrendSection({
             showLegend
             loading={loading}
             className="h-[280px]"
+            range={comparisonQuery ? window : undefined}
+            comparisonData={comparisonTrendDisplayData}
+            comparisonRange={comparisonQuery?.window}
+            currentPeriodLabel={messages.dashboardHeader.compareCurrentPeriod}
+            comparisonLabel={comparisonLabel}
           />
         </div>
       </CardContent>
@@ -4011,11 +4324,24 @@ export function OverviewClientPage({
 }: OverviewClientPageProps) {
   const searchParams = useLiveSearchParams();
   const livePathname = usePathname() || pathname;
-  const { window } = useDashboardQuery();
+  const { window, scopePreference } = useDashboardQuery();
+  const resolvedScope = useMemo(
+    () => resolveFilterScope("overview", scopePreference),
+    [scopePreference],
+  );
   const searchParamsKey = searchParams.toString();
   const requestFilters = useMemo(
     () => parseOverviewCardFilters(new URLSearchParams(searchParamsKey)),
     [searchParamsKey],
+  );
+  // Overview's Auto scope is resolved once by the parent operation (event)
+  // and passed to every dashboard child request. The URL remains Auto.
+  const resolvedRequestFilters = useMemo(
+    () =>
+      resolvedScope
+        ? attachFilterScopePreference(requestFilters, resolvedScope)
+        : requestFilters,
+    [requestFilters, resolvedScope],
   );
   const selectedGeoValue = dashboardFilterValue(requestFilters, "geo") ?? null;
   const selectedGeoCountry = useMemo(() => {
@@ -4063,14 +4389,14 @@ export function OverviewClientPage({
         messages={messages}
         siteId={siteId}
         window={window}
-        filters={requestFilters}
+        filters={resolvedRequestFilters}
       />
       <OverviewTrendSection
         locale={locale}
         messages={messages}
         siteId={siteId}
         window={window}
-        filters={requestFilters}
+        filters={resolvedRequestFilters}
       />
       <OverviewPagesSection
         locale={locale}
@@ -4078,7 +4404,8 @@ export function OverviewClientPage({
         siteId={siteId}
         siteDomain={siteDomain}
         pathname={pathname}
-        filters={requestFilters}
+        filters={resolvedRequestFilters}
+        resolvedScope={resolvedScope ?? undefined}
         showSourceLinkTab={showSourceLinkTab}
       />
       <OverviewGeoPointsMapCard
@@ -4086,7 +4413,8 @@ export function OverviewClientPage({
         messages={messages}
         siteId={siteId}
         window={window}
-        filters={requestFilters}
+        filters={resolvedRequestFilters}
+        resolvedScope={resolvedScope ?? undefined}
         selectedCountryCode={selectedGeoCountry}
         onCountrySelect={handleMapCountrySelect}
       />

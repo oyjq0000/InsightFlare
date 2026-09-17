@@ -14,11 +14,14 @@ import type {
   QueryTime,
 } from "@/lib/edge/analytics/contract";
 import { createQueryTime } from "@/lib/edge/analytics/contract/helpers";
+import { paginationBinding } from "@/lib/pagination";
 
 export interface ApiV1QueryInvocation<Query, Result> {
   readonly operation: AnalyticsOperationId;
   readonly context: QueryInput["context"];
   readonly query: Query;
+  /** Canonical request DTO, before it is expanded into a provider query. */
+  readonly rawRequest?: unknown;
   readonly providerRegistry: AnalyticsProviderRegistry;
   readonly cache?: {
     readonly key: string;
@@ -69,11 +72,48 @@ function queryTime(
   return undefined;
 }
 
+function rawRequestWithoutPaging(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const page = record.page;
+  if (!page || typeof page !== "object" || Array.isArray(page)) {
+    return value;
+  }
+  const pageRecord = page as Record<string, unknown>;
+  const { cursor: _cursor, limit: _limit, ...pageWithoutPaging } = pageRecord;
+  return { ...record, page: pageWithoutPaging };
+}
+
+async function apiV1RequestPaginationBinding(
+  operation: AnalyticsOperationId,
+  query: unknown,
+  context: QueryInput["context"],
+): Promise<string> {
+  const subject = context.subject;
+  const canonicalSubject =
+    subject.kind === "site"
+      ? subject
+      : {
+          ...subject,
+          authorizedSiteIds: [...subject.authorizedSiteIds].sort(),
+        };
+  return paginationBinding([
+    "api-v1-request-pagination-v2",
+    operation,
+    context.policy.audience,
+    context.policy.revision,
+    canonicalSubject,
+    rawRequestWithoutPaging(query),
+  ]);
+}
+
 function serviceError<Result>(
   operation: AnalyticsOperationId,
   result: AnalyticsResult<Result>,
 ): AnalyticsServiceResult<Result> | null {
-  if (result.ok) return { ok: true, value: result.data };
+  if (result.ok) return { ok: true, value: result.data, meta: result.meta };
   if (result.error.kind === "request-cancelled") {
     return { ok: false, error: { kind: "request-cancelled" } };
   }
@@ -84,6 +124,18 @@ function serviceError<Result>(
     return {
       ok: false,
       error: { kind: "query-cost-exceeded", cost: result.error.cost },
+    };
+  }
+  if (result.error.kind === "invalid-input") {
+    return {
+      ok: false,
+      error: { kind: "invalid-input", issues: result.error.issues },
+    };
+  }
+  if (result.error.kind === "invalid-cursor") {
+    return {
+      ok: false,
+      error: { kind: "invalid-cursor", cursorKind: result.error.cursorKind },
     };
   }
   if (result.error.kind === "internal") {
@@ -125,10 +177,16 @@ export async function executeApiV1Query<Query, Result>(
       },
     };
   }
+  const rawRequest = invocation.rawRequest ?? invocation.query;
+  const requestBinding = await apiV1RequestPaginationBinding(
+    invocation.operation,
+    rawRequest,
+    invocation.context,
+  );
   const query = {
     ...invocation.query,
     context: invocation.context,
-    time,
+    time: { ...time, paginationBinding: requestBinding },
   } as QueryInput;
   let providerError: unknown;
   const result = await new TypedQueryApplicationService(cache).execute(

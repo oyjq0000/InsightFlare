@@ -13,8 +13,15 @@ import {
   analyticsFilterRegistry,
   FILTER_DOCUMENT_VERSION,
   type FilterDocument,
+  filterScopePreferenceFromDocument,
   parseFilterParams,
   serializeFilterParams,
+} from "@/lib/filter-contract";
+import {
+  attachFilterScopePreference,
+  type FilterScopePreference,
+  parseFilterScopePreference,
+  serializeFilterScopePreference,
 } from "@/lib/filter-contract";
 
 import { serializeDashboardSearchParams } from "./filter-state";
@@ -33,7 +40,6 @@ export type RangePreset =
   | "90d"
   | "6m"
   | "12m"
-  | "all"
   | "custom";
 
 export type DashboardInterval = "minute" | "hour" | "day" | "week" | "month";
@@ -67,7 +73,6 @@ const RANGE_PRESETS: readonly RangePreset[] = [
   "90d",
   "6m",
   "12m",
-  "all",
   "custom",
 ] as const;
 
@@ -178,9 +183,6 @@ function rangeBounds(
       to: now,
     };
   }
-  if (preset === "all") {
-    return { from: 0, to: now };
-  }
   if (preset === "custom" && isValidCustomRange(customRange)) {
     return {
       from: Math.max(0, customRange.from),
@@ -275,7 +277,23 @@ export function resolveTimeWindow(
 export function parseFilterDocumentFromSearchParams(
   searchParams: URLSearchParams,
 ): FilterDocument {
-  return parseFilterParams(searchParams, analyticsFilterRegistry);
+  return attachFilterScopePreference(
+    parseFilterParams(searchParams, analyticsFilterRegistry),
+    parseFilterScopePreference(searchParams),
+  );
+}
+
+export function parseFilterScopeFromSearchParams(
+  searchParams: URLSearchParams,
+): FilterScopePreference {
+  return parseFilterScopePreference(searchParams);
+}
+
+export function serializeFilterScopeToSearchParams(
+  searchParams: URLSearchParams,
+  preference: FilterScopePreference,
+): URLSearchParams {
+  return serializeFilterScopePreference(searchParams, preference);
 }
 
 export function withRangeAndFilters(
@@ -288,6 +306,12 @@ export function withRangeAndFilters(
     analyticsFilterRegistry,
   );
   params.set("range", range);
+  const scopePreference = filterScopePreferenceFromDocument(filters);
+  if (scopePreference && filters?.root) {
+    return `${pathname}?${serializeDashboardSearchParams(
+      serializeFilterScopePreference(params, scopePreference),
+    )}`;
+  }
   return `${pathname}?${serializeDashboardSearchParams(params)}`;
 }
 

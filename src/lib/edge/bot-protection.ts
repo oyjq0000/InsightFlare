@@ -1,64 +1,17 @@
 import { classifyASN } from "asn-blocklist";
 import { isbot } from "isbot";
 
-import { isAnalyticsEngineDisabled } from "./analytics-engine";
-import type { InvocationLogger } from "./observability-logger";
-import type { Env, TrackerClientPayload } from "./types";
+import type { TrackerClientPayload } from "./types";
 import { clampString, coerceNumber, coerceString, safeHostname } from "./utils";
 
-export type BotConfidence = "high" | "medium" | "low";
-
+export type BotClassificationCategory = "normal" | "suspected_bot" | "bot";
 export interface BotClassification {
-  isBot: boolean;
-  confidence: BotConfidence;
+  category: BotClassificationCategory;
   reasons: string[];
 }
 
-export interface BotAnalyticsInput {
-  request: Request;
-  payload: TrackerClientPayload;
-  siteId: string;
-  origin: string | null;
-  traceId: string;
-  receivedAt: number;
-  classification: BotClassification;
-}
-
-export const BOT_ANALYTICS_BLOBS = [
-  "siteId",
-  "kind",
-  "confidence",
-  "reasons",
-  "ip",
-  "userAgent",
-  "origin",
-  "hostname",
-  "pathname",
-  "country",
-  "region",
-  "city",
-  "continent",
-  "colo",
-  "asn",
-  "asOrganization",
-  "verifiedBotCategory",
-  "rayId",
-  "traceId",
-  "metadataJson",
-] as const;
-
-export const BOT_ANALYTICS_DOUBLES = [
-  "receivedAt",
-  "asn",
-  "latitude",
-  "longitude",
-  "botScore",
-  "userAgentLength",
-] as const;
-
 const EMPTY_CLASSIFICATION: BotClassification = {
-  isBot: false,
-  confidence: "low",
+  category: "normal",
   reasons: [],
 };
 
@@ -87,34 +40,6 @@ function requestHeader(
   maxLength: number,
 ): string {
   return clampString(request.headers.get(name)?.trim() ?? "", maxLength);
-}
-
-function requestIp(request: Request): string {
-  const cfIp = requestHeader(request, "cf-connecting-ip", 80);
-  if (cfIp) return cfIp;
-  const forwarded = requestHeader(request, "x-forwarded-for", 255);
-  return forwarded.split(",")[0]?.trim() || "";
-}
-
-function requestPathname(request: Request): string {
-  try {
-    return clampString(new URL(request.url).pathname, 2048);
-  } catch {
-    return "";
-  }
-}
-
-function payloadPathname(payload: TrackerClientPayload): string {
-  const pathname = coerceString(payload.pathname || "");
-  if (!pathname) return "";
-  if (pathname.includes("://")) {
-    try {
-      return clampString(new URL(pathname).pathname || "/", 2048);
-    } catch {
-      return "";
-    }
-  }
-  return clampString(pathname.split(/[?#]/)[0] ?? pathname, 2048);
 }
 
 function payloadHostname(payload: TrackerClientPayload): string {
@@ -198,132 +123,20 @@ export function classifyCollectBotTraffic(input: {
     "cf_verified_bot_category",
   ]);
   if (reasons.some((reason) => highReasons.has(reason))) {
-    return { isBot: true, confidence: "high", reasons };
+    return { category: "bot", reasons };
   }
 
   if (hostedByAsn) {
-    return { isBot: true, confidence: "medium", reasons };
+    return { category: "suspected_bot", reasons };
   }
   if (
     networkServiceAsn &&
     (missingBrowserProvenance || reasons.includes("origin_hostname_mismatch"))
   ) {
-    return { isBot: true, confidence: "medium", reasons };
+    return { category: "suspected_bot", reasons };
   }
 
   return reasons.length > 0
-    ? { isBot: false, confidence: "low", reasons }
+    ? { category: "normal", reasons }
     : EMPTY_CLASSIFICATION;
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "{}";
-  }
-}
-
-function latitude(cf: Record<string, unknown>): number {
-  return coerceNumber(cf.latitude, 0) ?? 0;
-}
-
-function longitude(cf: Record<string, unknown>): number {
-  return coerceNumber(cf.longitude, 0) ?? 0;
-}
-
-export function writeBotAnalyticsEvent(
-  env: Env,
-  input: BotAnalyticsInput,
-  logger?: Pick<InvocationLogger, "warn" | "error"> &
-    Partial<Pick<InvocationLogger, "info">>,
-): void {
-  if (isAnalyticsEngineDisabled(env)) {
-    return;
-  }
-
-  const dataset = env.BOT_ANALYTICS;
-  if (!dataset) {
-    logger?.warn("collect.bot_analytics_missing_binding");
-    return;
-  }
-
-  const request = input.request;
-  const cf = requestCf(request);
-  const userAgent = requestHeader(request, "user-agent", 1024);
-  const asn = coerceNumber(cf.asn, 0) ?? 0;
-  const rayId = requestHeader(request, "cf-ray", 120);
-  const metadata = {
-    rayId,
-    requestUrl: request.url,
-    requestPathname: requestPathname(request),
-    requestMethod: request.method,
-    referer: requestHeader(request, "referer", 2048),
-    secFetchSite: requestHeader(request, "sec-fetch-site", 40),
-    secFetchMode: requestHeader(request, "sec-fetch-mode", 40),
-    secFetchDest: requestHeader(request, "sec-fetch-dest", 40),
-    httpProtocol: clampString(coerceString(cf.httpProtocol || ""), 40),
-    tlsVersion: clampString(coerceString(cf.tlsVersion || ""), 40),
-    tlsCipher: clampString(coerceString(cf.tlsCipher || ""), 120),
-    tlsClientExtensionsSha1: clampString(
-      coerceString(cf.tlsClientExtensionsSha1 || ""),
-      160,
-    ),
-    tlsClientHelloLength: clampString(
-      coerceString(cf.tlsClientHelloLength || ""),
-      40,
-    ),
-    requestPriority: clampString(coerceString(cf.requestPriority || ""), 160),
-    clientTcpRtt: coerceNumber(cf.clientTcpRtt, null),
-    clientQuicRtt: coerceNumber(cf.clientQuicRtt, null),
-    botManagement:
-      cf.botManagement && typeof cf.botManagement === "object"
-        ? cf.botManagement
-        : null,
-    eventId: clampString(coerceString(input.payload.eventId || ""), 128),
-    previousVisitId: clampString(
-      coerceString(input.payload.previousVisitId || ""),
-      128,
-    ),
-  };
-
-  try {
-    dataset.writeDataPoint({
-      indexes: [input.siteId || "unknown"],
-      blobs: [
-        input.siteId,
-        clampString(coerceString(input.payload.kind || ""), 40),
-        input.classification.confidence,
-        input.classification.reasons.join(","),
-        requestIp(request),
-        userAgent,
-        input.origin || "",
-        payloadHostname(input.payload),
-        payloadPathname(input.payload),
-        clampString(coerceString(cf.country || ""), 10),
-        clampString(coerceString(cf.region || ""), 128),
-        clampString(coerceString(cf.city || ""), 128),
-        clampString(coerceString(cf.continent || ""), 32),
-        clampString(coerceString(cf.colo || ""), 16),
-        String(Math.trunc(asn)),
-        clampString(coerceString(cf.asOrganization || ""), 255),
-        cfVerifiedBotCategory(cf),
-        rayId,
-        input.traceId,
-        safeJson(metadata),
-      ],
-      doubles: [
-        input.receivedAt,
-        asn,
-        latitude(cf),
-        longitude(cf),
-        cfBotScore(cf) ?? 0,
-        userAgent.length,
-      ],
-    });
-    logger?.info?.("collect.bot_analytics_written");
-  } catch (error) {
-    void error;
-    logger?.error("collect.bot_analytics_write_failed");
-  }
 }

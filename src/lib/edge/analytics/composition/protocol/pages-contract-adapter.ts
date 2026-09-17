@@ -6,6 +6,7 @@ import {
   type PagesResult,
   type ReferrersQuery,
   type ReferrersResult,
+  type ReferrerSummaryResult,
   siteQueryContext,
 } from "@/lib/edge/analytics/contract";
 import {
@@ -14,17 +15,19 @@ import {
   mapPages,
   mapReferrers,
   mapTabs,
-  paginationOffset,
   parseBooleanFlag,
   parseInterval,
   parseLimit,
+  parseListSearch,
   parseQueryLimit,
   parseWindow,
   queryErrorResponse,
   type ResponseContext,
 } from "@/lib/edge/analytics/providers/d1/internal/core";
-import type { queryPageTabsAggregate } from "@/lib/edge/analytics/providers/d1/internal/pages";
-import type { queryPagesDashboard } from "@/lib/edge/analytics/providers/d1/internal/pages";
+import type {
+  PagesWithTabsResult,
+  queryPagesDashboard,
+} from "@/lib/edge/analytics/providers/d1/internal/pages";
 import { toQueryTime } from "@/lib/edge/analytics/providers/d1/operations/overview-reader";
 import type { Env } from "@/lib/edge/types";
 
@@ -43,6 +46,7 @@ export async function handlePagesContract(
   if (!window) return badRequest("Invalid time window");
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const limit = parseLimit(url, 20, 200);
+  const cursor = url.searchParams.get("cursor");
   const time = toQueryTime(window);
   const includeDetails = parseBooleanFlag(url, "details");
   const query = {
@@ -51,34 +55,32 @@ export async function handlePagesContract(
     filters,
     limit,
     includeDetails,
-  } satisfies PagesQuery;
+    includeTabs,
+    page: { limit, ...(cursor ? { cursor } : {}) },
+  } as PagesQuery & { readonly includeTabs: boolean };
   const result = await createD1SiteQueryRuntime({
     env,
     siteId,
-  }).execute<PagesResult>("pages", query);
+  }).execute<PagesResult | PagesWithTabsResult>("pages", query);
   if (!result.ok) return queryErrorResponse(result.error);
+  const pagesResult = includeTabs
+    ? (result.data as PagesWithTabsResult).pages
+    : (result.data as PagesResult);
   const payload: Record<string, unknown> = {
     ok: true,
-    data: mapPages([...result.data.items]),
+    data: {
+      items: mapPages([...pagesResult.items]),
+      pagination: pagesResult.pagination,
+    },
   };
   if (includeTabs) {
-    const tabsResult = await createD1SiteQueryRuntime({
-      env,
-      siteId,
-    }).execute<Awaited<ReturnType<typeof queryPageTabsAggregate>>>("pages", {
-      context: queryContext,
-      time: toQueryTime(window),
-      filters,
-      variant: "tabs",
-      limit,
-    } as BaseQuery & { readonly variant: "tabs"; readonly limit: number });
-    if (!tabsResult.ok) return queryErrorResponse(tabsResult.error);
+    const tabs = (result.data as PagesWithTabsResult).tabs;
     payload.tabs = {
-      path: mapTabs(tabsResult.data.path),
-      title: mapTabs(tabsResult.data.title),
-      hostname: mapTabs(tabsResult.data.hostname),
-      entry: mapTabs(tabsResult.data.entry),
-      exit: mapTabs(tabsResult.data.exit),
+      path: mapTabs(tabs.path),
+      title: mapTabs(tabs.title),
+      hostname: mapTabs(tabs.hostname),
+      entry: mapTabs(tabs.entry),
+      exit: mapTabs(tabs.exit),
     };
   }
   return jsonResponseWith(ctx!, payload);
@@ -101,6 +103,12 @@ export async function handleReferrersContract(
   const time = toQueryTime(window);
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const limit = parseLimit(url, fallbackLimit, 200);
+  const cursor = url.searchParams.get("cursor");
+  const search = parseListSearch(url) ?? undefined;
+  const sort =
+    url.searchParams.get("sort") === "visitors" ? "visitors" : "views";
+  const direction =
+    url.searchParams.get("direction") === "asc" ? "asc" : "desc";
   const includeFullUrl = allowFullUrlParam && parseBooleanFlag(url, "fullUrl");
   const query = {
     context: queryContext,
@@ -108,6 +116,10 @@ export async function handleReferrersContract(
     filters,
     limit,
     includeFullUrl,
+    search,
+    sort,
+    direction,
+    page: { limit, ...(cursor ? { cursor } : {}) },
   } satisfies ReferrersQuery;
   const result = await createD1SiteQueryRuntime({
     env,
@@ -116,8 +128,38 @@ export async function handleReferrersContract(
   if (!result.ok) return queryErrorResponse(result.error);
   return jsonResponseWith(ctx!, {
     ok: true,
-    data: mapReferrers([...result.data.items]),
+    data: {
+      items: mapReferrers([...result.data.items]),
+      pagination: result.data.pagination,
+    },
   });
+}
+
+export async function handleReferrerSummaryContract(
+  env: Env,
+  siteId: string,
+  url: URL,
+  ctx?: ResponseContext,
+  queryContext = siteQueryContext(siteId, "private-dashboard"),
+): Promise<Response> {
+  const window = parseWindow(url);
+  if (!window) return badRequest("Invalid time window");
+  const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
+  const topN = parseQueryLimit(url, "topN", 5, 1, 20);
+  const result = await createD1SiteQueryRuntime({
+    env,
+    siteId,
+  }).execute<ReferrerSummaryResult>("referrers", {
+    context: queryContext,
+    time: toQueryTime(window),
+    filters,
+    limit: topN,
+    includeFullUrl: false,
+    variant: "summary",
+    topN,
+  });
+  if (!result.ok) return queryErrorResponse(result.error);
+  return jsonResponseWith(ctx!, { ok: true, data: result.data });
 }
 
 export async function handlePagesDashboardContract(
@@ -129,14 +171,8 @@ export async function handlePagesDashboardContract(
 ): Promise<Response> {
   const window = parseWindow(url);
   if (!window) return badRequest("Invalid time window");
-  const page = parseQueryLimit(url, "page", 1, 1, 10_000);
-  const pageSize = parseQueryLimit(url, "pageSize", 12, 1, 24);
-  const offset = paginationOffset(page, pageSize);
-  if (offset === null) {
-    return badRequest(
-      "Pagination depth exceeds 20,000 rows; narrow the time range or filters",
-    );
-  }
+  const limit = parseQueryLimit(url, "limit", 12, 1, 24);
+  const cursor = url.searchParams.get("cursor");
   const filters = parseFilterUrlForAudience(queryContext.policy.audience, url);
   const result = await createD1SiteQueryRuntime({ env, siteId }).execute<
     Awaited<ReturnType<typeof queryPagesDashboard>>
@@ -145,15 +181,20 @@ export async function handlePagesDashboardContract(
     time: toQueryTime(window),
     filters,
     interval: parseInterval(url),
-    page,
-    pageSize,
-    offset,
+    page: { limit, cursor },
+    audience: queryContext.policy.audience,
   } as BaseQuery & {
     readonly interval: ReturnType<typeof parseInterval>;
-    readonly page: number;
-    readonly pageSize: number;
-    readonly offset: number;
+    readonly page: { readonly limit: number; readonly cursor: string | null };
+    readonly audience: "private-dashboard" | "public-share" | "api-v1";
   });
   if (!result.ok) return queryErrorResponse(result.error);
-  return jsonResponseWith(ctx!, { ok: true, ...result.data });
+  return jsonResponseWith(ctx!, {
+    ok: true,
+    data: {
+      items: result.data.items,
+      pagination: result.data.pagination,
+    },
+    interval: result.data.interval,
+  });
 }

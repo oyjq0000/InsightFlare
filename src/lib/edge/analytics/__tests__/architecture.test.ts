@@ -61,6 +61,7 @@ describe("analytics architecture", () => {
       "composition/d1/journeys.ts",
       "composition/d1/technology.ts",
       "composition/d1/funnels.ts",
+      "composition/d1/goals.ts",
       "composition/d1/create-site-runtime.ts",
       "composition/d1/create-team-runtime.ts",
       "composition/protocol/overview-contract-adapter.ts",
@@ -218,6 +219,77 @@ describe("analytics architecture", () => {
     }
   });
 
+  it("keeps filter compilation behind the canonical application and dataset layers", () => {
+    const boundaryFiles = [
+      ...productionFiles("src/lib/api-v1"),
+      ...productionFiles("src/lib/hono/routes"),
+      ...productionFiles("src/lib/edge/analytics/adapters"),
+      ...productionFiles("src/lib/edge/analytics/composition/protocol"),
+    ];
+    for (const file of boundaryFiles) {
+      const content = readFileSync(file, "utf8");
+      expect(
+        content,
+        `${file} bypasses the canonical filter runtime`,
+      ).not.toMatch(
+        /(?:compileFilterDocument|buildVisitFilterSql|buildEventFilterSql|scopedDatasetFor|compileScopedDatasetSql|analytics\/providers\/d1\/internal\/(?:core-filters|scoped-dataset))/u,
+      );
+    }
+
+    expect(source("src/lib/edge/analytics/application/service.ts")).toContain(
+      "prepareScopedQuery",
+    );
+    expect(
+      source("src/lib/edge/analytics/composition/query-runtime.ts"),
+    ).toContain("TypedQueryApplicationService");
+    expect(
+      source("src/lib/edge/analytics/providers/d1/internal/scoped-dataset.ts"),
+    ).toContain("planObservationFilter");
+
+    const coreFilters = source(
+      "src/lib/edge/analytics/providers/d1/internal/core-filters.ts",
+    );
+    for (const legacyMembershipSymbol of [
+      "membershipSetSql",
+      "buildEntityMembershipPredicate",
+      "scope_universe",
+    ]) {
+      expect(
+        coreFilters,
+        `legacy membership implementation returned: ${legacyMembershipSymbol}`,
+      ).not.toContain(legacyMembershipSymbol);
+    }
+  });
+
+  it("does not reintroduce legacy D1 entity-membership SQL", () => {
+    const legacyPatterns = [
+      /membershipSetSql/u,
+      /buildEntityMembershipPredicate/u,
+      /fullEntityFilterCtes/u,
+      /entityExpansionSql/u,
+      /calculated_visits/u,
+      /matched_entities/u,
+      /matched_sessions/u,
+      /matched_visitors/u,
+      /scope_visit_source/u,
+      /scope_event_source/u,
+      /scope_set_/u,
+      /scope_empty/u,
+      /entity_membership/u,
+    ];
+    for (const file of productionFiles(
+      "src/lib/edge/analytics/providers/d1/internal",
+    )) {
+      const content = readFileSync(file, "utf8");
+      for (const pattern of legacyPatterns) {
+        expect(
+          content,
+          `${file} reintroduced legacy entity-membership SQL: ${pattern}`,
+        ).not.toMatch(pattern);
+      }
+    }
+  });
+
   it("does not reintroduce the generic D1 provider barrel", () => {
     for (const file of productionFiles("src/lib")) {
       expect(readFileSync(file, "utf8")).not.toContain(
@@ -321,6 +393,8 @@ describe("analytics architecture", () => {
       "visitor-detail",
       "session-detail",
       "funnel-analysis",
+      "goal-summary",
+      "goal-timeseries",
       "share-trend",
       "radar",
       "cross-dimension",

@@ -1,8 +1,15 @@
+import { parseApiV1FilterDsl } from "@/lib/api-v1/analytics-overview";
 import {
   type TeamTimeseriesQueryDto,
   TeamTimeseriesQueryDtoSchema,
 } from "@/lib/api-v1/dto/analytics";
-import { apiV1ErrorRegistry } from "@/lib/api-v1/errors";
+import {
+  type ApiV1ErrorIssue,
+  apiV1ErrorRegistry,
+  fromInputIssues,
+  fromRequestBodyError,
+  fromZodIssues,
+} from "@/lib/api-v1/errors";
 import { createApiV1QueryApplicationAdapter } from "@/lib/api-v1/query-application";
 import { readBoundedJson } from "@/lib/api-v1/request-budget";
 import { resolveApiV1TimeRange } from "@/lib/api-v1/time-range";
@@ -50,7 +57,10 @@ function response(
   });
 }
 
-function errorResponse(code: keyof typeof apiV1ErrorRegistry) {
+function errorResponse(
+  code: keyof typeof apiV1ErrorRegistry,
+  issues?: readonly ApiV1ErrorIssue[],
+) {
   const requestId = crypto.randomUUID();
   const definition = apiV1ErrorRegistry[code];
   return response(
@@ -60,6 +70,7 @@ function errorResponse(code: keyof typeof apiV1ErrorRegistry) {
         code,
         message: definition.message,
         retryable: definition.retryable,
+        ...(issues && issues.length > 0 ? { issues } : {}),
       },
       meta: { requestId },
     },
@@ -102,6 +113,13 @@ async function readBody(request: Request): Promise<unknown> {
 
 function filter(input: TeamTimeseriesQueryDto): FilterDocument | null {
   if (!input.filter) return { version: 1, root: null };
+  if (input.filter.type === "dsl") {
+    try {
+      return parseApiV1FilterDsl(input.filter.expression);
+    } catch {
+      return null;
+    }
+  }
   try {
     return parseApiV1FilterDocument({
       version: 1,
@@ -148,9 +166,18 @@ export async function handlePlannedTeamTimeseries(
 
   let input: TeamTimeseriesQueryDto;
   try {
-    input = TeamTimeseriesQueryDtoSchema.parse(await readBody(request));
-  } catch {
-    return errorResponse("validation_failed");
+    const parsed = TeamTimeseriesQueryDtoSchema.safeParse(
+      await readBody(request),
+    );
+    if (!parsed.success) {
+      return errorResponse(
+        "validation_failed",
+        fromZodIssues(parsed.error.issues),
+      );
+    }
+    input = parsed.data;
+  } catch (error) {
+    return errorResponse("validation_failed", fromRequestBodyError(error));
   }
   const resolvedTimeRange = resolveApiV1TimeRange(
     input.timeRange,
@@ -167,10 +194,18 @@ export async function handlePlannedTeamTimeseries(
     endExclusiveMs <= startMs ||
     !isReportingTimeZone(timeZone)
   ) {
-    return errorResponse("validation_failed");
+    return errorResponse(
+      "validation_failed",
+      fromInputIssues([{ path: "timeRange", code: "invalid_time_range" }]),
+    );
   }
   const filters = filter(input);
-  if (!filters) return errorResponse("validation_failed");
+  if (!filters) {
+    return errorResponse(
+      "validation_failed",
+      fromInputIssues([{ path: "filter", code: "invalid_filter" }]),
+    );
+  }
   if (
     exceedsQueryCost({
       rangeMs: endExclusiveMs - startMs,
@@ -193,6 +228,7 @@ export async function handlePlannedTeamTimeseries(
       timeZone,
       interval: input.interval,
       filters,
+      scopePreference: input.scope ?? "auto",
     };
     const serviceResult = await createApiV1QueryApplicationAdapter().execute<
       TeamTimeseriesReaderInput,
@@ -267,6 +303,9 @@ export async function handlePlannedTeamTimeseries(
           },
           source: result.source,
           accuracy: result.approximateVisitors ? "approximate" : "exact",
+          ...(serviceResult.meta?.filterScope
+            ? { filterScope: serviceResult.meta.filterScope }
+            : {}),
         },
       },
       requestId,

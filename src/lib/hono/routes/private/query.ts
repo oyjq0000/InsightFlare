@@ -19,8 +19,10 @@ import {
 import { resolvePrivateSiteMiddleware } from "@/lib/hono/middleware/site";
 import type { AppEnv } from "@/lib/hono/types";
 import { executionContext, requestUrl } from "@/lib/hono/utils/context";
+import { forb } from "@/lib/response";
 
 const FUNNEL_PATH = "funnels";
+const GOAL_PATH = "goals";
 const TEAM_DASHBOARD_PATH = "team-dashboard";
 
 function privateQuery(pathname: string) {
@@ -73,6 +75,7 @@ privateQueryRoutes.all("/team-dashboard", async (c) => {
         tenantId: team.teamId,
         route: "team-dashboard",
         audienceId: session.userId,
+        allowedSiteIds: team.allowedSiteIds,
       },
       request: c.req.raw,
     },
@@ -81,12 +84,44 @@ privateQueryRoutes.all("/team-dashboard", async (c) => {
 
 privateQueryRoutes.use(
   `/${FUNNEL_PATH}`,
-  requireMethodsMiddleware(["GET", "POST", "DELETE"]),
+  requireMethodsMiddleware(["GET", "POST", "PATCH", "DELETE"]),
 );
 privateQueryRoutes.all(
   `/${FUNNEL_PATH}`,
   resolvePrivateSiteMiddleware(),
-  privateQuery(FUNNEL_PATH),
+  async (c) => {
+    const method = c.req.raw.method;
+    const site = c.get("privateSite");
+    if (method !== "GET" && !site?.canManage) {
+      return forb(
+        "Funnel mutations require team owner or admin access",
+        undefined,
+        c.req.raw,
+      );
+    }
+    return privateQuery(FUNNEL_PATH)(c);
+  },
+);
+
+privateQueryRoutes.use(
+  `/${GOAL_PATH}`,
+  requireMethodsMiddleware(["GET", "POST", "PATCH", "DELETE"]),
+);
+privateQueryRoutes.all(
+  `/${GOAL_PATH}`,
+  resolvePrivateSiteMiddleware(),
+  async (c) => {
+    const method = c.req.raw.method;
+    const site = c.get("privateSite");
+    if (method !== "GET" && !site?.canManage) {
+      return forb(
+        "Goal mutations require team owner or admin access",
+        undefined,
+        c.req.raw,
+      );
+    }
+    return privateQuery(GOAL_PATH)(c);
+  },
 );
 
 for (const path of DASHBOARD_QUERY_PATHS) {

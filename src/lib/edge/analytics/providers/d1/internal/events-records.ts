@@ -1,3 +1,7 @@
+import {
+  EMPTY_FILTER_DOCUMENT,
+  type ScopedDatasetSql,
+} from "@/lib/edge/analytics/contract";
 import { readCustomEventDetail } from "@/lib/edge/custom-event-read";
 import { SITE_PK_FROM_SITE_ID_SQL } from "@/lib/edge/site-identity-sql";
 import type { Env } from "@/lib/edge/types";
@@ -20,8 +24,7 @@ import {
   visitSourceBindings,
 } from "./core";
 import { mapVisitPerformanceMetrics } from "./core-performance";
-
-const EVENT_RECORD_CURSOR_MAX_LENGTH = 12_288;
+import { scopedDatasetFor } from "./scoped-dataset";
 
 // Event-record lists only need this projection for their output, filters, and
 // cursor predicates. Keeping it explicit prevents the shared analytics source
@@ -104,9 +107,7 @@ function eventRecordSourceColumns(filters: FilterDocument): string {
 }
 
 export interface EventRecordCursor {
-  sortKey: EventRecordSortKey;
-  sortDirection: "asc" | "desc";
-  sortValue: string | number;
+  readonly sortValue?: string | number;
   occurredAt: number;
   eventId: string;
   eventPk: number;
@@ -163,105 +164,22 @@ export interface EventRecordPage {
   nextCursor: EventRecordCursor | null;
 }
 
-function toBase64Url(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/u, "");
-}
-
-function fromBase64Url(value: string): string | null {
-  try {
-    const padded = value.replaceAll("-", "+").replaceAll("_", "/");
-    const binary = atob(padded.padEnd(Math.ceil(padded.length / 4) * 4, "="));
-    const bytes = Uint8Array.from(binary, (character) =>
-      character.charCodeAt(0),
-    );
-    return new TextDecoder().decode(bytes);
-  } catch {
-    return null;
-  }
-}
-
-export function serializeEventRecordCursor(cursor: EventRecordCursor): string {
-  return toBase64Url(JSON.stringify(cursor));
-}
-
-export function parseEventRecordCursor(
-  raw: string,
-  sort: ListSort<EventRecordSortKey>,
-): EventRecordCursor | null {
-  if (raw.length === 0 || raw.length > EVENT_RECORD_CURSOR_MAX_LENGTH) {
-    return null;
-  }
-  const decoded = fromBase64Url(raw);
-  if (!decoded) return null;
-
-  try {
-    const value: unknown = JSON.parse(decoded);
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      return null;
-    const cursor = value as Record<string, unknown>;
-    const sortKey = cursor.sortKey;
-    const sortDirection = cursor.sortDirection;
-    const sortValue = cursor.sortValue;
-    const occurredAt = cursor.occurredAt;
-    const eventId = cursor.eventId;
-    const eventPk = cursor.eventPk;
-    if (
-      sortKey !== sort.key ||
-      sortDirection !== sort.direction ||
-      (typeof sortValue !== "string" && typeof sortValue !== "number") ||
-      typeof occurredAt !== "number" ||
-      !Number.isFinite(occurredAt) ||
-      typeof eventId !== "string" ||
-      typeof eventPk !== "number" ||
-      !Number.isSafeInteger(eventPk) ||
-      eventPk < 0
-    ) {
-      return null;
-    }
-    if (
-      (sort.key === "occurredAt" &&
-        (typeof sortValue !== "number" || sortValue !== occurredAt)) ||
-      ((sort.key === "eventName" || sort.key === "pathname") &&
-        typeof sortValue !== "string")
-    ) {
-      return null;
-    }
-    return {
-      sortKey: sort.key,
-      sortDirection: sort.direction,
-      sortValue,
-      occurredAt,
-      eventId,
-      eventPk,
-    };
-  } catch {
-    return null;
-  }
-}
-
 function eventRecordCursorFromRow(
   row: EventRecordCursorRow,
   sort: ListSort<EventRecordSortKey>,
 ): EventRecordCursor {
-  return {
-    sortKey: sort.key,
-    sortDirection: sort.direction,
-    sortValue:
-      sort.key === "eventName"
-        ? row.eventName
-        : sort.key === "pathname"
-          ? row.pathname
-          : row.occurredAt,
-    occurredAt: row.occurredAt,
-    eventId: row.eventId,
-    eventPk: row.eventPk,
-  };
+  return sort.key === "occurredAt"
+    ? {
+        occurredAt: row.occurredAt,
+        eventId: row.eventId,
+        eventPk: row.eventPk,
+      }
+    : {
+        sortValue: sort.key === "eventName" ? row.eventName : row.pathname,
+        occurredAt: row.occurredAt,
+        eventId: row.eventId,
+        eventPk: row.eventPk,
+      };
 }
 
 function eventRecordCursorFilter(
@@ -310,8 +228,8 @@ function eventRecordCursorFilter(
         )
       )`,
     bindings: [
-      cursor.sortValue,
-      cursor.sortValue,
+      cursor.sortValue!,
+      cursor.sortValue!,
       cursor.occurredAt,
       cursor.occurredAt,
       cursor.eventId,
@@ -327,14 +245,19 @@ function eventRecordsSql(
   sort: ListSort<EventRecordSortKey>,
   sourceColumns: string,
   eventName?: string,
+  scopedDataset?: ScopedDatasetSql | null,
 ): string {
   return `
 WITH
-${buildVisitSourceCte()},
+${
+  scopedDataset
+    ? scopedDataset.ctes
+    : `${buildVisitSourceCte()},
 ${buildEventAnalyticsSourceCte({
   eventName,
   selectColumns: sourceColumns,
-})}
+})}`
+}
 SELECT
   event_pk AS eventPk,
   event_id AS eventId,
@@ -359,7 +282,7 @@ SELECT
   device_type AS deviceType,
   node_count AS nodeCount,
   value_count AS valueCount
-FROM event_source es
+FROM ${scopedDataset?.eventRelation ?? "event_source"} es
 ${filterClause || "WHERE 1 = 1"}
 ${cursorClause}
 ORDER BY ${eventRecordOrderBy(sort)}
@@ -378,38 +301,54 @@ export async function queryEventRecordPageFromD1(
   window: QueryWindow,
   filters: FilterDocument,
   options: {
-    pageSize: number;
+    limit: number;
     sort: ListSort<EventRecordSortKey>;
     search?: string;
     eventName?: string;
     cursor?: EventRecordCursor | null;
   },
 ): Promise<EventRecordPage> {
-  const filter = buildEventFilterSql(filters, "es", {
-    search: options.search,
-  });
+  const eventName = options.eventName?.trim() || undefined;
+  const scopedDataset = scopedDatasetFor(siteId, window, filters);
+  const filter = buildEventFilterSql(
+    scopedDataset ? EMPTY_FILTER_DOCUMENT : filters,
+    "es",
+    {
+      search: options.search,
+    },
+  );
+  const eventNameClause =
+    scopedDataset && eventName
+      ? `${filter.clause ? " AND" : "WHERE"} TRIM(COALESCE(es.event_name, '')) = ?`
+      : "";
   const cursor = options.cursor
     ? eventRecordCursorFilter(options.cursor, options.sort)
     : { clause: "", bindings: [] };
   const rows = await queryD1All<EventRecordCursorRow>(
     env,
     eventRecordsSql(
-      filter.clause,
+      `${filter.clause}${eventNameClause}`,
       cursor.clause,
       options.sort,
       eventRecordSourceColumns(filters),
-      options.eventName,
+      eventName,
+      scopedDataset,
     ),
     [
-      ...visitSourceBindings(siteId, window),
-      ...eventSourceBindings(siteId, window, options.eventName),
+      ...(scopedDataset
+        ? scopedDataset.bindings.map((binding) => binding.value)
+        : [
+            ...visitSourceBindings(siteId, window),
+            ...eventSourceBindings(siteId, window, eventName),
+          ]),
       ...filter.bindings,
+      ...(scopedDataset && eventName ? [eventName] : []),
       ...cursor.bindings,
-      options.pageSize + 1,
+      options.limit + 1,
     ],
   );
-  const hasMore = rows.length > options.pageSize;
-  const pageRows = hasMore ? rows.slice(0, options.pageSize) : rows;
+  const hasMore = rows.length > options.limit;
+  const pageRows = hasMore ? rows.slice(0, options.limit) : rows;
   const lastRow = pageRows.at(-1);
   return {
     rows: pageRows.map(withoutEventPk),
@@ -418,56 +357,6 @@ export async function queryEventRecordPageFromD1(
         ? eventRecordCursorFromRow(lastRow, options.sort)
         : null,
   };
-}
-
-/**
- * @deprecated Use queryEventRecordPageFromD1 so callers can carry a keyset
- * cursor instead of asking D1 to scan and discard OFFSET rows.
- */
-export async function queryEventRecordsFromD1(
-  env: Env,
-  siteId: string,
-  window: QueryWindow,
-  filters: FilterDocument,
-  options: {
-    limit: number;
-    offset: number;
-    sort: ListSort<EventRecordSortKey>;
-    search?: string;
-    eventName?: string;
-  },
-): Promise<EventRecordRow[]> {
-  const limit = Math.max(0, Math.trunc(options.limit));
-  if (limit === 0) return [];
-
-  let remainingOffset = Math.max(0, Math.trunc(options.offset));
-  let cursor: EventRecordCursor | null = null;
-  const rows: EventRecordRow[] = [];
-  const pageSize = Math.max(1, Math.min(200, limit));
-
-  while (rows.length < limit) {
-    const page = await queryEventRecordPageFromD1(
-      env,
-      siteId,
-      window,
-      filters,
-      {
-        pageSize,
-        sort: options.sort,
-        search: options.search,
-        eventName: options.eventName,
-        cursor,
-      },
-    );
-    const pageRows =
-      remainingOffset > 0 ? page.rows.slice(remainingOffset) : page.rows;
-    remainingOffset = Math.max(0, remainingOffset - page.rows.length);
-    rows.push(...pageRows.slice(0, limit - rows.length));
-    if (rows.length >= limit || !page.nextCursor) break;
-    cursor = page.nextCursor;
-  }
-
-  return rows;
 }
 
 export async function queryEventRecordDetailFromD1(

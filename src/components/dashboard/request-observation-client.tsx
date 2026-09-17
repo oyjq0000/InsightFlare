@@ -2,8 +2,6 @@ import {
   Fragment,
   type KeyboardEvent,
   memo,
-  type MouseEvent,
-  type PointerEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -36,6 +34,7 @@ import {
 import {
   AsyncDimensionBreakdownCard,
   type AsyncDimensionBreakdownLabelAppearance,
+  type AsyncDimensionBreakdownLoader,
   type AsyncDimensionBreakdownRow,
   type AsyncDimensionBreakdownTab,
 } from "@/components/dashboard/async-dimension-breakdown-card";
@@ -48,8 +47,7 @@ import {
   VisitorAvatar,
 } from "@/components/dashboard/journey-display";
 import { ShareRadialCard } from "@/components/dashboard/share-radial-card";
-import { EVENT_RECORD_DRAWER_Z_INDEX } from "@/components/dashboard/site-pages/floating-layer";
-import { AppOverlay, overlayZIndexFor } from "@/components/ui/app-overlay";
+import type { TabbedDataTablePage } from "@/components/dashboard/tabbed-data-table-card";
 import { AutoResizer } from "@/components/ui/auto-resizer";
 import { AutoTransition } from "@/components/ui/auto-transition";
 import { Badge } from "@/components/ui/badge";
@@ -100,6 +98,19 @@ interface RequestObservationClientProps {
   messages: AppMessages;
 }
 
+type RequestObservationCategory =
+  "normal" | "suspected_bot" | "bot" | "custom_block";
+type RequestObservationDisposition = "included" | "blocked";
+
+interface RequestObservationSampling {
+  provider: "cloudflare_analytics_engine";
+  mode: "automatic";
+  observedSampled: boolean;
+  aggregatesWeighted: boolean;
+  detailsAreSampled: boolean;
+  distinctAreApproximate: boolean;
+}
+
 interface BotEvent {
   timestamp: string;
   receivedAt: number;
@@ -107,7 +118,8 @@ interface BotEvent {
   siteName: string;
   siteDomain: string;
   kind: string;
-  confidence: string;
+  category: RequestObservationCategory | "";
+  disposition: RequestObservationDisposition | "";
   reasons: string[];
   ip: string;
   userAgent: string;
@@ -124,6 +136,7 @@ interface BotEvent {
   verifiedBotCategory: string;
   rayId: string;
   traceId: string;
+  requestMethod: string;
   metadataJson?: string;
   latitude: number | null;
   longitude: number | null;
@@ -135,11 +148,18 @@ interface NormalRequestEvent {
   timestamp: string;
   receivedAt: number;
   eventAt: number;
-  edgeLatencyMs: number;
+  edgeLatencyMs: number | null;
   siteId: string;
   siteName: string;
   siteDomain: string;
   kind: string;
+  category: RequestObservationCategory | "";
+  disposition: RequestObservationDisposition | "";
+  reasons: string[];
+  ip: string;
+  userAgent: string;
+  verifiedBotCategory: string;
+  botScore: number | null;
   origin: string;
   hostname: string;
   pathname: string;
@@ -166,7 +186,8 @@ const BOT_EVENT_DETAIL_SKELETON_DATA: BotEvent = {
   siteName: "",
   siteDomain: "",
   kind: "",
-  confidence: "",
+  category: "",
+  disposition: "",
   reasons: [],
   ip: "",
   userAgent: "",
@@ -183,10 +204,46 @@ const BOT_EVENT_DETAIL_SKELETON_DATA: BotEvent = {
   verifiedBotCategory: "",
   rayId: "",
   traceId: "",
+  requestMethod: "",
   metadataJson: "",
   latitude: null,
   longitude: null,
   botScore: null,
+  userAgentLength: 0,
+};
+
+const NORMAL_REQUEST_DETAIL_SKELETON_DATA: NormalRequestEvent = {
+  timestamp: "",
+  receivedAt: 0,
+  eventAt: 0,
+  edgeLatencyMs: null,
+  siteId: "",
+  siteName: "",
+  siteDomain: "",
+  kind: "",
+  category: "",
+  disposition: "",
+  reasons: [],
+  ip: "",
+  userAgent: "",
+  verifiedBotCategory: "",
+  botScore: null,
+  origin: "",
+  hostname: "",
+  pathname: "",
+  country: "",
+  region: "",
+  city: "",
+  continent: "",
+  colo: "",
+  asn: 0,
+  asOrganization: "",
+  rayId: "",
+  traceId: "",
+  requestMethod: "",
+  metadataJson: "",
+  latitude: null,
+  longitude: null,
   userAgentLength: 0,
 };
 
@@ -195,40 +252,48 @@ interface RequestMapPoint {
   longitude: number;
   country: string;
   pointCount: number;
-  source?: "normal" | "abnormal";
+  source?: "included" | "blocked";
   color?: [number, number, number];
 }
+
+type RequestObservationTrendDataPoint = RequestObservationTrendPoint;
 
 interface RequestNetworkDimensionRow {
   key: string;
   label: string;
   count: number;
-  highConfidence: number;
+  botCount: number;
   country: string;
   region: string;
   iconLabel?: string;
 }
 
-interface RequestDetailCursor {
-  timestamp: string;
-  receivedAt: number;
+interface RequestObservationPagination {
+  limit: number;
+  returned: number;
+  hasMore: boolean;
+  nextCursor: string | null;
 }
 
 interface RequestObservationPageData {
-  ok: true;
-  configured: boolean;
-  generatedAt: number;
-  page: {
-    source: "abnormal" | "normal";
-    events: BotEvent[] | NormalRequestEvent[];
-    hasMore: boolean;
-    nextCursor: RequestDetailCursor | null;
-  };
+  items: BotEvent[] | NormalRequestEvent[];
+  pagination: RequestObservationPagination;
 }
 
 interface RequestObservationDimensionData {
   ok: true;
+  sampling?: RequestObservationSampling;
   dimension: { rows: RequestNetworkDimensionRow[] };
+}
+
+interface LegacyRequestObservationPartition {
+  summary: Record<string, number | null>;
+  mapPoints: RequestMapPoint[];
+  events: Array<BotEvent | NormalRequestEvent>;
+  reasons?: Array<{ reason: string; count: number }>;
+  countries?: Array<{ country: string; count: number }>;
+  asns?: Array<{ asn: number; asOrganization: string; count: number }>;
+  pagination?: RequestObservationPagination;
 }
 
 interface RequestObservationData {
@@ -239,6 +304,7 @@ interface RequestObservationData {
     analyticsEngineEnableUrl?: string;
   };
   generatedAt: number;
+  sampling?: RequestObservationSampling;
   window?: {
     minutes: number;
     from: number;
@@ -247,17 +313,27 @@ interface RequestObservationData {
   };
   error?: string;
   summary: {
-    total: number;
-    baselineRequests: number;
-    botRequestRatio: number;
-    highConfidence: number;
-    mediumConfidence: number;
+    totalRequests?: number;
+    includedRequests?: number;
+    blockedRequests?: number;
+    normalRequests?: number;
+    suspectedBotRequests?: number;
+    botRequests?: number;
+    customBlockedRequests?: number;
+    botRequestRatio?: number;
+    blockedRequestRatio?: number;
+    normalRequestRatio?: number;
+    total?: number;
+    baselineRequests?: number;
+    highThreat?: number;
+    mediumThreat?: number;
+    customBlocked?: number;
     affectedSites: number;
     uniqueAsns: number;
     uniqueCountries: number;
   };
   mapPoints: RequestMapPoint[];
-  trend: RequestObservationTrendPoint[];
+  trend: RequestObservationTrendDataPoint[];
   reasons: Array<{ reason: string; count: number }>;
   countries?: Array<{ country: string; count: number }>;
   asns: Array<{ asn: number; asOrganization: string; count: number }>;
@@ -265,9 +341,14 @@ interface RequestObservationData {
   normalEvents?: NormalRequestEvent[];
   overview?: {
     totalRequests: number;
+    includedRequests?: number;
+    blockedRequests?: number;
     normalRequests: number;
-    abnormalRequests: number;
-    abnormalRequestRatio: number;
+    suspectedBotRequests?: number;
+    botRequests?: number;
+    customBlockedRequests?: number;
+    botRequestRatio?: number;
+    blockedRequestRatio?: number;
     normalRequestRatio: number;
     pageviews: number;
     customEvents: number;
@@ -277,12 +358,23 @@ interface RequestObservationData {
     p95LatencyMs: number | null;
     p99LatencyMs: number | null;
   };
-  abnormal?: {
+  blocked?: {
     summary: {
       total: number;
       ratio: number;
-      highConfidence: number;
-      mediumConfidence: number;
+      totalRequests?: number;
+      includedRequests?: number;
+      blockedRequests?: number;
+      normalRequests?: number;
+      suspectedBotRequests?: number;
+      botRequests?: number;
+      customBlockedRequests?: number;
+      botRequestRatio?: number;
+      blockedRequestRatio?: number;
+      normalRequestRatio?: number;
+      highThreat?: number;
+      mediumThreat?: number;
+      customBlocked?: number;
       affectedSites: number;
       uniqueAsns: number;
       uniqueCountries: number;
@@ -292,18 +384,27 @@ interface RequestObservationData {
     reasons?: Array<{ reason: string; count: number }>;
     countries?: Array<{ country: string; count: number }>;
     asns?: Array<{ asn: number; asOrganization: string; count: number }>;
-    hasMore?: boolean;
-    nextCursor?: RequestDetailCursor | null;
+    pagination?: RequestObservationPagination;
     dimensions?: {
       network?: Partial<
         Record<NetworkDimensionTab, RequestNetworkDimensionRow[]>
       >;
     };
   };
-  normal?: {
+  included?: {
     summary: {
       total: number;
       ratio: number;
+      totalRequests?: number;
+      includedRequests?: number;
+      blockedRequests?: number;
+      normalRequests?: number;
+      suspectedBotRequests?: number;
+      botRequests?: number;
+      customBlockedRequests?: number;
+      botRequestRatio?: number;
+      blockedRequestRatio?: number;
+      normalRequestRatio?: number;
       pageviews: number;
       customEvents: number;
       affectedSites: number;
@@ -317,32 +418,35 @@ interface RequestObservationData {
     };
     mapPoints: RequestMapPoint[];
     events: NormalRequestEvent[];
-    hasMore?: boolean;
-    nextCursor?: RequestDetailCursor | null;
+    pagination?: RequestObservationPagination;
     dimensions?: {
       network?: Partial<
         Record<NetworkDimensionTab, RequestNetworkDimensionRow[]>
       >;
     };
   };
+  // Read-only compatibility for links and cached responses from the old API.
+  abnormal?: LegacyRequestObservationPartition;
+  normal?: LegacyRequestObservationPartition;
 }
 
 interface RequestObservationDetailData {
   ok: true;
   configured: boolean;
   generatedAt: number;
-  detail: BotEvent | null;
+  sampling?: RequestObservationSampling;
+  detail: BotEvent | NormalRequestEvent | null;
 }
 
 const DIMENSION_ROW_LIMIT = 30;
 const BOT_EVENT_FETCH_LIMIT = 50;
-type AbnormalRequestTableColumnId =
+type BlockedRequestTableColumnId =
   | "id"
   | "time"
   | "site"
   | "kind"
   | "reason"
-  | "confidence"
+  | "category"
   | "botScore"
   | "verifiedBotCategory"
   | "network"
@@ -356,6 +460,7 @@ type NormalRequestTableColumnId =
   | "time"
   | "site"
   | "kind"
+  | "category"
   | "requestMethod"
   | "hostname"
   | "network"
@@ -364,22 +469,21 @@ type NormalRequestTableColumnId =
   | "pathname"
   | "edgeLatency";
 
-const BOT_EVENT_SKELETON_WIDTHS: Record<AbnormalRequestTableColumnId, string> =
-  {
-    id: "w-24",
-    time: "w-28",
-    site: "w-24",
-    kind: "w-20",
-    reason: "w-28",
-    confidence: "w-32",
-    botScore: "w-24",
-    verifiedBotCategory: "w-36",
-    network: "w-40",
-    ip: "w-28",
-    location: "w-24",
-    pathname: "w-24",
-    userAgent: "w-20",
-  };
+const BOT_EVENT_SKELETON_WIDTHS: Record<BlockedRequestTableColumnId, string> = {
+  id: "w-24",
+  time: "w-28",
+  site: "w-24",
+  kind: "w-20",
+  reason: "w-28",
+  category: "w-32",
+  botScore: "w-24",
+  verifiedBotCategory: "w-36",
+  network: "w-40",
+  ip: "w-28",
+  location: "w-24",
+  pathname: "w-24",
+  userAgent: "w-20",
+};
 const NORMAL_REQUEST_SKELETON_WIDTHS: Record<
   NormalRequestTableColumnId,
   string
@@ -388,6 +492,7 @@ const NORMAL_REQUEST_SKELETON_WIDTHS: Record<
   time: "w-28",
   site: "w-24",
   kind: "w-16",
+  category: "w-32",
   requestMethod: "w-24",
   hostname: "w-36",
   network: "w-40",
@@ -398,7 +503,7 @@ const NORMAL_REQUEST_SKELETON_WIDTHS: Record<
 };
 type RequestObservationColumnAlignment = "left" | "center" | "right";
 const BOT_EVENT_COLUMN_ALIGNMENTS: Record<
-  AbnormalRequestTableColumnId,
+  BlockedRequestTableColumnId,
   RequestObservationColumnAlignment
 > = {
   id: "left",
@@ -406,7 +511,7 @@ const BOT_EVENT_COLUMN_ALIGNMENTS: Record<
   site: "left",
   kind: "left",
   reason: "left",
-  confidence: "center",
+  category: "center",
   botScore: "right",
   verifiedBotCategory: "left",
   network: "left",
@@ -423,6 +528,7 @@ const NORMAL_REQUEST_COLUMN_ALIGNMENTS: Record<
   time: "center",
   site: "left",
   kind: "left",
+  category: "center",
   requestMethod: "center",
   hostname: "left",
   network: "left",
@@ -431,15 +537,15 @@ const NORMAL_REQUEST_COLUMN_ALIGNMENTS: Record<
   pathname: "left",
   edgeLatency: "right",
 };
-const ABNORMAL_POINT_COLOR: [number, number, number] = [239, 68, 68];
-const NORMAL_POINT_COLOR: [number, number, number] = [34, 197, 154];
+const BLOCKED_POINT_COLOR: [number, number, number] = [239, 68, 68];
+const INCLUDED_POINT_COLOR: [number, number, number] = [34, 197, 154];
 const PERFORMANCE_WARNING_COLOR = "oklch(0.75 0.16 80)";
 const NORMAL_TRAFFIC_SHARE_COLOR = "var(--color-chart-4)";
-const LOW_CONFIDENCE_TRAFFIC_COLOR = "var(--color-chart-5)";
-const MEDIUM_CONFIDENCE_TRAFFIC_COLOR = PERFORMANCE_WARNING_COLOR;
-const HIGH_CONFIDENCE_TRAFFIC_COLOR = "var(--color-destructive)";
+const SUSPECTED_BOT_TRAFFIC_COLOR = PERFORMANCE_WARNING_COLOR;
+const BOT_TRAFFIC_COLOR = "var(--color-destructive)";
+const CUSTOM_BLOCKED_TRAFFIC_COLOR = "var(--muted-foreground)";
 
-type RequestObservationTab = "overview" | "abnormal" | "normal";
+type RequestObservationTab = "overview" | "blocked" | "included";
 interface RequestObservationMapConfig {
   key: RequestObservationTab;
   points: RequestMapPoint[];
@@ -449,8 +555,8 @@ interface RequestObservationMapConfig {
 
 const REQUEST_OBSERVATION_TAB_INDEX = {
   overview: 0,
-  abnormal: 1,
-  normal: 2,
+  blocked: 1,
+  included: 2,
 } as const satisfies Record<RequestObservationTab, number>;
 const REQUEST_MAP_SLIDE_TRANSITION = {
   duration: 2,
@@ -460,8 +566,64 @@ const REQUEST_MAP_SLIDE_TRANSITION = {
 function normalizeRequestObservationTab(
   value: string | null | undefined,
 ): RequestObservationTab {
-  if (value === "abnormal" || value === "normal") return value;
+  if (value === "blocked" || value === "abnormal") return "blocked";
+  if (value === "included" || value === "normal") return "included";
   return "overview";
+}
+
+function normalizeRequestObservationCategory(
+  value: unknown,
+): RequestObservationCategory | "" {
+  const category = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (category === "medium_threat") return "suspected_bot";
+  if (category === "high_threat") return "bot";
+  if (
+    category === "normal" ||
+    category === "suspected_bot" ||
+    category === "bot" ||
+    category === "custom_block"
+  ) {
+    return category;
+  }
+  return "";
+}
+
+function normalizeRequestObservationDisposition(
+  value: unknown,
+  fallback: RequestObservationDisposition,
+): RequestObservationDisposition {
+  return value === "blocked" || value === "included" ? value : fallback;
+}
+
+function normalizeRequestObservationEvent<
+  T extends BotEvent | NormalRequestEvent,
+>(event: T, fallbackDisposition: RequestObservationDisposition): T {
+  const raw = event as unknown as Record<string, unknown>;
+  return {
+    ...event,
+    category: normalizeRequestObservationCategory(raw.category),
+    disposition: normalizeRequestObservationDisposition(
+      raw.disposition,
+      fallbackDisposition,
+    ),
+    reasons: Array.isArray(raw.reasons)
+      ? raw.reasons.filter(
+          (reason): reason is string => typeof reason === "string",
+        )
+      : [],
+    ip: typeof raw.ip === "string" ? raw.ip : "",
+    userAgent: typeof raw.userAgent === "string" ? raw.userAgent : "",
+    verifiedBotCategory:
+      typeof raw.verifiedBotCategory === "string"
+        ? raw.verifiedBotCategory
+        : "",
+    botScore:
+      raw.botScore == null || !Number.isFinite(Number(raw.botScore))
+        ? null
+        : Number(raw.botScore),
+  } as T;
 }
 
 function shortId(value: string): string {
@@ -469,7 +631,10 @@ function shortId(value: string): string {
   return `${value.slice(0, 9)}...`;
 }
 
-function botEventDetailId(event: BotEvent): string {
+function requestObservationDetailId(event: {
+  traceId: string;
+  rayId: string;
+}): string {
   return event.traceId || event.rayId || "";
 }
 
@@ -493,161 +658,612 @@ function latencyFormat(
   return durationFormat(locale, value);
 }
 
+interface RequestObservationUiLabels {
+  pageSubtitle: string;
+  blocked: string;
+  included: string;
+  disposition: string;
+  normalRequests: string;
+  suspectedBotRequests: string;
+  botRequests: string;
+  customBlockedRequests: string;
+  includedRequests: string;
+  blockedRequests: string;
+  totalRequests: string;
+  botRequestRatio: string;
+  blockedRequestRatio: string;
+  normalRequestRatio: string;
+  normalTrafficShare: string;
+  suspectedBotTraffic: string;
+  botTraffic: string;
+  customBlockedTraffic: string;
+  requests: string;
+  blockedSubtitle: string;
+  includedSubtitle: string;
+  blockedTrendDescription: string;
+  includedTrendDescription: string;
+  recentBlockedTitle: string;
+  recentBlockedDescription: string;
+  recentIncludedTitle: string;
+  recentIncludedDescription: string;
+  detailTitle: string;
+  detailSubtitle: string;
+}
+
+function nestedMessage(
+  source: unknown,
+  path: string[],
+  fallback: string,
+): string {
+  let current: unknown = source;
+  for (const key of path) {
+    if (!current || typeof current !== "object") return fallback;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === "string" && current.trim() ? current : fallback;
+}
+
+function requestObservationUiLabels(
+  locale: Locale,
+  copy: AppMessages["requestObservation"],
+): RequestObservationUiLabels {
+  const fallback =
+    locale === "zh"
+      ? {
+          pageSubtitle:
+            "基于 Analytics Engine 观察请求分类、实际处置与统计链路。",
+          blocked: "拦截请求",
+          included: "统计请求",
+          disposition: "处置",
+          normalRequests: "正常请求",
+          suspectedBotRequests: "疑似机器人",
+          botRequests: "机器人请求",
+          customBlockedRequests: "自定义拦截",
+          includedRequests: "统计请求数",
+          blockedRequests: "拦截请求数",
+          totalRequests: "总请求数",
+          botRequestRatio: "机器人请求比例",
+          blockedRequestRatio: "拦截请求比例",
+          normalRequestRatio: "正常请求比例",
+          normalTrafficShare: "正常请求",
+          suspectedBotTraffic: "疑似机器人",
+          botTraffic: "机器人请求",
+          customBlockedTraffic: "自定义拦截",
+          requests: "请求数",
+          blockedSubtitle: "聚焦实际被拦截的请求；分类仍表示请求的检测结果。",
+          includedSubtitle:
+            "聚焦进入统计链路的请求，包括正常请求和未被拦截的机器人信号。",
+          blockedTrendDescription: "按时间显示实际拦截请求数与拦截比例。",
+          includedTrendDescription: "按时间显示进入统计链路的请求数。",
+          recentBlockedTitle: "最近拦截请求",
+          recentBlockedDescription:
+            "这些记录来自统一的 Request Analytics Engine 数据集。",
+          recentIncludedTitle: "最近统计请求",
+          recentIncludedDescription:
+            "这些记录来自统一的 Request Analytics Engine 数据集。",
+          detailTitle: "请求详情",
+          detailSubtitle: "查看请求的分类、处置结果、网络和客户端上下文。",
+        }
+      : locale === "ja"
+        ? {
+            pageSubtitle:
+              "Analytics Engine でリクエストの分類、処置、集計経路を確認します。",
+            blocked: "ブロック済みリクエスト",
+            included: "集計対象リクエスト",
+            disposition: "処置",
+            normalRequests: "通常リクエスト",
+            suspectedBotRequests: "ボット疑い",
+            botRequests: "ボットリクエスト",
+            customBlockedRequests: "カスタムブロック",
+            includedRequests: "集計対象リクエスト数",
+            blockedRequests: "ブロック済みリクエスト数",
+            totalRequests: "総リクエスト数",
+            botRequestRatio: "ボットリクエスト比率",
+            blockedRequestRatio: "ブロック率",
+            normalRequestRatio: "通常リクエスト比率",
+            normalTrafficShare: "通常リクエスト",
+            suspectedBotTraffic: "ボット疑い",
+            botTraffic: "ボットリクエスト",
+            customBlockedTraffic: "カスタムブロック",
+            requests: "リクエスト数",
+            blockedSubtitle: "実際にブロックされたリクエストを表示します。",
+            includedSubtitle: "統計に含まれるリクエストを表示します。",
+            blockedTrendDescription: "時間帯ごとのブロック数とブロック率。",
+            includedTrendDescription: "時間帯ごとの集計対象リクエスト数。",
+            recentBlockedTitle: "最近のブロック済みリクエスト",
+            recentBlockedDescription:
+              "統合された Request Analytics Engine データセットの記録です。",
+            recentIncludedTitle: "最近の集計対象リクエスト",
+            recentIncludedDescription:
+              "統合された Request Analytics Engine データセットの記録です。",
+            detailTitle: "リクエスト詳細",
+            detailSubtitle:
+              "分類、処置、ネットワーク、クライアントの情報を確認します。",
+          }
+        : {
+            pageSubtitle:
+              "Monitor request categories, dispositions, and the statistics pipeline from Analytics Engine.",
+            blocked: "Blocked requests",
+            included: "Included requests",
+            disposition: "Disposition",
+            normalRequests: "Normal requests",
+            suspectedBotRequests: "Suspected bots",
+            botRequests: "Bot requests",
+            customBlockedRequests: "Custom blocks",
+            includedRequests: "Included requests",
+            blockedRequests: "Blocked requests",
+            totalRequests: "Total requests",
+            botRequestRatio: "Bot request ratio",
+            blockedRequestRatio: "Blocked request ratio",
+            normalRequestRatio: "Normal request ratio",
+            normalTrafficShare: "Normal requests",
+            suspectedBotTraffic: "Suspected bots",
+            botTraffic: "Bot requests",
+            customBlockedTraffic: "Custom blocks",
+            requests: "Requests",
+            blockedSubtitle:
+              "Requests that were actually blocked; category remains the detection result.",
+            includedSubtitle:
+              "Requests included in statistics, including requests with signals that were not blocked.",
+            blockedTrendDescription:
+              "Actual blocked requests and blocked ratio by interval.",
+            includedTrendDescription:
+              "Requests included in statistics by interval.",
+            recentBlockedTitle: "Recent blocked requests",
+            recentBlockedDescription:
+              "Records read from the unified Request Analytics Engine dataset.",
+            recentIncludedTitle: "Recent included requests",
+            recentIncludedDescription:
+              "Records read from the unified Request Analytics Engine dataset.",
+            detailTitle: "Request details",
+            detailSubtitle:
+              "Inspect the request category, disposition, network, and client context.",
+          };
+  const read = (paths: string[][], value: string) => {
+    for (const path of paths) {
+      const candidate = nestedMessage(copy, path, "");
+      if (candidate) return candidate;
+    }
+    return value;
+  };
+  return {
+    pageSubtitle: read([["subtitle"]], fallback.pageSubtitle),
+    blocked: read([["tabs", "blocked"]], fallback.blocked),
+    included: read([["tabs", "included"]], fallback.included),
+    disposition: read([["disposition"]], fallback.disposition),
+    normalRequests: read(
+      [["normalRequests"], ["overviewLabels", "normalRequests"]],
+      fallback.normalRequests,
+    ),
+    suspectedBotRequests: read(
+      [["suspectedBotRequests"], ["overviewLabels", "suspectedBotRequests"]],
+      fallback.suspectedBotRequests,
+    ),
+    botRequests: read(
+      [["botRequests"], ["overviewLabels", "botRequests"]],
+      fallback.botRequests,
+    ),
+    customBlockedRequests: read(
+      [["customBlockedRequests"], ["overviewLabels", "customBlockedRequests"]],
+      fallback.customBlockedRequests,
+    ),
+    includedRequests: read(
+      [["includedRequests"], ["overviewLabels", "includedRequests"]],
+      fallback.includedRequests,
+    ),
+    blockedRequests: read(
+      [["blockedRequests"], ["overviewLabels", "blockedRequests"]],
+      fallback.blockedRequests,
+    ),
+    totalRequests: read(
+      [["totalRequests"], ["overviewLabels", "totalRequests"]],
+      fallback.totalRequests,
+    ),
+    botRequestRatio: read(
+      [["botRequestRatio"], ["overviewLabels", "botRequestRatio"]],
+      fallback.botRequestRatio,
+    ),
+    blockedRequestRatio: read(
+      [["blockedRequestRatio"], ["overviewLabels", "blockedRequestRatio"]],
+      fallback.blockedRequestRatio,
+    ),
+    normalRequestRatio: read(
+      [["normalRequestRatio"], ["overviewLabels", "normalRequestRatio"]],
+      fallback.normalRequestRatio,
+    ),
+    normalTrafficShare: read(
+      [["normalRequests"], ["overviewLabels", "normalTrafficShare"]],
+      fallback.normalTrafficShare,
+    ),
+    suspectedBotTraffic: read(
+      [["suspectedBotRequests"], ["overviewLabels", "suspectedBotTraffic"]],
+      fallback.suspectedBotTraffic,
+    ),
+    botTraffic: read(
+      [["botRequests"], ["overviewLabels", "botTraffic"]],
+      fallback.botTraffic,
+    ),
+    customBlockedTraffic: read(
+      [["customBlockedRequests"], ["overviewLabels", "customBlockedTraffic"]],
+      fallback.customBlockedTraffic,
+    ),
+    requests: read([["overviewLabels", "requests"]], fallback.requests),
+    blockedSubtitle: read([["blockedSubtitle"]], fallback.blockedSubtitle),
+    includedSubtitle: read([["includedSubtitle"]], fallback.includedSubtitle),
+    blockedTrendDescription: read(
+      [["blockedTrendDescription"]],
+      fallback.blockedTrendDescription,
+    ),
+    includedTrendDescription: read(
+      [["includedTrendDescription"]],
+      fallback.includedTrendDescription,
+    ),
+    recentBlockedTitle: read(
+      [["recentBlockedTitle"]],
+      fallback.recentBlockedTitle,
+    ),
+    recentBlockedDescription: read(
+      [["recentBlockedDescription"]],
+      fallback.recentBlockedDescription,
+    ),
+    recentIncludedTitle: read(
+      [["recentIncludedTitle"]],
+      fallback.recentIncludedTitle,
+    ),
+    recentIncludedDescription: read(
+      [["recentIncludedDescription"]],
+      fallback.recentIncludedDescription,
+    ),
+    detailTitle: read([["requestDetailTitle"]], fallback.detailTitle),
+    detailSubtitle: read([["requestDetailSubtitle"]], fallback.detailSubtitle),
+  };
+}
+
 type DetectionDimensionTab =
-  | "reason"
-  | "confidence"
-  | "kind"
-  | "botScoreBucket"
-  | "verifiedBotCategory";
+  "reason" | "category" | "kind" | "botScoreBucket" | "verifiedBotCategory";
 type TargetDimensionTab = "site" | "hostname" | "pathname" | "origin";
+type IncludedTargetDimensionTab = "category" | TargetDimensionTab;
 type NetworkDimensionTab =
-  | "asOrganization"
-  | "asn"
-  | "country"
-  | "region"
-  | "city"
-  | "colo";
+  "asOrganization" | "asn" | "country" | "region" | "city" | "colo";
 type ClientDimensionTab =
-  | "ip"
-  | "userAgent"
-  | "userAgentLengthBucket"
-  | "ipPrefix";
+  "ip" | "userAgent" | "userAgentLengthBucket" | "ipPrefix";
 
 interface BotDimensionRow {
   label: string;
   count: number;
-  highConfidence: number;
+  botCount: number;
   sampleEvent: BotEvent | null;
 }
 
 function withRequestObservabilityDefaults(
   data: RequestObservationData,
 ): RequestObservationData {
+  const legacyData = data as RequestObservationData & {
+    abnormal?: LegacyRequestObservationPartition;
+    normal?: LegacyRequestObservationPartition;
+  };
+  const numeric = (value: unknown, fallback = 0) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const firstNumeric = (...values: unknown[]) => {
+    for (const value of values) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
+  };
   const rawTrend = data.trend ?? [];
   const trend = rawTrend.map((point) => {
-    const abnormalCount = Number(point.abnormalCount ?? point.count ?? 0);
-    const normalCount = Number(point.normalCount ?? point.baselineCount ?? 0);
-    const totalCount = Number(point.totalCount ?? abnormalCount + normalCount);
+    const raw = point as unknown as Record<string, unknown>;
+    const legacyAbnormalCount = firstNumeric(raw.abnormalCount, raw.count);
+    const normalCount = firstNumeric(raw.normalCount, raw.baselineCount);
+    const customBlockedCount = firstNumeric(
+      raw.customBlockedCount,
+      raw.customBlocked,
+    );
+    const botCount = firstNumeric(raw.botCount, raw.highThreat);
+    const suspectedBotCount = firstNumeric(
+      raw.suspectedBotCount,
+      raw.mediumThreat,
+      Math.max(0, legacyAbnormalCount - botCount - customBlockedCount),
+    );
+    const includedCount = firstNumeric(raw.includedCount, normalCount);
+    const blockedCount = firstNumeric(raw.blockedCount, legacyAbnormalCount);
+    const categoryTotal =
+      normalCount + suspectedBotCount + botCount + customBlockedCount;
+    const totalCount = firstNumeric(
+      raw.totalCount,
+      categoryTotal,
+      includedCount + blockedCount,
+    );
+    const botRatio = firstNumeric(
+      raw.botRatio,
+      totalCount > 0 ? botCount / totalCount : 0,
+    );
+    const blockedRatio = firstNumeric(
+      raw.blockedRatio,
+      totalCount > 0 ? blockedCount / totalCount : 0,
+    );
     return {
-      timestampMs: Number(point.timestampMs ?? 0),
-      count: abnormalCount,
-      baselineCount: normalCount,
+      timestampMs: numeric(point.timestampMs),
+      count: totalCount,
+      baselineCount: includedCount,
       normalCount,
-      abnormalCount,
+      suspectedBotCount,
+      botCount,
+      customBlockedCount,
+      includedCount,
+      blockedCount,
       totalCount,
-      botRatio:
-        totalCount > 0
-          ? Number(point.botRatio ?? abnormalCount / totalCount)
-          : 0,
-      abnormalRatio:
-        totalCount > 0
-          ? Number(point.abnormalRatio ?? abnormalCount / totalCount)
-          : 0,
-      normalRatio:
-        totalCount > 0
-          ? Number(point.normalRatio ?? normalCount / totalCount)
-          : 0,
-      pageviews: Number(point.pageviews ?? normalCount),
-      customEvents: Number(point.customEvents ?? 0),
-      avgLatencyMs: point.avgLatencyMs ?? null,
-      p50LatencyMs: point.p50LatencyMs ?? point.avgLatencyMs ?? null,
-      p75LatencyMs: point.p75LatencyMs ?? point.p95LatencyMs ?? null,
-      p95LatencyMs: point.p95LatencyMs ?? null,
-      p99LatencyMs: point.p99LatencyMs ?? point.p95LatencyMs ?? null,
+      botRatio,
+      blockedRatio,
+      normalRatio: firstNumeric(
+        raw.normalRatio,
+        totalCount > 0 ? normalCount / totalCount : 0,
+      ),
+      pageviews: firstNumeric(raw.pageviews, normalCount),
+      customEvents: numeric(raw.customEvents),
+      pageviewCount: firstNumeric(raw.pageviewCount, raw.pageviews),
+      leaveCount: numeric(raw.leaveCount),
+      visibilityCount: numeric(raw.visibilityCount),
+      customEventCount: firstNumeric(raw.customEventCount, raw.customEvents),
+      identifyCount: numeric(raw.identifyCount),
+      weightedRequestCount: firstNumeric(raw.weightedRequestCount, totalCount),
+      latencyWeightedSumMs: firstNumeric(
+        raw.latencyWeightedSumMs,
+        raw.avgLatencyMs == null
+          ? 0
+          : numeric(raw.avgLatencyMs) * includedCount,
+      ),
+      latencySampleWeight: firstNumeric(
+        raw.latencySampleWeight,
+        raw.avgLatencyMs == null ? 0 : includedCount,
+      ),
+      avgLatencyMs: raw.avgLatencyMs == null ? null : numeric(raw.avgLatencyMs),
+      p50LatencyMs:
+        raw.p50LatencyMs == null
+          ? raw.avgLatencyMs == null
+            ? null
+            : numeric(raw.avgLatencyMs)
+          : numeric(raw.p50LatencyMs),
+      p75LatencyMs:
+        raw.p75LatencyMs == null
+          ? raw.p95LatencyMs == null
+            ? null
+            : numeric(raw.p95LatencyMs)
+          : numeric(raw.p75LatencyMs),
+      p95LatencyMs: raw.p95LatencyMs == null ? null : numeric(raw.p95LatencyMs),
+      p99LatencyMs:
+        raw.p99LatencyMs == null
+          ? raw.p95LatencyMs == null
+            ? null
+            : numeric(raw.p95LatencyMs)
+          : numeric(raw.p99LatencyMs),
     };
   });
-  const abnormalEvents = data.abnormal?.events ?? data.events ?? [];
-  const normalEvents = data.normal?.events ?? data.normalEvents ?? [];
-  const abnormalMapPoints = data.abnormal?.mapPoints ?? data.mapPoints ?? [];
-  const normalMapPoints = data.normal?.mapPoints ?? [];
-  const normalRequests =
-    data.overview?.normalRequests ??
-    trend.reduce((sum, point) => sum + point.normalCount, 0) ??
-    data.summary.baselineRequests;
-  const abnormalRequests =
-    data.overview?.abnormalRequests ??
-    trend.reduce((sum, point) => sum + point.abnormalCount, 0) ??
-    data.summary.total;
-  const totalRequests =
-    data.overview?.totalRequests ?? normalRequests + abnormalRequests;
-  const abnormalRequestRatio =
-    data.overview?.abnormalRequestRatio ??
-    (totalRequests > 0 ? abnormalRequests / totalRequests : 0);
-  const normalRequestRatio =
-    data.overview?.normalRequestRatio ??
-    (totalRequests > 0 ? normalRequests / totalRequests : 0);
+  const legacyBlockedEvents = legacyData.abnormal?.events ?? data.events ?? [];
+  const legacyIncludedEvents =
+    legacyData.normal?.events ?? data.normalEvents ?? [];
+  const blockedEvents =
+    data.blocked?.events ?? (legacyBlockedEvents as BotEvent[]);
+  const includedEvents =
+    data.included?.events ?? (legacyIncludedEvents as NormalRequestEvent[]);
+  const normalizedBlockedEvents = blockedEvents.map((event) =>
+    normalizeRequestObservationEvent(event, "blocked"),
+  );
+  const normalizedIncludedEvents = includedEvents.map((event) =>
+    normalizeRequestObservationEvent(event, "included"),
+  );
+  const blockedMapPoints =
+    data.blocked?.mapPoints ??
+    legacyData.abnormal?.mapPoints ??
+    data.mapPoints ??
+    [];
+  const includedMapPoints =
+    data.included?.mapPoints ?? legacyData.normal?.mapPoints ?? [];
+  const trendTotals = trend.reduce(
+    (totals, point) => ({
+      total: totals.total + point.totalCount,
+      included: totals.included + point.includedCount,
+      blocked: totals.blocked + point.blockedCount,
+      normal: totals.normal + point.normalCount,
+      suspected: totals.suspected + point.suspectedBotCount,
+      bot: totals.bot + point.botCount,
+      custom: totals.custom + point.customBlockedCount,
+    }),
+    {
+      total: 0,
+      included: 0,
+      blocked: 0,
+      normal: 0,
+      suspected: 0,
+      bot: 0,
+      custom: 0,
+    },
+  );
+  const summary = data.summary;
+  const overviewSource = data.overview;
+  const normalRequests = firstNumeric(
+    overviewSource?.normalRequests,
+    summary.normalRequests,
+    trendTotals.normal,
+    summary.baselineRequests,
+  );
+  const suspectedBotRequests = firstNumeric(
+    overviewSource?.suspectedBotRequests,
+    summary.suspectedBotRequests,
+    trendTotals.suspected,
+  );
+  const botRequests = firstNumeric(
+    overviewSource?.botRequests,
+    summary.botRequests,
+    trendTotals.bot,
+    summary.highThreat,
+  );
+  const customBlockedRequests = firstNumeric(
+    overviewSource?.customBlockedRequests,
+    summary.customBlockedRequests,
+    trendTotals.custom,
+    summary.customBlocked,
+  );
+  const includedRequests = firstNumeric(
+    overviewSource?.includedRequests,
+    summary.includedRequests,
+    trendTotals.included,
+    summary.baselineRequests,
+    legacyIncludedEvents.length,
+  );
+  const blockedRequests = firstNumeric(
+    overviewSource?.blockedRequests,
+    summary.blockedRequests,
+    trendTotals.blocked,
+    summary.total,
+    legacyBlockedEvents.length,
+  );
+  const totalRequests = firstNumeric(
+    overviewSource?.totalRequests,
+    summary.totalRequests,
+    trendTotals.total,
+    summary.baselineRequests != null && summary.total != null
+      ? summary.baselineRequests + summary.total
+      : undefined,
+    includedRequests + blockedRequests,
+  );
+  const botRequestRatio = firstNumeric(
+    overviewSource?.botRequestRatio,
+    summary.botRequestRatio,
+    totalRequests > 0 ? botRequests / totalRequests : 0,
+  );
+  const blockedRequestRatio = firstNumeric(
+    overviewSource?.blockedRequestRatio,
+    summary.blockedRequestRatio,
+    totalRequests > 0 ? blockedRequests / totalRequests : 0,
+  );
+  const normalRequestRatio = firstNumeric(
+    overviewSource?.normalRequestRatio,
+    summary.normalRequestRatio,
+    totalRequests > 0 ? normalRequests / totalRequests : 0,
+  );
+  const blockedSummary = data.blocked?.summary;
+  const includedSummary = data.included?.summary;
 
   return {
     ...data,
     trend,
-    events: abnormalEvents,
-    normalEvents,
-    mapPoints: abnormalMapPoints,
+    events: normalizedBlockedEvents,
+    normalEvents: normalizedIncludedEvents,
+    mapPoints: blockedMapPoints,
     overview: {
       totalRequests,
+      includedRequests,
+      blockedRequests,
       normalRequests,
-      abnormalRequests,
-      abnormalRequestRatio,
+      suspectedBotRequests,
+      botRequests,
+      customBlockedRequests,
+      botRequestRatio,
+      blockedRequestRatio,
       normalRequestRatio,
       pageviews:
-        data.overview?.pageviews ??
+        overviewSource?.pageviews ??
         trend.reduce((sum, point) => sum + point.pageviews, 0),
       customEvents:
-        data.overview?.customEvents ??
+        overviewSource?.customEvents ??
         trend.reduce((sum, point) => sum + point.customEvents, 0),
-      avgLatencyMs: data.overview?.avgLatencyMs ?? null,
+      avgLatencyMs: overviewSource?.avgLatencyMs ?? null,
       p50LatencyMs:
-        data.overview?.p50LatencyMs ?? data.overview?.avgLatencyMs ?? null,
+        overviewSource?.p50LatencyMs ?? overviewSource?.avgLatencyMs ?? null,
       p75LatencyMs:
-        data.overview?.p75LatencyMs ?? data.overview?.p95LatencyMs ?? null,
-      p95LatencyMs: data.overview?.p95LatencyMs ?? null,
+        overviewSource?.p75LatencyMs ?? overviewSource?.p95LatencyMs ?? null,
+      p95LatencyMs: overviewSource?.p95LatencyMs ?? null,
       p99LatencyMs:
-        data.overview?.p99LatencyMs ?? data.overview?.p95LatencyMs ?? null,
+        overviewSource?.p99LatencyMs ?? overviewSource?.p95LatencyMs ?? null,
     },
-    abnormal: {
+    blocked: {
       summary: {
-        total: abnormalRequests,
-        ratio: abnormalRequestRatio,
-        highConfidence: data.summary.highConfidence,
-        mediumConfidence: data.summary.mediumConfidence,
+        total: blockedRequests,
+        ratio: blockedRequestRatio,
+        totalRequests,
+        includedRequests,
+        blockedRequests,
+        normalRequests,
+        suspectedBotRequests,
+        botRequests,
+        customBlockedRequests,
+        botRequestRatio,
+        blockedRequestRatio,
+        normalRequestRatio,
         affectedSites: data.summary.affectedSites,
         uniqueAsns: data.summary.uniqueAsns,
         uniqueCountries: data.summary.uniqueCountries,
-        ...(data.abnormal?.summary ?? {}),
+        ...(blockedSummary ?? {}),
       },
-      mapPoints: abnormalMapPoints,
-      events: abnormalEvents,
-      reasons: data.abnormal?.reasons ?? data.reasons,
-      countries: data.abnormal?.countries ?? data.countries,
-      asns: data.abnormal?.asns ?? data.asns,
-      hasMore: data.abnormal?.hasMore ?? false,
-      nextCursor: data.abnormal?.nextCursor ?? null,
+      mapPoints: blockedMapPoints,
+      events: normalizedBlockedEvents,
+      reasons:
+        data.blocked?.reasons ?? legacyData.abnormal?.reasons ?? data.reasons,
+      countries:
+        data.blocked?.countries ??
+        legacyData.abnormal?.countries ??
+        data.countries,
+      asns: data.blocked?.asns ?? legacyData.abnormal?.asns ?? data.asns,
+      pagination: data.blocked?.pagination ??
+        legacyData.abnormal?.pagination ?? {
+          limit: BOT_EVENT_FETCH_LIMIT,
+          returned: normalizedBlockedEvents.length,
+          hasMore: false,
+          nextCursor: null,
+        },
     },
-    normal: {
+    included: {
       summary: {
-        total: normalRequests,
+        total: includedRequests,
         ratio: normalRequestRatio,
-        pageviews: data.overview?.pageviews ?? normalRequests,
-        customEvents: data.overview?.customEvents ?? 0,
-        affectedSites: data.normal?.summary.affectedSites ?? 0,
-        uniqueAsns: data.normal?.summary.uniqueAsns ?? 0,
-        uniqueCountries: data.normal?.summary.uniqueCountries ?? 0,
-        avgLatencyMs: data.overview?.avgLatencyMs ?? null,
+        totalRequests,
+        includedRequests,
+        blockedRequests,
+        normalRequests,
+        suspectedBotRequests,
+        botRequests,
+        customBlockedRequests,
+        botRequestRatio,
+        blockedRequestRatio,
+        normalRequestRatio,
+        pageviews: overviewSource?.pageviews ?? includedRequests,
+        customEvents: overviewSource?.customEvents ?? 0,
+        affectedSites: includedSummary?.affectedSites ?? 0,
+        uniqueAsns: includedSummary?.uniqueAsns ?? 0,
+        uniqueCountries: includedSummary?.uniqueCountries ?? 0,
+        avgLatencyMs: overviewSource?.avgLatencyMs ?? null,
         p50LatencyMs:
-          data.overview?.p50LatencyMs ?? data.overview?.avgLatencyMs ?? null,
+          overviewSource?.p50LatencyMs ?? overviewSource?.avgLatencyMs ?? null,
         p75LatencyMs:
-          data.overview?.p75LatencyMs ?? data.overview?.p95LatencyMs ?? null,
-        p95LatencyMs: data.overview?.p95LatencyMs ?? null,
+          overviewSource?.p75LatencyMs ?? overviewSource?.p95LatencyMs ?? null,
+        p95LatencyMs: overviewSource?.p95LatencyMs ?? null,
         p99LatencyMs:
-          data.overview?.p99LatencyMs ?? data.overview?.p95LatencyMs ?? null,
-        ...(data.normal?.summary ?? {}),
+          overviewSource?.p99LatencyMs ?? overviewSource?.p95LatencyMs ?? null,
+        ...(includedSummary ?? {}),
       },
-      mapPoints: normalMapPoints,
-      events: normalEvents,
-      hasMore: data.normal?.hasMore ?? false,
-      nextCursor: data.normal?.nextCursor ?? null,
+      mapPoints: includedMapPoints,
+      events: normalizedIncludedEvents,
+      pagination: data.included?.pagination ??
+        legacyData.normal?.pagination ?? {
+          limit: BOT_EVENT_FETCH_LIMIT,
+          returned: normalizedIncludedEvents.length,
+          hasMore: false,
+          nextCursor: null,
+        },
     },
   };
+}
+
+function isInvalidRequestObservationCursorError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message.includes("request_observation_invalid_cursor") ||
+    error.message.includes("Invalid request observation page cursor")
+  );
 }
 
 export function RequestObservationClient({
@@ -661,18 +1277,26 @@ export function RequestObservationClient({
   const activeTab = normalizeRequestObservationTab(
     searchParams.get("requestTab"),
   );
-  const [loadingMore, setLoadingMore] = useState<"abnormal" | "normal" | null>(
+  const [loadingMore, setLoadingMore] = useState<"blocked" | "included" | null>(
     null,
   );
+  const ui = useMemo(
+    () => requestObservationUiLabels(locale, copy),
+    [copy, locale],
+  );
   const mapAnimationControls = useAnimationControls();
-  const observationQueryKey = [
-    "dashboard",
-    "request-observation",
-    timeWindow.from,
-    timeWindow.to,
-    timeWindow.interval,
-    timeWindow.timeZone,
-  ] as const;
+  const observationQueryKey = useMemo(
+    () =>
+      [
+        "dashboard",
+        "request-observation",
+        timeWindow.from,
+        timeWindow.to,
+        timeWindow.interval,
+        timeWindow.timeZone,
+      ] as const,
+    [timeWindow.from, timeWindow.interval, timeWindow.timeZone, timeWindow.to],
+  );
   const observationQuery = useQuery({
     queryKey: observationQueryKey,
     queryFn: ({ signal }) => fetchRequestObservation(timeWindow, signal),
@@ -681,26 +1305,36 @@ export function RequestObservationClient({
   const data = observationQuery.data ?? null;
   const loading = observationQuery.isPending;
   const refreshing = observationQuery.isFetching && !observationQuery.isPending;
-  const setData = (
-    updater:
-      | RequestObservationData
-      | null
-      | ((
-          current: RequestObservationData | null,
-        ) => RequestObservationData | null),
-  ) => {
-    queryClient.setQueryData<RequestObservationData | null>(
-      observationQueryKey,
-      (current = null) =>
-        typeof updater === "function" ? updater(current) : updater,
-    );
-  };
-
   const spanMs = Math.max(1, timeWindow.to - timeWindow.from);
   const windowDetail = formatI18nTemplate(copy.overviewLabels.windowDays, {
     days: Math.max(1, Math.ceil(spanMs / 86400000)),
   });
   const labels = copy.overviewLabels;
+  const trendLabels = useMemo(
+    () => ({
+      ...labels,
+      normalRequests: ui.normalRequests,
+      suspectedBotRequests: ui.suspectedBotRequests,
+      botRequests: ui.botRequests,
+      customBlockedRequests: ui.customBlockedRequests,
+      includedRequests: ui.includedRequests,
+      blockedRequests: ui.blockedRequests,
+      totalRequests: ui.totalRequests,
+      botRatio: ui.botRequestRatio,
+      blockedRatio: ui.blockedRequestRatio,
+      normalRatio: ui.normalRequestRatio,
+      normalTrafficShare: ui.normalTrafficShare,
+      suspectedBotTraffic: ui.suspectedBotTraffic,
+      botTraffic: ui.botTraffic,
+      customBlockedTraffic: ui.customBlockedTraffic,
+      pageview: copy.requestKindLabels.pageview,
+      leave: copy.requestKindLabels.leave,
+      visibility: copy.requestKindLabels.visibility,
+      customEvent: copy.requestKindLabels.custom_event,
+      identify: copy.requestKindLabels.identify,
+    }),
+    [copy.requestKindLabels, labels, ui],
+  );
 
   useEffect(() => {
     if (!observationQuery.isError) return;
@@ -716,117 +1350,153 @@ export function RequestObservationClient({
     observationQuery.isError,
   ]);
 
-  const loadMoreEvents = useMemo(
-    () => async (source: "abnormal" | "normal") => {
-      const section = data?.[source];
-      if (!section?.hasMore || !section.nextCursor || loadingMore !== null) {
+  const loadingMoreRef = useRef<"blocked" | "included" | null>(null);
+  const loadMoreEvents = useCallback(
+    async (source: "blocked" | "included") => {
+      if (loadingMoreRef.current !== null) return;
+
+      const currentData =
+        queryClient.getQueryData<RequestObservationData | null>(
+          observationQueryKey,
+        );
+      const section = currentData?.[source];
+      if (!section?.pagination?.hasMore || !section.pagination.nextCursor)
         return;
-      }
+
+      loadingMoreRef.current = source;
       setLoadingMore(source);
       try {
         const page = await fetchRequestObservationPage(
           timeWindow,
           source,
-          section.nextCursor,
+          section.pagination.nextCursor,
         );
-        setData((current) => {
-          if (!current || page.page.source !== source) return current;
-          if (source === "abnormal") {
+        queryClient.setQueryData<RequestObservationData | null>(
+          observationQueryKey,
+          (current) => {
+            if (!current || !Array.isArray(page.items)) {
+              return current;
+            }
+            const pageEvents = page.items.map((event) =>
+              normalizeRequestObservationEvent(
+                event as BotEvent & NormalRequestEvent,
+                source,
+              ),
+            );
+            if (source === "blocked") {
+              return {
+                ...current,
+                events: [...current.events, ...(pageEvents as BotEvent[])],
+                blocked: {
+                  ...current.blocked!,
+                  events: [
+                    ...current.blocked!.events,
+                    ...(pageEvents as BotEvent[]),
+                  ],
+                  pagination: page.pagination,
+                },
+              };
+            }
             return {
               ...current,
-              events: [...current.events, ...(page.page.events as BotEvent[])],
-              abnormal: {
-                ...current.abnormal!,
+              normalEvents: [
+                ...(current.normalEvents ?? []),
+                ...(pageEvents as NormalRequestEvent[]),
+              ],
+              included: {
+                ...current.included!,
                 events: [
-                  ...current.abnormal!.events,
-                  ...(page.page.events as BotEvent[]),
+                  ...current.included!.events,
+                  ...(pageEvents as NormalRequestEvent[]),
                 ],
-                hasMore: page.page.hasMore,
-                nextCursor: page.page.nextCursor,
+                pagination: page.pagination,
               },
             };
-          }
-          return {
-            ...current,
-            normalEvents: [
-              ...(current.normalEvents ?? []),
-              ...(page.page.events as NormalRequestEvent[]),
-            ],
-            normal: {
-              ...current.normal!,
-              events: [
-                ...current.normal!.events,
-                ...(page.page.events as NormalRequestEvent[]),
-              ],
-              hasMore: page.page.hasMore,
-              nextCursor: page.page.nextCursor,
-            },
-          };
-        });
+          },
+        );
       } catch (error) {
+        if (isInvalidRequestObservationCursorError(error)) {
+          try {
+            const refreshed = await fetchRequestObservation(timeWindow);
+            queryClient.setQueryData<RequestObservationData | null>(
+              observationQueryKey,
+              refreshed,
+            );
+          } catch (refreshError) {
+            toast.error(
+              refreshError instanceof Error
+                ? refreshError.message
+                : copy.loadFailed,
+            );
+          }
+          return;
+        }
         toast.error(error instanceof Error ? error.message : copy.loadFailed);
       } finally {
-        setLoadingMore(null);
+        if (loadingMoreRef.current === source) {
+          loadingMoreRef.current = null;
+          setLoadingMore(null);
+        }
       }
     },
-    [copy.loadFailed, data, loadingMore, timeWindow],
+    [copy.loadFailed, observationQueryKey, queryClient, timeWindow],
   );
-  const loadMoreAbnormalEvents = useCallback(() => {
-    void loadMoreEvents("abnormal");
+  const loadMoreBlockedEvents = useCallback(() => {
+    void loadMoreEvents("blocked");
   }, [loadMoreEvents]);
-  const loadMoreNormalEvents = useCallback(() => {
-    void loadMoreEvents("normal");
+  const loadMoreIncludedEvents = useCallback(() => {
+    void loadMoreEvents("included");
   }, [loadMoreEvents]);
 
   const trend = data?.trend ?? [];
-  const abnormalEvents = data?.abnormal?.events ?? data?.events ?? [];
-  const normalEvents = data?.normal?.events ?? data?.normalEvents ?? [];
-  const abnormalMapPoints = useMemo(
+  const blockedEvents = data?.blocked?.events ?? data?.events ?? [];
+  const includedEvents = data?.included?.events ?? data?.normalEvents ?? [];
+  const blockedMapPoints = useMemo(
     () =>
-      (data?.abnormal?.mapPoints ?? data?.mapPoints ?? []).map((point) => ({
+      (data?.blocked?.mapPoints ?? data?.mapPoints ?? []).map((point) => ({
         ...point,
-        source: "abnormal" as const,
-        color: ABNORMAL_POINT_COLOR,
+        source: "blocked" as const,
+        color: BLOCKED_POINT_COLOR,
       })),
     [data],
   );
-  const normalMapPoints = useMemo(
+  const includedMapPoints = useMemo(
     () =>
-      (data?.normal?.mapPoints ?? []).map((point) => ({
+      (data?.included?.mapPoints ?? []).map((point) => ({
         ...point,
-        source: "normal" as const,
-        color: NORMAL_POINT_COLOR,
+        source: "included" as const,
+        color: INCLUDED_POINT_COLOR,
       })),
     [data],
   );
   const overviewMapPoints = useMemo(
-    () => [...normalMapPoints, ...abnormalMapPoints],
-    [abnormalMapPoints, normalMapPoints],
+    () => [...includedMapPoints, ...blockedMapPoints],
+    [blockedMapPoints, includedMapPoints],
   );
   const activeMap = useMemo<RequestObservationMapConfig>(() => {
-    if (activeTab === "abnormal") {
+    if (activeTab === "blocked") {
       return {
-        key: "abnormal",
-        points: abnormalMapPoints,
-        pointColor: ABNORMAL_POINT_COLOR,
+        key: "blocked",
+        points: blockedMapPoints,
+        pointColor: BLOCKED_POINT_COLOR,
         collapseOverlappingPointColors: false,
       };
     }
-    if (activeTab === "normal") {
+    if (activeTab === "included") {
       return {
-        key: "normal",
-        points: normalMapPoints,
-        pointColor: NORMAL_POINT_COLOR,
+        key: "included",
+        points: includedMapPoints,
+        pointColor: INCLUDED_POINT_COLOR,
         collapseOverlappingPointColors: false,
       };
     }
     return {
       key: "overview",
       points: overviewMapPoints,
-      pointColor: NORMAL_POINT_COLOR,
+      pointColor: INCLUDED_POINT_COLOR,
       collapseOverlappingPointColors: true,
     };
-  }, [abnormalMapPoints, activeTab, normalMapPoints, overviewMapPoints]);
+  }, [activeTab, blockedMapPoints, includedMapPoints, overviewMapPoints]);
   const [renderedMap, setRenderedMap] =
     useState<RequestObservationMapConfig>(activeMap);
   const renderedMapRef = useRef(activeMap);
@@ -876,18 +1546,6 @@ export function RequestObservationClient({
       mapAnimationControls.stop();
     };
   }, [activeMap, mapAnimationControls]);
-  const confidenceCounts = useMemo(() => {
-    let low = 0;
-    let medium = 0;
-    let high = 0;
-    for (const event of abnormalEvents) {
-      if (event.confidence === "high") high += 1;
-      else if (event.confidence === "medium") medium += 1;
-      else low += 1;
-    }
-    return { low, medium, high };
-  }, [abnormalEvents]);
-
   const analyticsEngineDisabled =
     data?.config?.analyticsEngineDisabled === true;
   const configured = !analyticsEngineDisabled && data?.configured !== false;
@@ -924,31 +1582,31 @@ export function RequestObservationClient({
           value: "reason",
           label: copy.reason,
           columnLabel: copy.reason,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
-          value: "confidence",
-          label: copy.confidence,
-          columnLabel: copy.confidence,
-          primaryMetricLabel: copy.blocked,
+          value: "category",
+          label: copy.category,
+          columnLabel: copy.category,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "kind",
           label: copy.kind,
           columnLabel: copy.kind,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "botScoreBucket",
           label: copy.botScoreBucket,
           columnLabel: copy.botScoreBucket,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "verifiedBotCategory",
           label: copy.verifiedBotCategory,
           columnLabel: copy.verifiedBotCategory,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
       ] satisfies [
         AsyncDimensionBreakdownTab<DetectionDimensionTab>,
@@ -988,6 +1646,25 @@ export function RequestObservationClient({
         ...AsyncDimensionBreakdownTab<TargetDimensionTab>[],
       ],
     [copy, labels.requests],
+  );
+  const includedTargetTabs = useMemo(
+    () =>
+      [
+        targetTabs[0],
+        targetTabs[1],
+        {
+          value: "category",
+          label: copy.category,
+          columnLabel: copy.category,
+          primaryMetricLabel: labels.requests,
+        },
+        targetTabs[2],
+        targetTabs[3],
+      ] satisfies [
+        AsyncDimensionBreakdownTab<IncludedTargetDimensionTab>,
+        ...AsyncDimensionBreakdownTab<IncludedTargetDimensionTab>[],
+      ],
+    [copy.category, labels.requests, targetTabs],
   );
   const networkTabs = useMemo(
     () =>
@@ -1041,25 +1718,25 @@ export function RequestObservationClient({
           value: "ip",
           label: copy.ip,
           columnLabel: copy.ip,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "userAgent",
           label: copy.userAgent,
           columnLabel: copy.userAgent,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "userAgentLengthBucket",
           label: copy.userAgentLengthBucket,
           columnLabel: copy.userAgentLengthBucket,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
         {
           value: "ipPrefix",
           label: copy.ipPrefix,
           columnLabel: copy.ipPrefix,
-          primaryMetricLabel: copy.blocked,
+          primaryMetricLabel: ui.blockedRequests,
         },
       ] satisfies [
         AsyncDimensionBreakdownTab<ClientDimensionTab>,
@@ -1068,18 +1745,20 @@ export function RequestObservationClient({
     [copy],
   );
 
-  const loadAbnormalDimensionRows = useMemo(
+  const loadBlockedDimensionRows = useMemo(
     () =>
       async (
         group: "detection" | "target" | "network" | "client",
         tab: string,
+        signal?: AbortSignal,
       ) =>
         toAsyncAggregatedDimensionRows(
           await fetchRequestObservationDimension(
             timeWindow,
-            "abnormal",
+            "blocked",
             group,
             tab,
+            signal,
           ),
           group === "network"
             ? {
@@ -1098,99 +1777,128 @@ export function RequestObservationClient({
         ),
     [copy.emptyValue, locale, timeWindow],
   );
-  const loadNormalDimensionRows = useMemo(
-    () => async (group: "target" | "network", tab: string) =>
-      toAsyncAggregatedDimensionRows(
-        await fetchRequestObservationDimension(
-          timeWindow,
-          "normal",
-          group,
-          tab,
+  const loadIncludedDimensionRows = useMemo(
+    () =>
+      async (group: "target" | "network", tab: string, signal?: AbortSignal) =>
+        toAsyncAggregatedDimensionRows(
+          await fetchRequestObservationDimension(
+            timeWindow,
+            "included",
+            group,
+            tab,
+            signal,
+          ),
+          group === "network"
+            ? {
+                networkTab: tab as NetworkDimensionTab,
+                locale,
+                unknownLabel: copy.emptyValue,
+              }
+            : tab === "category"
+              ? { detectionTab: "category", copy }
+              : { targetTab: tab as TargetDimensionTab },
         ),
-        group === "network"
-          ? {
-              networkTab: tab as NetworkDimensionTab,
-              locale,
-              unknownLabel: copy.emptyValue,
-            }
-          : group === "target"
-            ? { targetTab: tab as TargetDimensionTab }
-            : undefined,
+    [copy, locale, timeWindow],
+  );
+  const loadBlockedDetection = useCallback<
+    AsyncDimensionBreakdownLoader<DetectionDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadBlockedDimensionRows("detection", tab, signal),
+        limit,
       ),
-    [copy.emptyValue, locale, timeWindow],
+    [loadBlockedDimensionRows],
   );
-  const loadAbnormalDetectionRows = useCallback(
-    (tab: DetectionDimensionTab, _signal?: AbortSignal) =>
-      loadAbnormalDimensionRows("detection", tab),
-    [loadAbnormalDimensionRows],
+  const loadBlockedTarget = useCallback<
+    AsyncDimensionBreakdownLoader<TargetDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadBlockedDimensionRows("target", tab, signal),
+        limit,
+      ),
+    [loadBlockedDimensionRows],
   );
-  const loadAbnormalTargetRows = useCallback(
-    (tab: TargetDimensionTab, _signal?: AbortSignal) =>
-      loadAbnormalDimensionRows("target", tab),
-    [loadAbnormalDimensionRows],
+  const loadBlockedNetwork = useCallback<
+    AsyncDimensionBreakdownLoader<NetworkDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadBlockedDimensionRows("network", tab, signal),
+        limit,
+      ),
+    [loadBlockedDimensionRows],
   );
-  const loadAbnormalNetworkRows = useCallback(
-    (tab: NetworkDimensionTab, _signal?: AbortSignal) =>
-      loadAbnormalDimensionRows("network", tab),
-    [loadAbnormalDimensionRows],
+  const loadBlockedClient = useCallback<
+    AsyncDimensionBreakdownLoader<ClientDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadBlockedDimensionRows("client", tab, signal),
+        limit,
+      ),
+    [loadBlockedDimensionRows],
   );
-  const loadAbnormalClientRows = useCallback(
-    (tab: ClientDimensionTab, _signal?: AbortSignal) =>
-      loadAbnormalDimensionRows("client", tab),
-    [loadAbnormalDimensionRows],
+  const loadIncludedTarget = useCallback<
+    AsyncDimensionBreakdownLoader<IncludedTargetDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadIncludedDimensionRows("target", tab, signal),
+        limit,
+      ),
+    [loadIncludedDimensionRows],
   );
-  const loadNormalTargetRows = useCallback(
-    (tab: TargetDimensionTab, _signal?: AbortSignal) =>
-      loadNormalDimensionRows("target", tab),
-    [loadNormalDimensionRows],
+  const loadIncludedNetwork = useCallback<
+    AsyncDimensionBreakdownLoader<NetworkDimensionTab>
+  >(
+    async ({ tab, limit, signal }) =>
+      asyncDimensionPage(
+        await loadIncludedDimensionRows("network", tab, signal),
+        limit,
+      ),
+    [loadIncludedDimensionRows],
   );
-  const loadNormalNetworkRows = useCallback(
-    (tab: NetworkDimensionTab, _signal?: AbortSignal) =>
-      loadNormalDimensionRows("network", tab),
-    [loadNormalDimensionRows],
-  );
-
-  const requestKey = `${timeWindow.interval}:${data?.generatedAt ?? 0}`;
+  const requestKey = `${timeWindow.from}:${timeWindow.to}:${timeWindow.interval}:${timeWindow.timeZone}:${locale}`;
   const overview = data?.overview;
-  const abnormalSummary = data?.abnormal?.summary;
-  const normalSummary = data?.normal?.summary;
-  const confidenceShareItems = useMemo(
+  const blockedSummary = data?.blocked?.summary;
+  const includedSummary = data?.included?.summary;
+  const categoryShareItems = useMemo(
     () => [
       {
         key: "normal",
-        label: labels.normalTrafficShare,
+        label: ui.normalTrafficShare,
         value: overview?.normalRequests ?? 0,
         color: NORMAL_TRAFFIC_SHARE_COLOR,
       },
       {
-        key: "low",
-        label: labels.lowConfidenceTraffic,
-        value: confidenceCounts.low,
-        color: LOW_CONFIDENCE_TRAFFIC_COLOR,
+        key: "suspected_bot",
+        label: ui.suspectedBotTraffic,
+        value: overview?.suspectedBotRequests ?? 0,
+        color: SUSPECTED_BOT_TRAFFIC_COLOR,
       },
       {
-        key: "medium",
-        label: labels.mediumConfidenceTraffic,
-        value: abnormalSummary?.mediumConfidence ?? confidenceCounts.medium,
-        color: MEDIUM_CONFIDENCE_TRAFFIC_COLOR,
+        key: "bot",
+        label: ui.botTraffic,
+        value: overview?.botRequests ?? 0,
+        color: BOT_TRAFFIC_COLOR,
       },
       {
-        key: "high",
-        label: labels.highConfidenceTraffic,
-        value: abnormalSummary?.highConfidence ?? confidenceCounts.high,
-        color: HIGH_CONFIDENCE_TRAFFIC_COLOR,
+        key: "custom_block",
+        label: ui.customBlockedTraffic,
+        value: overview?.customBlockedRequests ?? 0,
+        color: CUSTOM_BLOCKED_TRAFFIC_COLOR,
       },
     ],
     [
-      abnormalSummary?.highConfidence,
-      abnormalSummary?.mediumConfidence,
-      confidenceCounts.high,
-      confidenceCounts.low,
-      confidenceCounts.medium,
-      labels.highConfidenceTraffic,
-      labels.lowConfidenceTraffic,
-      labels.mediumConfidenceTraffic,
-      labels.normalTrafficShare,
+      overview?.botRequests,
+      overview?.customBlockedRequests,
+      overview?.suspectedBotRequests,
+      ui.customBlockedTraffic,
+      ui.botTraffic,
+      ui.normalTrafficShare,
+      ui.suspectedBotTraffic,
       overview?.normalRequests,
     ],
   );
@@ -1230,7 +1938,7 @@ export function RequestObservationClient({
           {copy.title}
         </h1>
         <p className="mt-1 max-w-prose text-sm text-foreground/75">
-          {copy.subtitle}
+          {ui.pageSubtitle}
         </p>
       </div>
       <div className="absolute right-4 top-4 z-10 md:right-6 md:top-6">
@@ -1260,41 +1968,43 @@ export function RequestObservationClient({
             <div className="grid gap-px overflow-hidden bg-border/70 md:grid-cols-2 xl:grid-cols-4">
               <MetricTile
                 icon={RiRadarLine}
-                label={labels.totalRequests}
+                label={ui.totalRequests}
                 value={numberFormat(locale, overview?.totalRequests ?? 0)}
                 detail={windowDetail}
                 loading={loading}
               />
               <MetricTile
-                icon={RiShieldCheckLine}
-                label={labels.normalRequests}
-                value={numberFormat(locale, overview?.normalRequests ?? 0)}
-                detail={percentFormat(
+                icon={RiRobot2Line}
+                label={ui.blockedRequestRatio}
+                value={percentFormat(
                   locale,
-                  overview?.normalRequestRatio ?? 0,
+                  overview?.blockedRequestRatio ?? 0,
                 )}
+                detail={`${labels.requests}: ${numberFormat(
+                  locale,
+                  overview?.blockedRequests ?? 0,
+                )}`}
                 loading={loading}
               />
               <MetricTile
                 icon={RiRobot2Line}
-                label={labels.abnormalRatio}
-                value={percentFormat(
+                label={ui.botRequestRatio}
+                value={percentFormat(locale, overview?.botRequestRatio ?? 0)}
+                detail={`${labels.requests}: ${numberFormat(
                   locale,
-                  overview?.abnormalRequestRatio ?? 0,
-                )}
-                detail={numberFormat(locale, overview?.abnormalRequests ?? 0)}
+                  overview?.botRequests ?? 0,
+                )}`}
                 loading={loading}
               />
               <MetricTile
                 icon={RiGlobalLine}
-                label={labels.p95Latency}
-                value={
-                  overview?.p95LatencyMs === null ||
-                  overview?.p95LatencyMs === undefined
-                    ? "--"
-                    : latencyFormat(locale, copy, overview.p95LatencyMs)
-                }
-                detail={labels.avgLatency}
+                label={labels.avgLatency}
+                value={latencyFormat(locale, copy, overview?.avgLatencyMs)}
+                detail={`${labels.p95Latency}: ${latencyFormat(
+                  locale,
+                  copy,
+                  overview?.p95LatencyMs,
+                )}`}
                 loading={loading}
               />
             </div>
@@ -1304,12 +2014,12 @@ export function RequestObservationClient({
         <Card>
           <CardHeader>
             <CardTitle>{labels.overviewTrendTitle}</CardTitle>
-            <CardDescription>{labels.overviewTrendDescription}</CardDescription>
+            <CardDescription>{ui.blockedTrendDescription}</CardDescription>
           </CardHeader>
           <CardContent>
             <RequestObservationTrendChart
               data={trend}
-              labels={labels}
+              labels={trendLabels}
               locale={locale}
               spanMs={spanMs}
               variant="overview"
@@ -1318,11 +2028,11 @@ export function RequestObservationClient({
           </CardContent>
         </Card>
 
-        <section className="grid gap-4 xl:grid-cols-2">
+        <section className="grid min-w-0 gap-4 xl:grid-cols-2">
           <ShareRadialCard
-            className="xl:col-span-2"
-            title={labels.confidenceShareTitle}
-            items={confidenceShareItems}
+            className="min-w-0 xl:col-span-2"
+            title={labels.categoryShareTitle}
+            items={categoryShareItems}
             maxItems={4}
             locale={locale}
             valueLabel={labels.requests}
@@ -1330,7 +2040,7 @@ export function RequestObservationClient({
             emptyLabel={copy.noData}
           />
 
-          <Card>
+          <Card className="min-w-0">
             <CardHeader>
               <CardTitle>{labels.trafficCompositionTitle}</CardTitle>
               <CardDescription>
@@ -1340,7 +2050,7 @@ export function RequestObservationClient({
             <CardContent>
               <RequestObservationTrendChart
                 data={trend}
-                labels={labels}
+                labels={trendLabels}
                 locale={locale}
                 spanMs={spanMs}
                 variant="traffic-composition"
@@ -1349,7 +2059,7 @@ export function RequestObservationClient({
             </CardContent>
           </Card>
 
-          <Card>
+          <Card className="min-w-0">
             <CardHeader>
               <CardTitle>{labels.latencyTitle}</CardTitle>
               <CardDescription>{labels.latencyDescription}</CardDescription>
@@ -1357,7 +2067,7 @@ export function RequestObservationClient({
             <CardContent>
               <RequestObservationTrendChart
                 data={trend}
-                labels={labels}
+                labels={trendLabels}
                 locale={locale}
                 spanMs={spanMs}
                 variant="latency"
@@ -1396,23 +2106,20 @@ export function RequestObservationClient({
             >
               {activeTab === "overview" ? (
                 <div className="space-y-6">{renderOverviewCharts()}</div>
-              ) : activeTab === "abnormal" ? (
+              ) : activeTab === "blocked" ? (
                 <div className="space-y-6">
                   <div className="mx-auto w-full max-w-[1400px] px-4 md:px-6">
                     <div className="space-y-6">
-                      <div className="text-sm text-muted-foreground">
-                        {labels.abnormalSubtitle}
-                      </div>
                       <Card className="py-0">
                         <CardContent className="p-0">
                           <div className="grid gap-px overflow-hidden bg-border/70 md:grid-cols-2 xl:grid-cols-4">
                             <MetricTile
                               icon={RiRobot2Line}
-                              label={labels.abnormalRequests}
+                              label={ui.blockedRequests}
                               value={numberFormat(
                                 locale,
-                                abnormalSummary?.total ??
-                                  overview?.abnormalRequests ??
+                                blockedSummary?.total ??
+                                  overview?.blockedRequests ??
                                   0,
                               )}
                               detail={windowDetail}
@@ -1420,24 +2127,29 @@ export function RequestObservationClient({
                             />
                             <MetricTile
                               icon={RiRadarLine}
-                              label={labels.abnormalRatio}
+                              label={ui.blockedRequestRatio}
                               value={percentFormat(
                                 locale,
-                                abnormalSummary?.ratio ??
-                                  overview?.abnormalRequestRatio ??
+                                blockedSummary?.ratio ??
+                                  overview?.blockedRequestRatio ??
                                   0,
                               )}
-                              detail={labels.totalRequests}
+                              detail={`${labels.requests}: ${numberFormat(
+                                locale,
+                                blockedSummary?.total ??
+                                  overview?.blockedRequests ??
+                                  0,
+                              )}`}
                               loading={loading}
                             />
                             <MetricTile
                               icon={RiShieldCheckLine}
-                              label={copy.highConfidenceBots}
+                              label={ui.botRequests}
                               value={numberFormat(
                                 locale,
-                                abnormalSummary?.highConfidence ?? 0,
+                                blockedSummary?.botRequests ?? 0,
                               )}
-                              detail={copy.confidence}
+                              detail={copy.category}
                               loading={loading}
                             />
                             <MetricTile
@@ -1445,7 +2157,7 @@ export function RequestObservationClient({
                               label={copy.affectedSites}
                               value={numberFormat(
                                 locale,
-                                abnormalSummary?.affectedSites ?? 0,
+                                blockedSummary?.affectedSites ?? 0,
                               )}
                               detail={copy.site}
                               loading={loading}
@@ -1458,16 +2170,16 @@ export function RequestObservationClient({
                         <CardHeader>
                           <CardTitle>{copy.trendTitle}</CardTitle>
                           <CardDescription>
-                            {copy.trendDescription}
+                            {ui.blockedTrendDescription}
                           </CardDescription>
                         </CardHeader>
                         <CardContent>
                           <RequestObservationTrendChart
                             data={trend}
-                            labels={labels}
+                            labels={trendLabels}
                             locale={locale}
                             spanMs={spanMs}
-                            variant="abnormal"
+                            variant="blocked"
                             className="h-[320px]"
                           />
                         </CardContent>
@@ -1478,53 +2190,53 @@ export function RequestObservationClient({
                           locale={locale}
                           messages={messages}
                           tabs={detectionTabs}
-                          loadRows={loadAbnormalDetectionRows}
+                          loader={loadBlockedDetection}
                           requestKey={`${requestKey}:detection`}
                           className="h-full"
-                          secondaryMetricLabel={copy.highConfidenceRequests}
+                          secondaryMetricLabel={ui.botRequests}
                           emptyLabel={copy.noData}
                         />
                         <AsyncDimensionBreakdownCard
                           locale={locale}
                           messages={messages}
                           tabs={targetTabs}
-                          loadRows={loadAbnormalTargetRows}
+                          loader={loadBlockedTarget}
                           requestKey={`${requestKey}:target`}
                           className="h-full"
-                          secondaryMetricLabel={copy.highConfidenceRequests}
+                          secondaryMetricLabel={ui.botRequests}
                           emptyLabel={copy.noData}
                         />
                         <AsyncDimensionBreakdownCard
                           locale={locale}
                           messages={messages}
                           tabs={networkTabs}
-                          loadRows={loadAbnormalNetworkRows}
+                          loader={loadBlockedNetwork}
                           requestKey={`${requestKey}:network`}
                           className="h-full"
-                          secondaryMetricLabel={copy.highConfidenceRequests}
+                          secondaryMetricLabel={ui.botRequests}
                           emptyLabel={copy.noData}
                         />
                         <AsyncDimensionBreakdownCard
                           locale={locale}
                           messages={messages}
                           tabs={clientTabs}
-                          loadRows={loadAbnormalClientRows}
+                          loader={loadBlockedClient}
                           requestKey={`${requestKey}:client`}
                           className="h-full"
-                          secondaryMetricLabel={copy.highConfidenceRequests}
+                          secondaryMetricLabel={ui.botRequests}
                           emptyLabel={copy.noData}
                         />
                       </section>
 
-                      <BotEventsTable
+                      <BlockedRequestsTable
                         locale={locale}
                         messages={messages}
                         copy={copy}
-                        events={abnormalEvents}
+                        events={blockedEvents}
                         loading={loading}
-                        hasMore={data?.abnormal?.hasMore ?? false}
-                        loadingMore={loadingMore === "abnormal"}
-                        onLoadMore={loadMoreAbnormalEvents}
+                        hasMore={data?.blocked?.pagination?.hasMore ?? false}
+                        loadingMore={loadingMore === "blocked"}
+                        onLoadMore={loadMoreBlockedEvents}
                         timeWindow={timeWindow}
                       />
                     </div>
@@ -1534,26 +2246,25 @@ export function RequestObservationClient({
                 <div className="space-y-6">
                   <div className="mx-auto w-full max-w-[1400px] px-4 md:px-6">
                     <div className="space-y-6">
-                      <div className="text-sm text-muted-foreground">
-                        {labels.normalSubtitle}
-                      </div>
                       <Card className="py-0">
                         <CardContent className="p-0">
                           <div className="grid gap-px overflow-hidden bg-border/70 md:grid-cols-2 xl:grid-cols-4">
                             <MetricTile
                               icon={RiShieldCheckLine}
-                              label={labels.normalRequests}
+                              label={ui.includedRequests}
                               value={numberFormat(
                                 locale,
-                                normalSummary?.total ??
-                                  overview?.normalRequests ??
+                                includedSummary?.total ??
+                                  overview?.includedRequests ??
                                   0,
                               )}
                               detail={percentFormat(
                                 locale,
-                                normalSummary?.ratio ??
-                                  overview?.normalRequestRatio ??
-                                  0,
+                                overview?.includedRequests &&
+                                  overview.totalRequests > 0
+                                  ? overview.includedRequests /
+                                      overview.totalRequests
+                                  : 0,
                               )}
                               loading={loading}
                             />
@@ -1562,7 +2273,7 @@ export function RequestObservationClient({
                               label={labels.pageviews}
                               value={numberFormat(
                                 locale,
-                                normalSummary?.pageviews ??
+                                includedSummary?.pageviews ??
                                   overview?.pageviews ??
                                   0,
                               )}
@@ -1574,28 +2285,46 @@ export function RequestObservationClient({
                               label={copy.uniqueCountries}
                               value={numberFormat(
                                 locale,
-                                normalSummary?.uniqueCountries ?? 0,
+                                includedSummary?.uniqueCountries ?? 0,
                               )}
                               detail={copy.country}
                               loading={loading}
                             />
                             <MetricTile
                               icon={RiRadarLine}
-                              label={labels.p95Latency}
-                              value={
-                                normalSummary?.p95LatencyMs === null ||
-                                normalSummary?.p95LatencyMs === undefined
-                                  ? "--"
-                                  : latencyFormat(
-                                      locale,
-                                      copy,
-                                      normalSummary.p95LatencyMs,
-                                    )
-                              }
-                              detail={labels.avgLatency}
+                              label={labels.avgLatency}
+                              value={latencyFormat(
+                                locale,
+                                copy,
+                                includedSummary?.avgLatencyMs,
+                              )}
+                              detail={`${labels.p95Latency}: ${latencyFormat(
+                                locale,
+                                copy,
+                                includedSummary?.p95LatencyMs,
+                              )}`}
                               loading={loading}
                             />
                           </div>
+                        </CardContent>
+                      </Card>
+
+                      <Card>
+                        <CardHeader>
+                          <CardTitle>{copy.trendTitle}</CardTitle>
+                          <CardDescription>
+                            {ui.includedTrendDescription}
+                          </CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                          <RequestObservationTrendChart
+                            data={trend}
+                            labels={trendLabels}
+                            locale={locale}
+                            spanMs={spanMs}
+                            variant="included"
+                            className="h-[320px]"
+                          />
                         </CardContent>
                       </Card>
 
@@ -1603,9 +2332,9 @@ export function RequestObservationClient({
                         <AsyncDimensionBreakdownCard
                           locale={locale}
                           messages={messages}
-                          tabs={targetTabs}
-                          loadRows={loadNormalTargetRows}
-                          requestKey={`${requestKey}:normal-target`}
+                          tabs={includedTargetTabs}
+                          loader={loadIncludedTarget}
+                          requestKey={`${requestKey}:included-target`}
                           className="h-full"
                           showVisitors={false}
                           emptyLabel={copy.noData}
@@ -1614,23 +2343,24 @@ export function RequestObservationClient({
                           locale={locale}
                           messages={messages}
                           tabs={networkTabs}
-                          loadRows={loadNormalNetworkRows}
-                          requestKey={`${requestKey}:normal-network`}
+                          loader={loadIncludedNetwork}
+                          requestKey={`${requestKey}:included-network`}
                           className="h-full"
                           showVisitors={false}
                           emptyLabel={copy.noData}
                         />
                       </section>
 
-                      <NormalRequestsTable
+                      <IncludedRequestsTable
                         locale={locale}
                         messages={messages}
                         copy={copy}
-                        events={normalEvents}
+                        events={includedEvents}
                         loading={loading}
-                        hasMore={data?.normal?.hasMore ?? false}
-                        loadingMore={loadingMore === "normal"}
-                        onLoadMore={loadMoreNormalEvents}
+                        hasMore={data?.included?.pagination?.hasMore ?? false}
+                        loadingMore={loadingMore === "included"}
+                        onLoadMore={loadMoreIncludedEvents}
+                        timeWindow={timeWindow}
                       />
                     </div>
                   </div>
@@ -1672,7 +2402,7 @@ async function fetchRequestObservation(
   signal?: AbortSignal,
 ): Promise<RequestObservationData> {
   const payload = await requestAdminService<RequestObservationData>(
-    "bot-analytics",
+    "request-observation",
     {
       params: {
         from: String(Math.floor(timeWindow.from)),
@@ -1689,30 +2419,34 @@ async function fetchRequestObservation(
 
 async function fetchRequestObservationPage(
   timeWindow: TimeWindow,
-  source: "abnormal" | "normal",
-  cursor: RequestDetailCursor,
+  source: "blocked" | "included",
+  cursor: string,
 ): Promise<RequestObservationPageData> {
-  return requestAdminService<RequestObservationPageData>("bot-analytics", {
-    params: {
-      from: String(Math.floor(timeWindow.from)),
-      to: String(Math.floor(timeWindow.to)),
-      interval: timeWindow.interval,
-      timeZone: timeWindow.timeZone,
-      page: source,
-      limit: String(BOT_EVENT_FETCH_LIMIT),
-      cursor: JSON.stringify(cursor),
+  return requestAdminService<RequestObservationPageData>(
+    "request-observation",
+    {
+      params: {
+        from: String(Math.floor(timeWindow.from)),
+        to: String(Math.floor(timeWindow.to)),
+        interval: timeWindow.interval,
+        timeZone: timeWindow.timeZone,
+        source,
+        limit: String(BOT_EVENT_FETCH_LIMIT),
+        cursor,
+      },
     },
-  });
+  );
 }
 
 async function fetchRequestObservationDimension(
   timeWindow: TimeWindow,
-  source: "abnormal" | "normal",
+  source: "blocked" | "included",
   group: "detection" | "target" | "network" | "client",
   tab: string,
+  signal?: AbortSignal,
 ): Promise<RequestNetworkDimensionRow[]> {
   const payload = await requestAdminService<RequestObservationDimensionData>(
-    "bot-analytics",
+    "request-observation",
     {
       params: {
         from: String(Math.floor(timeWindow.from)),
@@ -1723,6 +2457,7 @@ async function fetchRequestObservationDimension(
         dimensionGroup: group,
         dimensionTab: tab,
       },
+      signal,
     },
   );
   if (!payload.dimension) {
@@ -1731,13 +2466,11 @@ async function fetchRequestObservationDimension(
   return payload.dimension.rows;
 }
 
-async function fetchRequestObservationDetail(
-  timeWindow: TimeWindow,
-  event: BotEvent,
-  signal?: AbortSignal,
-): Promise<BotEvent | null> {
+async function fetchRequestObservationDetail<
+  T extends BotEvent | NormalRequestEvent,
+>(timeWindow: TimeWindow, event: T, signal?: AbortSignal): Promise<T | null> {
   const payload = await requestAdminService<RequestObservationDetailData>(
-    "bot-analytics",
+    "request-observation",
     {
       params: {
         from: String(Math.floor(timeWindow.from)),
@@ -1751,7 +2484,7 @@ async function fetchRequestObservationDetail(
       signal,
     },
   );
-  return payload.detail;
+  return payload.detail as T | null;
 }
 
 function compactReason(reason: string): string {
@@ -1764,6 +2497,36 @@ function botReasonLabel(
 ): string {
   const labels: Readonly<Record<string, string>> = copy.botReasonLabels;
   return labels[reason] ?? compactReason(reason);
+}
+
+function requestCategoryLabel(
+  copy: AppMessages["requestObservation"],
+  category: string,
+): string {
+  const normalized = normalizeRequestObservationCategory(category);
+  if (normalized === "normal") {
+    return nestedMessage(
+      copy,
+      ["normalRequests"],
+      nestedMessage(
+        copy,
+        ["overviewLabels", "normalRequests"],
+        "Normal requests",
+      ),
+    );
+  }
+  if (normalized === "suspected_bot") {
+    return nestedMessage(copy, ["suspectedBotRequests"], "Suspected bots");
+  }
+  if (normalized === "bot") {
+    return nestedMessage(copy, ["botRequests"], "Bot requests");
+  }
+  if (normalized === "custom_block") {
+    return nestedMessage(copy, ["customBlockedRequests"], "Custom blocks");
+  }
+  // Unknown values are kept as neutral data labels; never reinterpret them
+  // as a legacy threat level.
+  return compactReason(category);
 }
 
 function botReasonCombinationLabel(
@@ -1827,7 +2590,7 @@ function _valuesForDetectionTab(
   if (tab === "reason") {
     return event.reasons.map((reason) => botReasonLabel(copy, reason));
   }
-  if (tab === "confidence") return [event.confidence];
+  if (tab === "category") return [event.category];
   if (tab === "kind") return [event.kind];
   if (tab === "botScoreBucket") return [botScoreBucket(event.botScore)];
   return [event.verifiedBotCategory];
@@ -1876,7 +2639,7 @@ function _aggregateDimensionRows(
 ): BotDimensionRow[] {
   const rowMap = new Map<
     string,
-    { count: number; highConfidence: number; sampleEvent: BotEvent | null }
+    { count: number; botCount: number; sampleEvent: BotEvent | null }
   >();
 
   for (const event of events) {
@@ -1887,11 +2650,11 @@ function _aggregateDimensionRows(
     for (const value of normalizedValues) {
       const current = rowMap.get(value) ?? {
         count: 0,
-        highConfidence: 0,
+        botCount: 0,
         sampleEvent: event,
       };
       current.count += 1;
-      if (event.confidence === "high") current.highConfidence += 1;
+      if (event.category === "bot") current.botCount += 1;
       current.sampleEvent ??= event;
       rowMap.set(value, current);
     }
@@ -1901,13 +2664,13 @@ function _aggregateDimensionRows(
     .map(([label, row]) => ({
       label,
       count: row.count,
-      highConfidence: row.highConfidence,
+      botCount: row.botCount,
       sampleEvent: row.sampleEvent,
     }))
     .sort(
       (left, right) =>
         right.count - left.count ||
-        right.highConfidence - left.highConfidence ||
+        right.botCount - left.botCount ||
         left.label.localeCompare(right.label),
     )
     .slice(0, DIMENSION_ROW_LIMIT);
@@ -2082,7 +2845,7 @@ function toAsyncDimensionRows(
             .label
         : row.label,
     views: row.count,
-    visitors: row.highConfidence,
+    visitors: row.botCount,
     mono: row.label.includes("/") || row.label.includes(":"),
     labelAppearance:
       options?.targetTab && options.targetTab !== "pathname"
@@ -2127,7 +2890,7 @@ function _toAsyncNetworkDimensionRows(
         ? `AS${row.label}`
         : row.label || options.unknownLabel,
     count: row.count,
-    highConfidence: row.highConfidence,
+    botCount: row.botCount,
     sampleEvent: {
       country: row.country,
       region: row.region,
@@ -2153,11 +2916,13 @@ function toAsyncAggregatedDimensionRows(
       label:
         options?.detectionTab === "reason" && options.copy
           ? botReasonCombinationLabel(options.copy, row.label)
-          : options?.networkTab === "asn" && row.label
-            ? `AS${row.label}`
-            : row.label || options?.unknownLabel || "--",
+          : options?.detectionTab === "category" && options.copy
+            ? requestCategoryLabel(options.copy, row.label)
+            : options?.networkTab === "asn" && row.label
+              ? `AS${row.label}`
+              : row.label || options?.unknownLabel || "--",
       count: row.count,
-      highConfidence: row.highConfidence,
+      botCount: row.botCount,
       sampleEvent: {
         country: row.country,
         region: options?.networkTab === "region" ? row.label : row.region,
@@ -2169,6 +2934,21 @@ function toAsyncAggregatedDimensionRows(
     })),
     options,
   ).map((row, index) => ({ ...row, key: rows[index]?.key || row.key }));
+}
+
+function asyncDimensionPage(
+  items: AsyncDimensionBreakdownRow[],
+  limit: number,
+): TabbedDataTablePage<AsyncDimensionBreakdownRow> {
+  return {
+    items,
+    pagination: {
+      limit,
+      returned: items.length,
+      hasMore: false,
+      nextCursor: null,
+    },
+  };
 }
 
 function displayValue(
@@ -2321,35 +3101,39 @@ const DetailItem = memo(function DetailItem({
   );
 });
 
-function ConfidenceBlocks({
-  confidence,
+function CategoryBlocks({
+  category,
   label,
 }: {
-  confidence: string;
+  category: string;
   label?: string;
 }) {
-  const normalized = confidence.trim().toLowerCase();
+  const normalized = category.trim().toLowerCase();
   const activeCount =
-    normalized === "low"
+    normalized === "normal"
       ? 1
-      : normalized === "medium"
+      : normalized === "suspected_bot"
         ? 2
-        : normalized === "high"
+        : normalized === "bot"
           ? 3
-          : 0;
+          : normalized === "custom_block"
+            ? 3
+            : 0;
   const activeColor =
-    normalized === "low"
+    normalized === "normal"
       ? "bg-emerald-500"
-      : normalized === "medium"
+      : normalized === "suspected_bot"
         ? "bg-amber-500"
-        : normalized === "high"
+        : normalized === "bot"
           ? "bg-red-500"
-          : "";
+          : normalized === "custom_block"
+            ? "bg-muted-foreground"
+            : "";
 
   return (
     <span
       className="inline-flex items-center gap-0.5"
-      aria-label={label || confidence || undefined}
+      aria-label={label || category || undefined}
     >
       {Array.from({ length: 3 }, (_, index) => (
         <span
@@ -2429,49 +3213,29 @@ function BotRequestDetailDrawer({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const ui = useMemo(
+    () => requestObservationUiLabels(locale, copy),
+    [copy, locale],
+  );
   const empty = copy.emptyValue;
   const preview = detailEvent ?? previewEvent;
   const event = preview ?? BOT_EVENT_DETAIL_SKELETON_DATA;
   const hasEvent = Boolean(preview);
   const metadata = event ? metadataEntries(event.metadataJson) : [];
+  const requestMethod =
+    event.requestMethod ||
+    metadata.find(([key]) => key === "requestMethod")?.[1] ||
+    "";
   const eventId = event ? event.traceId || event.rayId : "";
-  const subtitle = eventId || copy.detailSubtitle;
-
-  const stopSideDrawerOverlayEvent = (
-    event: PointerEvent<HTMLDivElement> | MouseEvent<HTMLDivElement>,
-  ) => {
-    event.stopPropagation();
-    event.nativeEvent.stopImmediatePropagation();
-  };
-
-  const closeSideDrawerFromOverlay = (event: MouseEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    stopSideDrawerOverlayEvent(event);
-    onOpenChange(false);
-  };
+  const subtitle = eventId || ui.detailSubtitle;
 
   return (
     <>
-      <AppOverlay
-        layerId="request-observation-drawer"
-        open={open}
-        portal
-        zIndex={overlayZIndexFor(EVENT_RECORD_DRAWER_Z_INDEX)}
-        onPointerDown={stopSideDrawerOverlayEvent}
-        onPointerUp={stopSideDrawerOverlayEvent}
-        onClick={closeSideDrawerFromOverlay}
-      />
-      <Drawer
-        open={open}
-        onOpenChange={onOpenChange}
-        direction="right"
-        modal={false}
-      >
+      <Drawer open={open} onOpenChange={onOpenChange} direction="right">
         <DrawerContent
           data-dashboard-floating-layer="request-observation-drawer"
           className="!w-full !max-w-none sm:!w-[min(58vw,34rem)]"
           overlayClassName="hidden"
-          style={{ zIndex: EVENT_RECORD_DRAWER_Z_INDEX }}
           onFocusOutside={(event) => {
             event.preventDefault();
           }}
@@ -2483,7 +3247,7 @@ function BotRequestDetailDrawer({
           }}
         >
           <DrawerHeader className="border-b">
-            <DrawerTitle>{copy.detailTitle}</DrawerTitle>
+            <DrawerTitle>{ui.detailTitle}</DrawerTitle>
             <AutoTransition
               initial={false}
               transitionKey={loading ? "loading" : subtitle}
@@ -2511,7 +3275,7 @@ function BotRequestDetailDrawer({
             ) : (
               <div className="space-y-5">
                 <section className="space-y-3">
-                  <h3 className="text-sm font-medium">{copy.detailTitle}</h3>
+                  <h3 className="text-sm font-medium">{ui.detailTitle}</h3>
                   <AutoResizer className="w-full" duration={0.2}>
                     <AutoTransition
                       initial={false}
@@ -2536,9 +3300,20 @@ function BotRequestDetailDrawer({
                           className="flex flex-wrap items-center gap-2"
                         >
                           <Badge variant="outline">
-                            <ConfidenceBlocks
-                              confidence={event.confidence}
-                              label={displayValue(event.confidence, empty)}
+                            {event.disposition === "blocked"
+                              ? ui.blocked
+                              : event.disposition === "included"
+                                ? ui.included
+                                : empty}
+                          </Badge>
+                          <Badge variant="outline">
+                            <CategoryBlocks
+                              category={event.category}
+                              label={
+                                event.category
+                                  ? requestCategoryLabel(copy, event.category)
+                                  : empty
+                              }
                             />
                           </Badge>
                           {event.reasons.map((reason) => (
@@ -2618,10 +3393,7 @@ function BotRequestDetailDrawer({
                     <DetailItem
                       loading={loading}
                       label={copy.normalDetail.requestMethod}
-                      value={displayValue(
-                        metadata.find(([key]) => key === "requestMethod")?.[1],
-                        empty,
-                      )}
+                      value={displayValue(requestMethod, empty)}
                     />
                     <DetailItem
                       loading={loading}
@@ -2847,21 +3619,31 @@ function NormalRequestDetailDrawer({
   locale,
   messages,
   copy,
-  event,
+  previewEvent,
+  detailEvent,
+  loading,
+  error,
   open,
   onOpenChange,
 }: {
   locale: Locale;
   messages: AppMessages;
   copy: AppMessages["requestObservation"];
-  event: NormalRequestEvent | null;
+  previewEvent: NormalRequestEvent | null;
+  detailEvent: NormalRequestEvent | null;
+  loading: boolean;
+  error: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const ui = requestObservationUiLabels(locale, copy);
   const empty = copy.emptyValue;
-  const eventId = event ? event.traceId || event.rayId : "";
-  const title = copy.normalDetail.title;
-  const subtitle = eventId || copy.normalDetail.subtitle;
+  const preview = detailEvent ?? previewEvent;
+  const event = preview ?? NORMAL_REQUEST_DETAIL_SKELETON_DATA;
+  const hasEvent = Boolean(preview);
+  const eventId = preview ? requestObservationDetailId(preview) : "";
+  const title = ui.detailTitle;
+  const subtitle = eventId || ui.detailSubtitle;
   const requestMethodLabel = copy.normalDetail.requestMethod;
   const edgeLatencyLabel = copy.normalDetail.edgeLatency;
   const eventAtLabel = copy.normalDetail.eventAt;
@@ -2869,41 +3651,13 @@ function NormalRequestDetailDrawer({
   const continentLabel = copy.normalDetail.continent;
   const metadata = event ? metadataEntries(event.metadataJson) : [];
 
-  const stopSideDrawerOverlayEvent = (
-    event: PointerEvent<HTMLDivElement> | MouseEvent<HTMLDivElement>,
-  ) => {
-    event.stopPropagation();
-    event.nativeEvent.stopImmediatePropagation();
-  };
-
-  const closeSideDrawerFromOverlay = (event: MouseEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    stopSideDrawerOverlayEvent(event);
-    onOpenChange(false);
-  };
-
   return (
     <>
-      <AppOverlay
-        layerId="request-observation-normal-drawer"
-        open={open}
-        portal
-        zIndex={overlayZIndexFor(EVENT_RECORD_DRAWER_Z_INDEX)}
-        onPointerDown={stopSideDrawerOverlayEvent}
-        onPointerUp={stopSideDrawerOverlayEvent}
-        onClick={closeSideDrawerFromOverlay}
-      />
-      <Drawer
-        open={open}
-        onOpenChange={onOpenChange}
-        direction="right"
-        modal={false}
-      >
+      <Drawer open={open} onOpenChange={onOpenChange} direction="right">
         <DrawerContent
           data-dashboard-floating-layer="request-observation-normal-drawer"
           className="!w-full !max-w-none sm:!w-[min(58vw,34rem)]"
           overlayClassName="hidden"
-          style={{ zIndex: EVENT_RECORD_DRAWER_Z_INDEX }}
           onFocusOutside={(event) => {
             event.preventDefault();
           }}
@@ -2918,17 +3672,25 @@ function NormalRequestDetailDrawer({
             <DrawerTitle>{title}</DrawerTitle>
             <AutoTransition
               initial={false}
-              transitionKey={eventId || "ready"}
+              transitionKey={loading ? "loading" : eventId || "ready"}
               duration={0.18}
               type="fade"
               presenceMode="wait"
               className="h-5"
             >
-              <DrawerDescription key="ready">{subtitle}</DrawerDescription>
+              {loading ? (
+                <Skeleton key="loading" className="h-4 w-44" />
+              ) : (
+                <DrawerDescription key="ready">{subtitle}</DrawerDescription>
+              )}
             </AutoTransition>
           </DrawerHeader>
           <DrawerScrollArea contentClassName="p-4">
-            {!event ? (
+            {error ? (
+              <div className="flex h-64 items-center justify-center text-center text-sm text-muted-foreground">
+                {error}
+              </div>
+            ) : !hasEvent && !loading ? (
               <div className="flex h-64 items-center justify-center text-muted-foreground">
                 {copy.noData}
               </div>
@@ -2936,20 +3698,38 @@ function NormalRequestDetailDrawer({
               <div className="space-y-5">
                 <section className="space-y-3">
                   <h3 className="text-sm font-medium">{title}</h3>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">
+                      {event.disposition === "blocked"
+                        ? ui.blocked
+                        : event.disposition === "included"
+                          ? ui.included
+                          : empty}
+                    </Badge>
+                    <Badge variant="outline">
+                      {event.category
+                        ? requestCategoryLabel(copy, event.category)
+                        : empty}
+                    </Badge>
+                  </div>
                   <dl className="grid gap-3 sm:grid-cols-2">
                     <DetailItem
+                      loading={loading}
                       label={receivedAtLabel}
                       value={shortDateTimeWithSeconds(locale, event.receivedAt)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={eventAtLabel}
                       value={shortDateTimeWithSeconds(locale, event.eventAt)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.kind}
                       value={requestKindLabel(copy, event.kind)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={requestMethodLabel}
                       value={displayValue(event.requestMethod, empty)}
                     />
@@ -2962,6 +3742,7 @@ function NormalRequestDetailDrawer({
                   <h3 className="text-sm font-medium">{copy.request}</h3>
                   <dl className="grid gap-3 sm:grid-cols-2">
                     <DetailItem
+                      loading={loading}
                       label={copy.site}
                       value={
                         <div className="min-w-0">
@@ -2978,6 +3759,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={messages.realtime.siteId}
                       value={
                         <span className="break-all font-mono text-xs">
@@ -2986,6 +3768,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label={copy.origin}
                       value={
@@ -2995,6 +3778,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label={copy.hostname}
                       value={
@@ -3004,6 +3788,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label={copy.pathname}
                       value={
@@ -3021,10 +3806,12 @@ function NormalRequestDetailDrawer({
                   <h3 className="text-sm font-medium">{copy.edge}</h3>
                   <dl className="grid gap-3 sm:grid-cols-2">
                     <DetailItem
+                      loading={loading}
                       label={edgeLatencyLabel}
                       value={latencyFormat(locale, copy, event.edgeLatencyMs)}
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label={copy.location}
                       value={
@@ -3038,14 +3825,17 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.colo}
                       value={displayValue(event.colo, empty)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.network}
                       value={displayValue(formatNormalAsn(event), empty)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={messages.common.latitude}
                       value={
                         event.latitude === null ||
@@ -3055,6 +3845,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={messages.common.longitude}
                       value={
                         event.longitude === null ||
@@ -3064,6 +3855,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={continentLabel}
                       value={displayValue(event.continent, empty)}
                     />
@@ -3076,7 +3868,7 @@ function NormalRequestDetailDrawer({
                   country={event.country || ""}
                   latitude={event.latitude}
                   longitude={event.longitude}
-                  loading={false}
+                  loading={loading}
                 />
 
                 <Separator />
@@ -3085,6 +3877,7 @@ function NormalRequestDetailDrawer({
                   <h3 className="text-sm font-medium">{copy.client}</h3>
                   <dl className="grid gap-3 sm:grid-cols-2">
                     <DetailItem
+                      loading={loading}
                       label={copy.userAgentLengthBucket}
                       value={
                         event.userAgentLength
@@ -3093,6 +3886,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.userAgentLength}
                       value={
                         event.userAgentLength > 0
@@ -3101,6 +3895,14 @@ function NormalRequestDetailDrawer({
                       }
                     />
                   </dl>
+                  <div className="space-y-1">
+                    <div className="text-muted-foreground">
+                      {copy.fullUserAgent}
+                    </div>
+                    <div className="break-all rounded-none border bg-muted/30 p-3 font-mono text-xs text-muted-foreground">
+                      {displayValue(event.userAgent, empty)}
+                    </div>
+                  </div>
                 </section>
 
                 <Separator />
@@ -3109,6 +3911,7 @@ function NormalRequestDetailDrawer({
                   <h3 className="text-sm font-medium">{copy.identifiers}</h3>
                   <dl className="grid gap-3 sm:grid-cols-2">
                     <DetailItem
+                      loading={loading}
                       wide
                       label={copy.id}
                       value={
@@ -3118,6 +3921,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label="Trace ID"
                       value={
@@ -3127,6 +3931,7 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       wide
                       label="Ray ID"
                       value={
@@ -3136,10 +3941,12 @@ function NormalRequestDetailDrawer({
                       }
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.country}
                       value={displayValue(event.country, empty)}
                     />
                     <DetailItem
+                      loading={loading}
                       label={copy.asn}
                       value={displayValue(
                         event.asn ? `AS${event.asn}` : "",
@@ -3158,6 +3965,7 @@ function NormalRequestDetailDrawer({
                         {metadata.map(([key, value]) => (
                           <DetailItem
                             key={key}
+                            loading={loading}
                             inline
                             label={key}
                             value={
@@ -3180,7 +3988,7 @@ function NormalRequestDetailDrawer({
   );
 }
 
-const BotEventsTable = memo(function BotEventsTable({
+const BlockedRequestsTable = memo(function BlockedRequestsTable({
   locale,
   messages,
   copy,
@@ -3201,6 +4009,10 @@ const BotEventsTable = memo(function BotEventsTable({
   onLoadMore: () => void;
   timeWindow: TimeWindow;
 }) {
+  const ui = useMemo(
+    () => requestObservationUiLabels(locale, copy),
+    [copy, locale],
+  );
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [selectedEvent, setSelectedEvent] = useState<BotEvent | null>(null);
@@ -3209,7 +4021,9 @@ const BotEventsTable = memo(function BotEventsTable({
   const [detailParam, setDetailParam] = useState(
     () => searchParams.get("detail")?.trim() || "",
   );
-  const selectedEventId = selectedEvent ? botEventDetailId(selectedEvent) : "";
+  const selectedEventId = selectedEvent
+    ? requestObservationDetailId(selectedEvent)
+    : "";
   const selectedEventCacheKey = selectedEventId
     ? selectedEventId
     : selectedEvent
@@ -3227,7 +4041,11 @@ const BotEventsTable = memo(function BotEventsTable({
     ],
     queryFn: ({ signal }) =>
       selectedEvent
-        ? fetchRequestObservationDetail(timeWindow, selectedEvent, signal)
+        ? fetchRequestObservationDetail<BotEvent>(
+            timeWindow,
+            selectedEvent,
+            signal,
+          )
         : null,
     enabled:
       typeof window !== "undefined" && drawerOpen && Boolean(selectedEvent),
@@ -3285,7 +4103,7 @@ const BotEventsTable = memo(function BotEventsTable({
       setDrawerOpen(true);
 
       if (options?.syncUrl !== false) {
-        const detailId = botEventDetailId(event);
+        const detailId = requestObservationDetailId(event);
         if (detailId) updateDetailParam(detailId, "push");
       }
     },
@@ -3310,7 +4128,10 @@ const BotEventsTable = memo(function BotEventsTable({
       (event) => event.traceId === detailParam || event.rayId === detailParam,
     );
     if (!matchingEvent) return;
-    if (selectedEvent && botEventDetailId(selectedEvent) === detailParam) {
+    if (
+      selectedEvent &&
+      requestObservationDetailId(selectedEvent) === detailParam
+    ) {
       setDrawerOpen(true);
       return;
     }
@@ -3327,7 +4148,7 @@ const BotEventsTable = memo(function BotEventsTable({
   );
 
   const columnDefinitions = useMemo<
-    readonly AnalyticsTableColumnDefinition<AbnormalRequestTableColumnId>[]
+    readonly AnalyticsTableColumnDefinition<BlockedRequestTableColumnId>[]
   >(
     () => [
       { id: "id", label: copy.id, required: true },
@@ -3335,7 +4156,7 @@ const BotEventsTable = memo(function BotEventsTable({
       { id: "site", label: copy.site, required: true },
       { id: "kind", label: copy.kind },
       { id: "reason", label: copy.reason },
-      { id: "confidence", label: copy.confidence },
+      { id: "category", label: copy.category },
       { id: "network", label: copy.network },
       { id: "ip", label: copy.ip },
       { id: "location", label: copy.location },
@@ -3351,16 +4172,14 @@ const BotEventsTable = memo(function BotEventsTable({
       "insightflare:analytics-table-columns:request-observation-abnormal",
     columns: columnDefinitions,
   });
-  const headers = useMemo<Record<AbnormalRequestTableColumnId, ReactNode>>(
+  const headers = useMemo<Record<BlockedRequestTableColumnId, ReactNode>>(
     () => ({
       id: <TableHead className="pl-4">{copy.id}</TableHead>,
       time: <TableHead className="text-center">{copy.time}</TableHead>,
       site: <TableHead>{copy.site}</TableHead>,
       kind: <TableHead>{copy.kind}</TableHead>,
       reason: <TableHead>{copy.reason}</TableHead>,
-      confidence: (
-        <TableHead className="text-center">{copy.confidence}</TableHead>
-      ),
+      category: <TableHead className="text-center">{copy.category}</TableHead>,
       botScore: <TableHead className="text-right">{copy.botScore}</TableHead>,
       verifiedBotCategory: <TableHead>{copy.verifiedBotCategory}</TableHead>,
       network: <TableHead>{copy.network}</TableHead>,
@@ -3383,10 +4202,7 @@ const BotEventsTable = memo(function BotEventsTable({
   );
   const renderRow = useCallback(
     (event: BotEvent) => {
-      const reasonLabel = botReasonLabel(
-        copy,
-        event.reasons[0] || event.confidence || "",
-      );
+      const reasonLabel = botReasonLabel(copy, event.reasons[0] || "");
       const reasonItems =
         event.reasons.length > 0
           ? event.reasons.map((reason, index) => {
@@ -3406,7 +4222,9 @@ const BotEventsTable = memo(function BotEventsTable({
             ];
       const eventId = event.traceId || event.rayId || "";
       const kindLabel = requestKindLabel(copy, event.kind);
-      const confidenceLabel = event.confidence || emptyValue(copy);
+      const categoryLabel = event.category
+        ? requestCategoryLabel(copy, event.category)
+        : emptyValue(copy);
       const siteLabel =
         event.siteName || event.siteDomain || event.siteId || emptyValue(copy);
       const siteCopyValue =
@@ -3427,7 +4245,7 @@ const BotEventsTable = memo(function BotEventsTable({
         event.verifiedBotCategory || undefined;
       const pathnameLabel = event.pathname || "/";
       const userAgentLabel = event.userAgent || emptyValue(copy);
-      const cells: Record<AbnormalRequestTableColumnId, ReactNode> = {
+      const cells: Record<BlockedRequestTableColumnId, ReactNode> = {
         id: (
           <TableCell className="pl-4 max-w-36">
             <div className="flex w-28 min-w-0 items-center gap-2">
@@ -3523,26 +4341,23 @@ const BotEventsTable = memo(function BotEventsTable({
             </AnalyticsDetailsTooltipTarget>
           </TableCell>
         ),
-        confidence: (
+        category: (
           <TableCell className="max-w-36 text-center">
             <AnalyticsDetailsTooltipTarget
               className="inline-flex"
               locale={locale}
               request={{
-                key: `request-observation-abnormal-confidence:${eventId}:${event.confidence}`,
+                key: `request-observation-abnormal-category:${eventId}:${event.category}`,
                 items: [
                   {
-                    label: copy.confidence,
-                    value: confidenceLabel,
-                    copyValue: event.confidence || undefined,
+                    label: copy.category,
+                    value: categoryLabel,
+                    copyValue: event.category || undefined,
                   },
                 ],
               }}
             >
-              <ConfidenceBlocks
-                confidence={event.confidence}
-                label={event.confidence || "--"}
-              />
+              <CategoryBlocks category={event.category} label={categoryLabel} />
             </AnalyticsDetailsTooltipTarget>
           </TableCell>
         ),
@@ -3748,10 +4563,10 @@ const BotEventsTable = memo(function BotEventsTable({
           <div>
             <h2 className="inline-flex items-center gap-2 text-sm font-medium">
               <RiFileList3Line className="size-4 shrink-0" />
-              {copy.recentTitle}
+              {ui.recentBlockedTitle}
             </h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              {copy.recentDescription}
+              {ui.recentBlockedDescription}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -3764,11 +4579,6 @@ const BotEventsTable = memo(function BotEventsTable({
               onReset={tableColumns.reset}
               labels={messages.common.tableColumns}
             />
-            <div className="text-xs text-muted-foreground">
-              {!loading && events.length > 0 && !hasMore
-                ? copy.recentLoadedAll
-                : ""}
-            </div>
           </div>
         </div>
 
@@ -3862,14 +4672,16 @@ function _aggregateNormalDimensionRows(
     .map(([label, row]) => ({
       label,
       count: row.count,
-      highConfidence: 0,
+      botCount: 0,
       sampleEvent: row.sampleEvent
         ? ({
             ...row.sampleEvent,
-            confidence: "",
+            category: "",
+            disposition: "included",
             reasons: [],
             ip: "",
             userAgent: "",
+            requestMethod: "",
             verifiedBotCategory: "",
             botScore: null,
             metadataJson: "",
@@ -3883,7 +4695,7 @@ function _aggregateNormalDimensionRows(
     .slice(0, DIMENSION_ROW_LIMIT);
 }
 
-const NormalRequestsTable = memo(function NormalRequestsTable({
+const IncludedRequestsTable = memo(function IncludedRequestsTable({
   locale,
   messages,
   copy,
@@ -3892,6 +4704,7 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
   hasMore,
   loadingMore,
   onLoadMore,
+  timeWindow,
 }: {
   locale: Locale;
   messages: AppMessages;
@@ -3901,21 +4714,63 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
   hasMore: boolean;
   loadingMore: boolean;
   onLoadMore: () => void;
+  timeWindow: TimeWindow;
   requestKey?: string;
 }) {
+  const ui = useMemo(
+    () => requestObservationUiLabels(locale, copy),
+    [copy, locale],
+  );
   const [selectedEvent, setSelectedEvent] = useState<NormalRequestEvent | null>(
     null,
   );
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const selectedEventId = selectedEvent
+    ? requestObservationDetailId(selectedEvent)
+    : "";
+  const selectedEventCacheKey = selectedEventId
+    ? selectedEventId
+    : selectedEvent
+      ? `${selectedEvent.siteId}:${selectedEvent.pathname}:${selectedEvent.receivedAt}`
+      : "";
+  const detailQuery = useQuery({
+    queryKey: [
+      "dashboard",
+      "request-observation-detail",
+      selectedEventCacheKey,
+      timeWindow.from,
+      timeWindow.to,
+      timeWindow.interval,
+      timeWindow.timeZone,
+    ],
+    queryFn: ({ signal }) =>
+      selectedEvent
+        ? fetchRequestObservationDetail<NormalRequestEvent>(
+            timeWindow,
+            selectedEvent,
+            signal,
+          )
+        : null,
+    enabled:
+      typeof window !== "undefined" && drawerOpen && Boolean(selectedEvent),
+    retry: false,
+  });
+  const detailEvent = detailQuery.data ?? null;
+  const detailLoading = detailQuery.isPending;
+  const detailError = detailQuery.isError
+    ? detailQuery.error instanceof Error
+      ? detailQuery.error.message
+      : "load_request_observation_detail_failed"
+    : null;
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => window.clearInterval(interval);
   }, []);
 
-  const title = copy.recentNormal.title;
-  const description = copy.recentNormal.description;
+  const title = ui.recentIncludedTitle;
+  const description = ui.recentIncludedDescription;
   const openEvent = useCallback((event: NormalRequestEvent) => {
     setSelectedEvent(event);
     setDrawerOpen(true);
@@ -3939,6 +4794,7 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
       { id: "time", label: copy.time, required: true },
       { id: "site", label: copy.site, required: true },
       { id: "kind", label: copy.kind },
+      { id: "category", label: copy.category },
       { id: "requestMethod", label: copy.normalDetail.requestMethod },
       { id: "hostname", label: copy.hostname },
       { id: "network", label: copy.network },
@@ -3960,6 +4816,7 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
       time: <TableHead className="text-center">{copy.time}</TableHead>,
       site: <TableHead>{copy.site}</TableHead>,
       kind: <TableHead>{copy.kind}</TableHead>,
+      category: <TableHead className="text-center">{copy.category}</TableHead>,
       requestMethod: (
         <TableHead className="text-center">
           {copy.normalDetail.requestMethod}
@@ -3992,6 +4849,9 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
     (event: NormalRequestEvent) => {
       const eventId = event.traceId || event.rayId || "";
       const kindLabel = requestKindLabel(copy, event.kind);
+      const categoryLabel = event.category
+        ? requestCategoryLabel(copy, event.category)
+        : emptyValue(copy);
       const requestMethodLabel = event.requestMethod || emptyValue(copy);
       const siteLabel =
         event.siteName || event.siteDomain || event.siteId || emptyValue(copy);
@@ -4092,6 +4952,26 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
               }}
             >
               <span className="truncate">{kindLabel}</span>
+            </AnalyticsDetailsTooltipTarget>
+          </TableCell>
+        ),
+        category: (
+          <TableCell className="max-w-36 text-center">
+            <AnalyticsDetailsTooltipTarget
+              className="inline-flex"
+              locale={locale}
+              request={{
+                key: `request-observation-included-category:${eventId}:${event.category}`,
+                items: [
+                  {
+                    label: copy.category,
+                    value: categoryLabel,
+                    copyValue: event.category || undefined,
+                  },
+                ],
+              }}
+            >
+              <CategoryBlocks category={event.category} label={categoryLabel} />
             </AnalyticsDetailsTooltipTarget>
           </TableCell>
         ),
@@ -4328,11 +5208,6 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
               onReset={tableColumns.reset}
               labels={messages.common.tableColumns}
             />
-            <div className="text-xs text-muted-foreground">
-              {!loading && events.length > 0 && !hasMore
-                ? copy.recentLoadedAll
-                : ""}
-            </div>
           </div>
         </div>
 
@@ -4360,7 +5235,10 @@ const NormalRequestsTable = memo(function NormalRequestsTable({
         locale={locale}
         messages={messages}
         copy={copy}
-        event={selectedEvent}
+        previewEvent={selectedEvent}
+        detailEvent={detailEvent}
+        loading={detailLoading}
+        error={detailError}
         open={drawerOpen}
         onOpenChange={setDrawerOpen}
       />

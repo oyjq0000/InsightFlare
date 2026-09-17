@@ -2,6 +2,7 @@ import {
   type CSSProperties,
   memo,
   type ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -17,10 +18,15 @@ import {
   RiPulseLine,
   RiTimeLine,
 } from "@remixicon/react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 
 import {
+  AnalyticsTableColumnSettings,
+  useAnalyticsTableColumns,
+} from "@/components/dashboard/analytics-table-column-settings";
+import {
   AsyncDimensionBreakdownCard,
+  type AsyncDimensionBreakdownLoader,
   type AsyncDimensionBreakdownRow,
 } from "@/components/dashboard/async-dimension-breakdown-card";
 import { useDashboardQueryControls } from "@/components/dashboard/dashboard-query-provider";
@@ -36,6 +42,7 @@ import {
   OsMeta,
   ReferrerMeta,
   VisitorAvatar,
+  visitorDisplayName,
 } from "@/components/dashboard/journey-display";
 import {
   JourneyGeoLocationCard,
@@ -43,16 +50,18 @@ import {
 } from "@/components/dashboard/journey-geo-location-card";
 import { LazyGeoCityBreadcrumbLabel } from "@/components/dashboard/lazy-geo-location-label";
 import {
+  createSessionTableColumnDefinitions,
+  SESSION_TABLE_COLUMNS_STORAGE_KEY,
   type SessionSortKey,
   type SessionSortState,
   SessionsTableCard,
+  type SessionsTableLabels,
 } from "@/components/dashboard/sessions-table-card";
 import {
   useDetailDrawerClose,
   useDetailDrawerReady,
 } from "@/components/dashboard/site-pages/detail-drawer";
 import { EventDetailDrawer } from "@/components/dashboard/site-pages/event-detail-drawer";
-import { NESTED_DETAIL_DRAWER_Z_INDEX } from "@/components/dashboard/site-pages/floating-layer";
 import {
   OverviewPagesSection,
   type OverviewPagesSectionCardData,
@@ -61,6 +70,7 @@ import type {
   VisitorDetailMapTheme,
   VisitorLocationPoint,
 } from "@/components/dashboard/site-pages/visitor-detail-map-stage";
+import { useInfiniteTableSentinel } from "@/components/dashboard/use-infinite-table-sentinel";
 import { useTheme } from "@/components/theme-provider";
 import { AutoResizer } from "@/components/ui/auto-resizer";
 import { AutoTransition } from "@/components/ui/auto-transition";
@@ -74,9 +84,16 @@ import {
 import { Clickable } from "@/components/ui/clickable";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   fetchEventRecordDetail,
   fetchJourneyEventDetail,
   fetchVisitorDetail,
+  fetchVisitorEvents,
+  fetchVisitorSessions,
   type OverviewTabRows,
 } from "@/lib/dashboard/client-data";
 import { EMPTY_DASHBOARD_FILTER_DOCUMENT } from "@/lib/dashboard/filter-state";
@@ -87,6 +104,7 @@ import {
   percentFormat,
 } from "@/lib/dashboard/format";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
+import { loadLocalTablePage } from "@/lib/dashboard/table-loader";
 import { zonedParts } from "@/lib/dashboard/time-zone";
 import dynamic from "@/lib/dynamic";
 import type {
@@ -127,6 +145,8 @@ function createVisitorDetailPlaceholder(visitorId: string): VisitorDetail {
   return {
     visitor: {
       visitorId,
+      userId: "",
+      userName: "",
       firstSeenAt: 0,
       lastSeenAt: 0,
       views: 0,
@@ -264,8 +284,7 @@ interface VisitorActivityDayItem {
 }
 
 type VisitorActivityCalendarCell =
-  | { type: "empty"; key: string }
-  | VisitorActivityCalendarDayCell;
+  { type: "empty"; key: string } | VisitorActivityCalendarDayCell;
 
 interface VisitorActivityCalendarDayCell extends VisitorActivityDayItem {
   type: "day";
@@ -1109,6 +1128,11 @@ const VisitorMapHero = memo(function VisitorMapHero({
   const { resolvedTheme } = useTheme();
   const effectiveTheme: VisitorDetailMapTheme =
     resolvedTheme === "dark" ? "dark" : "light";
+  const displayName = visitorDisplayName(
+    visitor.userName,
+    visitor.userId,
+    labels.anonymous,
+  );
   const points = useMemo(
     () => (modalReady ? visitorLocationPoints(sessions) : []),
     [modalReady, sessions],
@@ -1135,7 +1159,6 @@ const VisitorMapHero = memo(function VisitorMapHero({
             enableHoverScale={false}
             tapScale={0.98}
             aria-label={labels.back}
-            title={labels.back}
             onClick={onBack}
           >
             <RiArrowLeftLine className="size-3.5" />
@@ -1146,7 +1169,6 @@ const VisitorMapHero = memo(function VisitorMapHero({
             href={backHref}
             className="inline-flex items-center gap-1 text-xs text-foreground/80 outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/60"
             aria-label={labels.back}
-            title={labels.back}
           >
             <RiArrowLeftLine className="size-3.5" />
             {labels.back}
@@ -1178,7 +1200,7 @@ const VisitorMapHero = memo(function VisitorMapHero({
             <VisitorAvatar seed={visitor.visitorId} className="size-12" />
             <div className="min-w-0">
               <h1 className="min-w-0 truncate text-2xl font-semibold tracking-tight text-foreground">
-                {labels.anonymous}
+                {displayName}
               </h1>
               <p className="mt-1 truncate font-mono text-[11px] text-foreground/70">
                 {labels.lastSeen}:{" "}
@@ -1219,6 +1241,23 @@ const VisitorMetaPanel = memo(function VisitorMetaPanel({
     <Card className="py-0">
       <CardContent className="p-0">
         <div className="grid grid-cols-2 gap-px overflow-hidden bg-border/70 text-xs text-muted-foreground xl:grid-cols-4">
+          <SummaryGridItem
+            label={labels.userName}
+            loading={loading}
+            value={visitor.userName || messages.common.unknown}
+          />
+          <SummaryGridItem
+            label={labels.userId}
+            mono
+            loading={loading}
+            value={visitor.userId || messages.common.unknown}
+          />
+          <SummaryGridItem
+            label={labels.visitorId}
+            mono
+            loading={loading}
+            value={visitor.visitorId || messages.common.unknown}
+          />
           <SummaryGridItem
             label={labels.totalDuration}
             prominent
@@ -1579,24 +1618,27 @@ const ActivityGrid = memo(function ActivityGrid({
           className={cn(cellClassName, "rounded-[2px] ring-1 ring-border/70")}
         />
       ) : (
-        <span
-          key={cell.key}
-          title={cell.title}
-          className={cn(
-            cellClassName,
-            "rounded-[2px] ring-1 ring-border/70",
-            cell.count === 0 && "bg-muted",
-          )}
-          style={
-            cell.count > 0
-              ? {
-                  backgroundColor: `rgba(16, 185, 129, ${
-                    0.28 + intensity * 0.72
-                  })`,
-                }
-              : undefined
-          }
-        />
+        <Tooltip key={cell.key}>
+          <TooltipTrigger asChild>
+            <span
+              className={cn(
+                cellClassName,
+                "rounded-[2px] ring-1 ring-border/70",
+                cell.count === 0 && "bg-muted",
+              )}
+              style={
+                cell.count > 0
+                  ? {
+                      backgroundColor: `rgba(16, 185, 129, ${
+                        0.28 + intensity * 0.72
+                      })`,
+                    }
+                  : undefined
+              }
+            />
+          </TooltipTrigger>
+          <TooltipContent>{cell.title}</TooltipContent>
+        </Tooltip>
       );
     });
   const renderActivityMonthLabels = (
@@ -1720,7 +1762,6 @@ const VisitorEventCard = memo(function VisitorEventCard({
       tapScale={0.985}
       duration={0.14}
       aria-label={eventDisplayTitle(labels, event)}
-      title={eventDisplayTitle(labels, event)}
     >
       <Card size="sm" className="border border-foreground/10 py-0 ring-0">
         <CardContent className="p-0">
@@ -1819,6 +1860,9 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
   messages,
   labels,
   events,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
   siteBasePath,
   timeZone,
   onOpenSession,
@@ -1829,6 +1873,9 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
   messages: AppMessages;
   labels: Labels;
   events: JourneyEvent[];
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
   siteBasePath: string;
   timeZone: string;
   onOpenSession?: (sessionId: string) => void;
@@ -1846,6 +1893,27 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
       }),
     [events],
   );
+  const eventContentKey = loading ? "loading" : "content";
+  const loadMoreInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!loadingMore || !hasMore) loadMoreInFlightRef.current = false;
+  }, [hasMore, loadingMore]);
+
+  const loadMore = useCallback(() => {
+    if (!hasMore || loadingMore || loadMoreInFlightRef.current || !onLoadMore) {
+      return;
+    }
+    loadMoreInFlightRef.current = true;
+    onLoadMore();
+  }, [hasMore, loadingMore, onLoadMore]);
+
+  const loadMoreSentinelRef = useInfiniteTableSentinel({
+    enabled: Boolean(onLoadMore) && !loading && !loadingMore && hasMore,
+    onReachEnd: loadMore,
+    rootMargin: "0px",
+    triggerDistance: 0,
+  });
 
   return (
     <Card>
@@ -1860,13 +1928,7 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
         <AutoResizer duration={0.24}>
           <AutoTransition
             initial={false}
-            transitionKey={
-              loading
-                ? "loading"
-                : chronologicalEvents.length > 0
-                  ? chronologicalEvents.map((event) => event.id).join(":")
-                  : "empty"
-            }
+            transitionKey={eventContentKey}
             duration={0.18}
             type="fade"
             presenceMode="wait"
@@ -1877,13 +1939,10 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
                   <VisitorEventSkeletonCard key={`event-skeleton-${index}`} />
                 ))}
               </div>
-            ) : chronologicalEvents.length === 0 ? (
+            ) : chronologicalEvents.length === 0 && !hasMore ? (
               <EmptyState key="empty">{labels.emptyEvents}</EmptyState>
             ) : (
-              <div
-                key={chronologicalEvents.map((event) => event.id).join(":")}
-                className="space-y-1.5"
-              >
+              <div key={eventContentKey} className="space-y-1.5">
                 {chronologicalEvents.map((event, index) => (
                   <VisitorEventCard
                     key={event.id}
@@ -1903,6 +1962,15 @@ const VisitDetailsCard = memo(function VisitDetailsCard({
                     }
                   />
                 ))}
+                {hasMore ? (
+                  <div
+                    ref={loadMoreSentinelRef}
+                    aria-hidden="true"
+                    className="min-h-[58px]"
+                  >
+                    <VisitorEventSkeletonCard />
+                  </div>
+                ) : null}
               </div>
             )}
           </AutoTransition>
@@ -1942,6 +2010,9 @@ const ActivityAndSessionsSection = memo(function ActivityAndSessionsSection({
   siteBasePath,
   timeZone,
   onOpenSession,
+  hasMoreSessions = false,
+  loadingMoreSessions = false,
+  onLoadMoreSessions,
   loading = false,
 }: {
   locale: Locale;
@@ -1951,15 +2022,54 @@ const ActivityAndSessionsSection = memo(function ActivityAndSessionsSection({
   siteBasePath: string;
   timeZone: string;
   onOpenSession?: (sessionId: string) => void;
+  hasMoreSessions?: boolean;
+  loadingMoreSessions?: boolean;
+  onLoadMoreSessions?: () => void;
   loading?: boolean;
 }) {
   const [sessionSort, setSessionSort] =
     useState<SessionSortState>(VISITOR_SESSION_SORT);
+  const sessionTableLabels = useMemo<SessionsTableLabels>(
+    () => ({
+      title: "",
+      subtitle: "",
+      search: "",
+      started: labels.started,
+      sessionId: labels.sessionId,
+      visitor: labels.visitor,
+      anonymous: labels.anonymous,
+      userId: labels.userId,
+      userName: labels.userName,
+      entryPage: labels.entryPath,
+      exitPage: labels.exitPath,
+      duration: labels.duration,
+      referrer: labels.referrer,
+      location: labels.location,
+      os: labels.os,
+      browser: labels.browser,
+      device: labels.device,
+      pageViews: labels.pageViews,
+      customEvents: labels.customEvents,
+      screenSize: messages.sessions.screenSize,
+      exitTime: messages.sessions.exitTime,
+      loadError: labels.loadError,
+      empty: labels.emptySessions,
+    }),
+    [labels, messages.sessions.screenSize, messages.sessions.exitTime],
+  );
+  const sessionColumnDefinitions = useMemo(
+    () => createSessionTableColumnDefinitions(sessionTableLabels),
+    [sessionTableLabels],
+  );
+  const sessionColumns = useAnalyticsTableColumns({
+    storageKey: SESSION_TABLE_COLUMNS_STORAGE_KEY,
+    columns: sessionColumnDefinitions,
+  });
   const sortedSessions = useMemo(
     () => sortVisitorSessions(detail.sessions, sessionSort),
     [detail.sessions, sessionSort],
   );
-  const toggleSessionSort = (key: SessionSortKey) => {
+  const toggleSessionSort = useCallback((key: SessionSortKey) => {
     setSessionSort((current) =>
       current.key === key
         ? {
@@ -1971,17 +2081,20 @@ const ActivityAndSessionsSection = memo(function ActivityAndSessionsSection({
             direction: "desc",
           },
     );
-  };
-  const openSessionDetail = (sessionId: string) => {
-    if (onOpenSession) {
-      onOpenSession(sessionId);
-      return;
-    }
+  }, []);
+  const openSessionDetail = useCallback(
+    (sessionId: string) => {
+      if (onOpenSession) {
+        onOpenSession(sessionId);
+        return;
+      }
 
-    window.location.assign(
-      `${siteBasePath}/sessions?detail=${encodeURIComponent(sessionId)}`,
-    );
-  };
+      window.location.assign(
+        `${siteBasePath}/sessions?detail=${encodeURIComponent(sessionId)}`,
+      );
+    },
+    [onOpenSession, siteBasePath],
+  );
 
   return (
     <section className="space-y-6">
@@ -2003,42 +2116,34 @@ const ActivityAndSessionsSection = memo(function ActivityAndSessionsSection({
       </Card>
 
       <section className="space-y-3">
-        <h2 className="text-base font-semibold tracking-tight">
-          {labels.sessionRecords}
-        </h2>
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold tracking-tight">
+            {labels.sessionRecords}
+          </h2>
+          <AnalyticsTableColumnSettings
+            columns={sessionColumnDefinitions}
+            orderedIds={sessionColumns.orderedIds}
+            visibleIds={sessionColumns.visibleIds}
+            onOrderChange={sessionColumns.setOrder}
+            onVisibilityChange={sessionColumns.setVisible}
+            onReset={sessionColumns.reset}
+            labels={messages.common.tableColumns}
+          />
+        </div>
         <SessionsTableCard
           locale={locale}
           messages={messages}
-          labels={{
-            title: "",
-            subtitle: "",
-            search: "",
-            started: labels.started,
-            sessionId: labels.sessionId,
-            visitor: labels.visitor,
-            anonymous: labels.anonymous,
-            entryPage: labels.entryPath,
-            exitPage: labels.exitPath,
-            duration: labels.duration,
-            referrer: labels.referrer,
-            location: labels.location,
-            os: labels.os,
-            browser: labels.browser,
-            device: labels.device,
-            pageViews: labels.pageViews,
-            customEvents: labels.customEvents,
-            screenSize: messages.sessions.screenSize,
-            exitTime: messages.sessions.exitTime,
-            loadError: labels.loadError,
-            empty: labels.emptySessions,
-          }}
+          labels={sessionTableLabels}
           rows={sortedSessions}
           onOpenSession={openSessionDetail}
           sort={sessionSort}
           onSort={toggleSessionSort}
-          hasMore={false}
+          hasMore={hasMoreSessions}
+          loadingMore={loadingMoreSessions}
+          onLoadMore={onLoadMoreSessions}
           loadingRows={loading}
           skeletonRows={5}
+          visibleColumnIds={sessionColumns.visibleIds}
         />
       </section>
     </section>
@@ -2249,7 +2354,24 @@ const VisitorDetailBottomCards = memo(function VisitorDetailBottomCards({
       ] as const,
     [labels.customEvents],
   );
-  const loadEventRows = useMemo(() => async () => eventRows, [eventRows]);
+  const eventLoader = useMemo<AsyncDimensionBreakdownLoader<"event">>(
+    () =>
+      async ({ cursor, limit, search, sort }) =>
+        loadLocalTablePage({
+          rows: eventRows,
+          sort,
+          columns: [
+            { key: "views", getValue: (row) => row.views },
+            { key: "visitors", getValue: (row) => row.visitors },
+          ],
+          tab: "event",
+          limit,
+          cursor,
+          search,
+          getSearchText: (row) => row.label,
+        }),
+    [eventRows],
+  );
 
   return (
     <section className="grid items-stretch gap-6 xl:grid-cols-2">
@@ -2274,12 +2396,11 @@ const VisitorDetailBottomCards = memo(function VisitorDetailBottomCards({
           locale={locale}
           messages={messages}
           tabs={eventTabs}
-          loadRows={loadEventRows}
-          requestKey={`visitor-detail-events:${detail.visitor.visitorId}:${locale}`}
+          loader={eventLoader}
+          requestKey={`visitor-detail-events:${detail.visitor.visitorId}:${locale}:${JSON.stringify(eventRows)}`}
           className="h-full"
           showVisitors={false}
           emptyLabel={labels.emptyCustomEvents}
-          loadingByTab={{ event: loading }}
         />
       </div>
     </section>
@@ -2296,6 +2417,12 @@ function DetailContent({
   timeZone,
   timeWindow,
   onOpenSession,
+  hasMoreSessions = false,
+  loadingMoreSessions = false,
+  onLoadMoreSessions,
+  hasMoreEvents = false,
+  loadingMoreEvents = false,
+  onLoadMoreEvents,
   loading = false,
 }: {
   locale: Locale;
@@ -2307,6 +2434,12 @@ function DetailContent({
   timeZone: string;
   timeWindow: TimeWindow;
   onOpenSession?: (sessionId: string) => void;
+  hasMoreSessions?: boolean;
+  loadingMoreSessions?: boolean;
+  onLoadMoreSessions?: () => void;
+  hasMoreEvents?: boolean;
+  loadingMoreEvents?: boolean;
+  onLoadMoreEvents?: () => void;
   loading?: boolean;
 }) {
   const modalClose = useDetailDrawerClose();
@@ -2393,6 +2526,9 @@ function DetailContent({
           siteBasePath={siteBasePath}
           timeZone={timeZone}
           onOpenSession={onOpenSession}
+          hasMoreSessions={hasMoreSessions}
+          loadingMoreSessions={loadingMoreSessions}
+          onLoadMoreSessions={onLoadMoreSessions}
           loading={loading}
         />
 
@@ -2401,6 +2537,9 @@ function DetailContent({
           messages={messages}
           labels={labels}
           events={displayEvents}
+          hasMore={hasMoreEvents}
+          loadingMore={loadingMoreEvents}
+          onLoadMore={onLoadMoreEvents}
           siteBasePath={siteBasePath}
           timeZone={timeZone}
           onOpenSession={onOpenSession}
@@ -2450,7 +2589,6 @@ function DetailContent({
           loading={eventDetailLoading}
           error={eventDetailError}
           eventKind={selectedEvent?.kind ?? "pageview"}
-          zIndex={NESTED_DETAIL_DRAWER_Z_INDEX + 100}
         />
       </div>
     </div>
@@ -2478,8 +2616,65 @@ export const VisitorDetailClientPage = memo(function VisitorDetailClientPage({
       fetchVisitorDetail(siteId, visitorId, timeZone, window, { signal }),
     enabled: typeof window !== "undefined" && Boolean(visitorId),
   });
-  const detail = detailQuery.data?.data ?? null;
-  const loading = detailQuery.isPending && !detail;
+  const summary = detailQuery.data?.data ?? null;
+  const sessionsQuery = useInfiniteQuery({
+    queryKey: [
+      "dashboard",
+      "visitor-detail-sessions",
+      siteId,
+      visitorId,
+      timeZone,
+      window.from,
+      window.to,
+    ],
+    queryFn: ({ pageParam, signal }) =>
+      fetchVisitorSessions(siteId, visitorId, window, {
+        cursor: pageParam,
+        signal,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =>
+      lastPage.data?.pagination?.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
+    enabled: Boolean(summary && visitorId),
+  });
+  const eventsQuery = useInfiniteQuery({
+    queryKey: [
+      "dashboard",
+      "visitor-detail-events",
+      siteId,
+      visitorId,
+      timeZone,
+      window.from,
+      window.to,
+    ],
+    queryFn: ({ pageParam, signal }) =>
+      fetchVisitorEvents(siteId, visitorId, window, {
+        cursor: pageParam,
+        signal,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =>
+      lastPage.data?.pagination?.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
+    enabled: Boolean(summary && visitorId),
+  });
+  const loadedSessions = sessionsQuery.data
+    ? sessionsQuery.data.pages.flatMap((page) => page.data.items)
+    : (summary?.sessions ?? []);
+  const loadedEvents = eventsQuery.data
+    ? eventsQuery.data.pages.flatMap((page) => page.data.items)
+    : (summary?.events ?? []);
+  const detail = summary
+    ? {
+        ...summary,
+        sessions: loadedSessions,
+        events: loadedEvents,
+      }
+    : null;
+  const loading = detailQuery.isPending && !summary;
   const error = detailQuery.isError;
 
   if (!visitorId) {
@@ -2529,6 +2724,20 @@ export const VisitorDetailClientPage = memo(function VisitorDetailClientPage({
       timeZone={timeZone}
       timeWindow={window}
       onOpenSession={onOpenSession}
+      hasMoreSessions={Boolean(sessionsQuery.hasNextPage)}
+      loadingMoreSessions={sessionsQuery.isFetchingNextPage}
+      onLoadMoreSessions={() => {
+        if (sessionsQuery.hasNextPage && !sessionsQuery.isFetchingNextPage) {
+          void sessionsQuery.fetchNextPage();
+        }
+      }}
+      hasMoreEvents={Boolean(eventsQuery.hasNextPage)}
+      loadingMoreEvents={eventsQuery.isFetchingNextPage}
+      onLoadMoreEvents={() => {
+        if (eventsQuery.hasNextPage && !eventsQuery.isFetchingNextPage) {
+          void eventsQuery.fetchNextPage();
+        }
+      }}
       loading={loading}
     />
   );

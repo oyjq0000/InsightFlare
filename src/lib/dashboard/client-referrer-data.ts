@@ -1,4 +1,7 @@
-import type { UtmDimensionTab } from "@/lib/dashboard/client-data-types";
+import type {
+  DashboardListRequestOptions,
+  UtmDimensionTab,
+} from "@/lib/dashboard/client-data-types";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
 import type {
   BrowserTrendData,
@@ -6,11 +9,17 @@ import type {
   ReferrerChannelTrendData,
   ReferrerRadarData,
   ReferrersData,
+  ReferrerSummaryData,
 } from "@/lib/edge-client";
 import type { FilterDocument } from "@/lib/filter-contract";
 
 import { fetchPrivateJson } from "./client-request";
-import { withFilters } from "./client-utils";
+import {
+  normalizePaginatedCollection,
+  withComparison,
+  withFilters,
+  withPagination,
+} from "./client-utils";
 
 const utmPathMap: Record<UtmDimensionTab, string> = {
   source: "utm-source",
@@ -24,9 +33,8 @@ export async function fetchReferrers(
   siteId: string,
   window: TimeWindow,
   filters?: FilterDocument,
-  options?: {
+  options?: DashboardListRequestOptions & {
     fullUrl?: boolean;
-    limit?: number;
   },
 ): Promise<ReferrersData> {
   return fetchPrivateJson<ReferrersData>(
@@ -38,10 +46,37 @@ export async function fetchReferrers(
         to: window.to,
         timeZone: window.timeZone,
         limit: options?.limit ?? 100,
+        ...(options?.cursor ? { cursor: options.cursor } : {}),
+        ...(options?.search?.trim() ? { search: options.search.trim() } : {}),
+        ...(options?.sort ? { sort: options.sort } : {}),
+        ...(options?.direction ? { direction: options.direction } : {}),
         fullUrl: options?.fullUrl ? 1 : 0,
       },
       filters,
     ),
+    { signal: options?.signal },
+  );
+}
+
+export async function fetchReferrerSummary(
+  siteId: string,
+  window: TimeWindow,
+  filters?: FilterDocument,
+  options?: { topN?: number; signal?: AbortSignal },
+): Promise<ReferrerSummaryData> {
+  return fetchPrivateJson<ReferrerSummaryData>(
+    "/api/private/referrer-summary",
+    withFilters(
+      {
+        siteId,
+        from: window.from,
+        to: window.to,
+        timeZone: window.timeZone,
+        topN: options?.topN ?? 5,
+      },
+      filters,
+    ),
+    { signal: options?.signal },
   );
 }
 
@@ -50,19 +85,32 @@ export async function fetchUtmDimension(
   window: TimeWindow,
   tab: UtmDimensionTab,
   filters?: FilterDocument,
-  options?: { signal?: AbortSignal },
-): Promise<DimensionData> {
-  const requestParams = withFilters(
+  options?: DashboardListRequestOptions,
+): Promise<DimensionData["data"]> {
+  const requestParams = withComparison(
+    withFilters(
+      withPagination(
+        {
+          siteId,
+          from: window.from,
+          to: window.to,
+          timeZone: window.timeZone,
+          ...(options?.search?.trim() ? { search: options.search.trim() } : {}),
+          ...(options?.sort ? { sort: options.sort } : {}),
+          ...(options?.direction ? { direction: options.direction } : {}),
+        },
+        options,
+        20,
+      ),
+      filters,
+    ),
+    options?.comparison,
     {
-      siteId,
-      from: window.from,
-      to: window.to,
-      timeZone: window.timeZone,
-      limit: 100,
+      metric: options?.comparisonMetric,
+      sortBy: options?.comparisonSortBy,
     },
-    filters,
   );
-  return options?.signal
+  const response = options?.signal
     ? fetchPrivateJson<DimensionData>(
         `/api/private/${utmPathMap[tab]}`,
         requestParams,
@@ -74,6 +122,7 @@ export async function fetchUtmDimension(
         `/api/private/${utmPathMap[tab]}`,
         requestParams,
       );
+  return response.then((payload) => normalizePaginatedCollection(payload.data));
 }
 
 export async function fetchUtmTrend(

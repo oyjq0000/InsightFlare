@@ -250,6 +250,8 @@ CREATE TABLE notification_messages (
 
 CREATE INDEX idx_notification_messages_batch
   ON notification_messages(batch_id);
+CREATE INDEX idx_notification_messages_expires_at
+  ON notification_messages(expires_at);
 CREATE INDEX idx_notification_messages_rule_created
   ON notification_messages(rule_id, created_at DESC);
 CREATE INDEX idx_notification_messages_run
@@ -313,6 +315,8 @@ CREATE TABLE saved_filters (
     CHECK (filter_dsl_version >= 1),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  scope_preference TEXT NOT NULL DEFAULT 'auto'
+    CHECK (scope_preference IN ('auto', 'event', 'session', 'visitor')),
   FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE,
   FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT
 );
@@ -369,6 +373,20 @@ CREATE INDEX idx_scheduled_task_runs_status_started
   ON scheduled_task_runs(status, started_at_ms);
 CREATE INDEX idx_scheduled_task_runs_task_started
   ON scheduled_task_runs(task_key, started_at_ms);
+
+CREATE TABLE scheduled_task_schedule_state (
+  task_key TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  next_run_at INTEGER NOT NULL,
+  last_run_at INTEGER,
+  claim_token TEXT,
+  claim_expires_at INTEGER,
+  last_error TEXT,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX idx_scheduled_task_schedule_due
+  ON scheduled_task_schedule_state(enabled, next_run_at);
 
 CREATE TABLE site_identities (
   site_pk INTEGER PRIMARY KEY,

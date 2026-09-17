@@ -94,11 +94,15 @@ describe("mock events and journeys branch coverage", () => {
       limit: 5,
       timeZone: "UTC",
     });
-    const data = result.data as Array<Record<string, unknown>>;
+    const trend = result.data as Record<string, unknown>;
+    const data = trend.data as Array<Record<string, unknown>>;
 
     expect(result).toMatchObject({
       ok: true,
-      series: [expect.objectContaining({ eventName: "signup", events: 1 })],
+      data: {
+        interval: "hour",
+        series: [expect.objectContaining({ eventName: "signup", events: 1 })],
+      },
     });
     expect(data.map((point) => point.totalEvents)).toEqual([0, 0]);
   });
@@ -131,22 +135,24 @@ describe("mock events and journeys branch coverage", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      data: [
-        expect.objectContaining({
-          visitorId: "visitor-1",
-          firstSeenAt: 1_000,
-          lastSeenAt: 3_000,
-          views: 2,
-          sessions: 2,
-          region: "DE::BE::Berlin",
-          city: "DE::BE::Berlin::Berlin",
-        }),
-      ],
-      meta: {
-        pageSize: 10,
-        returned: 1,
-        hasMore: false,
-        nextCursor: null,
+      data: {
+        items: [
+          expect.objectContaining({
+            visitorId: "visitor-1",
+            firstSeenAt: 1_000,
+            lastSeenAt: 3_000,
+            views: 2,
+            sessions: 2,
+            region: "DE::BE::Berlin",
+            city: "DE::BE::Berlin::Berlin",
+          }),
+        ],
+        pagination: {
+          limit: 10,
+          returned: 1,
+          hasMore: false,
+          nextCursor: null,
+        },
       },
     });
   });
@@ -172,12 +178,80 @@ describe("mock events and journeys branch coverage", () => {
       sortBy: "views",
       sortDir: "desc",
     });
-    const data = result.data as Array<Record<string, unknown>>;
+    const data = (result.data as { items: Array<Record<string, unknown>> })
+      .items;
 
     expect(data.map((row) => row.visitorId)).toEqual([
       "visitor-a",
       "visitor-b",
     ]);
+  });
+
+  it("partitions demo journey records by funnel outcome", () => {
+    setFacts(
+      Array.from({ length: 6 }, (_, index) =>
+        makeVisit({
+          visitId: `visit-${index}`,
+          sessionId: `session-${index}`,
+          visitorId: `visitor-${index}`,
+          startedAt: index * 1_000,
+        }),
+      ),
+    );
+    const baseAnalysis = {
+      analysisType: "funnel",
+      analysisId: "funnel-1",
+      analysisStepId: "step-2",
+    } as const;
+    const items = (result: Record<string, unknown>) =>
+      (result.data as { items: Array<Record<string, unknown>> }).items;
+
+    const converted = items(
+      generateDemoVisitors("site", {
+        ...baseAnalysis,
+        analysisOutcome: "converted",
+      }) as Record<string, unknown>,
+    );
+    const defaulted = items(
+      generateDemoVisitors("site", baseAnalysis) as Record<string, unknown>,
+    );
+    const dropped = items(
+      generateDemoVisitors("site", {
+        ...baseAnalysis,
+        analysisOutcome: "dropoff",
+      }) as Record<string, unknown>,
+    );
+
+    expect(defaulted.map((row) => row.visitorId)).toEqual(
+      converted.map((row) => row.visitorId),
+    );
+    const droppedVisitorIds = new Set(
+      dropped.map((row) => String(row.visitorId)),
+    );
+    expect(
+      converted.some((row) => droppedVisitorIds.has(String(row.visitorId))),
+    ).toBe(false);
+
+    const convertedSessions = items(
+      generateDemoSessions("site", {
+        ...baseAnalysis,
+        analysisOutcome: "converted",
+      }) as Record<string, unknown>,
+    );
+    const droppedSessions = items(
+      generateDemoSessions("site", {
+        ...baseAnalysis,
+        analysisOutcome: "dropoff",
+      }) as Record<string, unknown>,
+    );
+    const droppedSessionIds = new Set(
+      droppedSessions.map((row) => String(row.sessionId)),
+    );
+    expect(
+      convertedSessions.some((row) =>
+        droppedSessionIds.has(String(row.sessionId)),
+      ),
+    ).toBe(false);
   });
 
   it("paginates visitors and filters search matches before building rows", () => {
@@ -210,27 +284,33 @@ describe("mock events and journeys branch coverage", () => {
 
     expect(
       generateDemoVisitors("site", {
-        pageSize: 2,
+        limit: 2,
       }),
     ).toMatchObject({
-      meta: {
-        pageSize: 2,
-        returned: 2,
-        hasMore: true,
-        nextCursor: "2",
+      data: {
+        pagination: {
+          limit: 2,
+          returned: 2,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
 
     const searched = generateDemoVisitors("site", {
-      pageSize: 2,
+      limit: 2,
       search: "beta-docs",
     }) as {
-      data: Array<Record<string, unknown>>;
-      meta: Record<string, unknown>;
+      data: {
+        items: Array<Record<string, unknown>>;
+        pagination: Record<string, unknown>;
+      };
     };
 
-    expect(searched.data.map((row) => row.visitorId)).toEqual(["visitor-beta"]);
-    expect(searched.meta).toMatchObject({
+    expect(searched.data.items.map((row) => row.visitorId)).toEqual([
+      "visitor-beta",
+    ]);
+    expect(searched.data.pagination).toMatchObject({
       returned: 1,
       hasMore: false,
       nextCursor: null,
@@ -531,7 +611,8 @@ describe("mock events and journeys branch coverage", () => {
       sortBy: "views",
       sortDir: "desc",
     });
-    const data = result.data as Array<Record<string, unknown>>;
+    const data = (result.data as { items: Array<Record<string, unknown>> })
+      .items;
 
     expect(data.map((row) => row.sessionId)).toEqual([
       "a-session",
@@ -569,29 +650,33 @@ describe("mock events and journeys branch coverage", () => {
 
     expect(
       generateDemoSessions("site", {
-        pageSize: 2,
+        limit: 2,
       }),
     ).toMatchObject({
-      meta: {
-        pageSize: 2,
-        returned: 2,
-        hasMore: true,
-        nextCursor: "2",
+      data: {
+        pagination: {
+          limit: 2,
+          returned: 2,
+          hasMore: true,
+          nextCursor: expect.any(String),
+        },
       },
     });
 
     const searched = generateDemoSessions("site", {
-      pageSize: 2,
+      limit: 2,
       q: "gamma help",
     }) as {
-      data: Array<Record<string, unknown>>;
-      meta: Record<string, unknown>;
+      data: {
+        items: Array<Record<string, unknown>>;
+        pagination: Record<string, unknown>;
+      };
     };
 
-    expect(searched.data.map((row) => row.sessionId)).toEqual([
+    expect(searched.data.items.map((row) => row.sessionId)).toEqual([
       "session-gamma",
     ]);
-    expect(searched.meta).toMatchObject({
+    expect(searched.data.pagination).toMatchObject({
       returned: 1,
       hasMore: false,
       nextCursor: null,

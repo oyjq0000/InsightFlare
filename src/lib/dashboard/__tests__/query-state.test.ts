@@ -4,7 +4,9 @@ import {
   dashboardFilterDocumentFromPresentation,
   dashboardFilterPresentation,
   dashboardFilterValue,
+  parseDashboardComparisonSearchParams,
   serializeDashboardSearchParams,
+  withDashboardComparisonSearchParams,
   withDashboardFilterSearchParams,
 } from "@/lib/dashboard/filter-state";
 import type { RangePreset } from "@/lib/dashboard/query-state";
@@ -15,10 +17,13 @@ import {
   finestIntervalForRange,
   normalizeCustomDateRange,
   parseFilterDocumentFromSearchParams,
+  parseFilterScopeFromSearchParams,
   resolveRangePreset,
   resolveTimeWindow,
+  serializeFilterScopeToSearchParams,
   withRangeAndFilters,
 } from "@/lib/dashboard/query-state";
+import { attachFilterScopePreference } from "@/lib/filter-contract";
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -74,7 +79,6 @@ describe("dashboard query-state helpers", () => {
       ["30m", now - 30 * MINUTE_MS, now, "minute"],
       ["1h", now - HOUR_MS, now, "minute"],
       ["24h", now - DAY_MS, now, "hour"],
-      ["all", 0, now, "month"],
     ] satisfies Array<[RangePreset, number, number, string]>)(
       "resolves %s bounds",
       (preset, from, to, interval) => {
@@ -265,6 +269,21 @@ describe("dashboard query-state helpers", () => {
     });
   });
 
+  describe("filter scope search parameters", () => {
+    it("parses and serializes explicit scope preferences", () => {
+      expect(
+        parseFilterScopeFromSearchParams(new URLSearchParams("scope=visitor")),
+      ).toBe("visitor");
+
+      const params = serializeFilterScopeToSearchParams(
+        new URLSearchParams("range=7d"),
+        "session",
+      );
+      expect(params.get("range")).toBe("7d");
+      expect(params.get("scope")).toBe("session");
+    });
+  });
+
   describe("withRangeAndFilters", () => {
     it("builds a range URL with every supported filter dimension", () => {
       const filters = dashboardFilterDocumentFromPresentation({
@@ -328,6 +347,31 @@ describe("dashboard query-state helpers", () => {
       expect(url.searchParams.get("filter[geo.country]")).toBeNull();
       expect(url.searchParams.get("filter[client.browser]")).toBe("Chrome");
     });
+
+    it("carries a filter document scope preference into the URL", () => {
+      const filters = attachFilterScopePreference(
+        dashboardFilterDocumentFromPresentation({ path: "/" }),
+        "visitor",
+      );
+
+      const url = new URL(
+        withRangeAndFilters("/dashboard", "7d", filters),
+        "https://example.test",
+      );
+
+      expect(url.searchParams.get("scope")).toBe("visitor");
+    });
+
+    it("does not serialize a scope preference without an active filter", () => {
+      const filters = attachFilterScopePreference(
+        dashboardFilterDocumentFromPresentation({}),
+        "visitor",
+      );
+
+      expect(withRangeAndFilters("/dashboard", "7d", filters)).toBe(
+        "/dashboard?range=7d",
+      );
+    });
   });
 
   describe("withDashboardFilterSearchParams", () => {
@@ -348,6 +392,74 @@ describe("dashboard query-state helpers", () => {
       expect(next.get("geoCountry")).toBeNull();
       expect(next.get("filter[geo.country]")).toBeNull();
       expect(next.get("filter[referrer.domain]")).toBe("google.com");
+    });
+
+    it("removes a stale scope when the active filter document is empty", () => {
+      const next = withDashboardFilterSearchParams(
+        new URLSearchParams("range=7d&scope=visitor"),
+        dashboardFilterDocumentFromPresentation({}),
+      );
+
+      expect(next.get("range")).toBe("7d");
+      expect(next.get("scope")).toBeNull();
+    });
+  });
+
+  describe("dashboard comparison search params", () => {
+    it("keeps a previous-period comparison without a comparison filter", () => {
+      const next = withDashboardComparisonSearchParams(
+        new URLSearchParams("range=7d&filter[client.browser]=Chrome"),
+        "previous",
+      );
+
+      expect(next.get("range")).toBe("7d");
+      expect(next.get("filter[client.browser]")).toBe("Chrome");
+      expect(next.get("compare")).toBe("previous");
+      expect(
+        [...next.keys()].some((key) => key.startsWith("compareFilter[")),
+      ).toBe(false);
+      expect(parseDashboardComparisonSearchParams(next).mode).toBe("previous");
+    });
+
+    it("requires a comparison filter for a same-period comparison", () => {
+      const next = withDashboardComparisonSearchParams(
+        new URLSearchParams("range=7d"),
+        "same",
+      );
+
+      expect(next.get("compare")).toBeNull();
+      expect(parseDashboardComparisonSearchParams(next).mode).toBeUndefined();
+    });
+
+    it("serializes comparison filters with the shared filter codec", () => {
+      const filterDocument = dashboardFilterDocumentFromPresentation({
+        path: "/pricing",
+        browser: "Chrome",
+      });
+      const next = withDashboardComparisonSearchParams(
+        new URLSearchParams("range=7d&filter[client.browser]=Safari"),
+        "same",
+        filterDocument,
+      );
+
+      expect(next.get("compare")).toBe("same");
+      expect(next.get("compareFilter[page.path]")).toBe("/pricing");
+      expect(next.get("compareFilter[client.browser]")).toBe("Chrome");
+      expect(next.get("filter[client.browser]")).toBe("Safari");
+      expect(
+        dashboardFilterPresentation(
+          parseDashboardComparisonSearchParams(next).filterDocument,
+        ),
+      ).toMatchObject({ path: "/pricing", browser: "Chrome" });
+    });
+
+    it("ignores same-period comparisons without valid comparison filters", () => {
+      const state = parseDashboardComparisonSearchParams(
+        new URLSearchParams("compare=same"),
+      );
+
+      expect(state.mode).toBeUndefined();
+      expect(state.filterDocument.root).toBeNull();
     });
   });
 
@@ -375,6 +487,14 @@ describe("dashboard query-state helpers", () => {
 
       expect(serializeDashboardSearchParams(params)).toBe(
         "filter[page.path]=/politics&filter[page.path][or:0.0]=/world&filter[event.payload][/device/screen/width]=json:1920&filter[referrer.domain]=google.com&filter[page.title]=News%20%26%20Politics",
+      );
+    });
+
+    it("keeps a root path filter intact across client navigation", () => {
+      const params = new URLSearchParams([["filter[page.path]", "/"]]);
+
+      expect(serializeDashboardSearchParams(params)).toBe(
+        "filter[page.path]=%2F",
       );
     });
   });

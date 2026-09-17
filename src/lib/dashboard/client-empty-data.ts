@@ -28,6 +28,15 @@ import type {
   VisitorsData,
 } from "@/lib/edge-client";
 
+function emptyPagination(limit = 1) {
+  return {
+    limit,
+    returned: 0,
+    hasMore: false,
+    nextCursor: null,
+  } as const;
+}
+
 type PageCardTabsData = NonNullable<PagesData["tabs"]>;
 type OverviewClientDimensionTabsData =
   OverviewClientDimensionTabsResponse["tabs"];
@@ -58,7 +67,7 @@ export function emptyTrend(interval: TimeWindow["interval"]): TrendData {
 }
 
 export function emptyPages(): PagesData {
-  return { ok: true, data: [] };
+  return { ok: true, data: { items: [], pagination: emptyPagination() } };
 }
 
 export function emptyPageCardTabs(): PageCardTabsData {
@@ -103,36 +112,27 @@ export function emptyOverviewGeoPoints(): OverviewGeoPointsData {
 }
 
 export function emptyReferrers(): ReferrersData {
-  return { ok: true, data: [] };
+  return { ok: true, data: { items: [], pagination: emptyPagination() } };
 }
 
 export function emptyDimension(): DimensionData {
-  return { ok: true, data: [] };
+  return {
+    ok: true,
+    data: { items: [], pagination: emptyPagination() },
+  };
 }
 
 export function emptyVisitors(): VisitorsData {
   return {
     ok: true,
-    data: [],
-    meta: {
-      pageSize: 0,
-      returned: 0,
-      hasMore: false,
-      nextCursor: null,
-    },
+    data: { items: [], pagination: emptyPagination() },
   };
 }
 
 export function emptySessions(): SessionsData {
   return {
     ok: true,
-    data: [],
-    meta: {
-      pageSize: 0,
-      returned: 0,
-      hasMore: false,
-      nextCursor: null,
-    },
+    data: { items: [], pagination: emptyPagination() },
   };
 }
 
@@ -187,15 +187,17 @@ export function emptyEventsTrend(
   };
 }
 
-export function emptyEventsRecords(pageSize = 0): EventsRecordsData {
+export function emptyEventsRecords(limit = 1): EventsRecordsData {
   return {
     ok: true,
-    data: [],
-    meta: {
-      pageSize,
-      returned: 0,
-      hasMore: false,
-      nextCursor: null,
+    data: {
+      items: [],
+      pagination: {
+        limit,
+        returned: 0,
+        hasMore: false,
+        nextCursor: null,
+      },
     },
   };
 }
@@ -217,7 +219,6 @@ export function emptyEventTypeDetail(eventName = ""): EventTypeDetailData {
     },
     breakdowns: emptyEventBreakdowns(),
     cards: emptyEventAnalyticsContextCards(),
-    fields: [],
   };
 }
 
@@ -229,7 +230,7 @@ export function emptyEventFieldValues(
     ok: true,
     fieldPath,
     fieldValueType,
-    data: [],
+    data: { items: [], pagination: emptyPagination() },
   };
 }
 
@@ -307,13 +308,22 @@ export function emptyPerformance(
 }
 
 export function emptyOverviewTab(): OverviewTabData {
-  return { ok: true, data: [] };
+  return { ok: true, data: { items: [], pagination: emptyPagination() } };
 }
 
 export function emptyOverviewGeoTab(): OverviewGeoTabData {
-  return { ok: true, data: [] };
+  return {
+    ok: true,
+    data: {
+      items: [],
+      pagination: emptyPagination(),
+    },
+  };
 }
 
 export function emptyDashboardFilterOptions(): DashboardFilterOptionsData {
-  return { ok: true, data: [] };
+  return {
+    ok: true,
+    data: { items: [], pagination: emptyPagination() },
+  };
 }

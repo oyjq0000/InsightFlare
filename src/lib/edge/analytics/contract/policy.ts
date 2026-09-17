@@ -19,7 +19,6 @@ const DEFAULT_LIMITS: QueryLimits = {
   maxCursorBytes: 12_288,
   maxFilterClauses: 96,
   maxLimit: 500,
-  maxOffset: 20_000,
 };
 
 const ALL_OPERATIONS: readonly QueryOperation[] = [
@@ -51,11 +50,16 @@ const ALL_OPERATIONS: readonly QueryOperation[] = [
   "event-records",
   "event-record-detail",
   "journey-event-detail",
+  "visitor-events",
+  "visitor-sessions",
+  "session-events",
   "visitors",
   "visitor-detail",
   "sessions",
   "session-detail",
   "funnel-analysis",
+  "goal-summary",
+  "goal-timeseries",
   "team-dashboard",
   "explore",
 ];
@@ -104,7 +108,7 @@ function policy(
     allowedFilters: filterIdsForAudience(audience),
     allowedDetails,
     limits: DEFAULT_LIMITS,
-    allowedPagination: new Set(["none", "offset", "keyset"]),
+    cursorPagination: true,
   };
 }
 

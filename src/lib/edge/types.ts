@@ -1,8 +1,9 @@
 export interface Env {
   DB: D1Database;
   INGEST_DO: DurableObjectNamespace;
-  BOT_ANALYTICS?: AnalyticsEngineDataset;
-  NORMAL_ANALYTICS?: AnalyticsEngineDataset;
+  REQUEST_ANALYTICS?: AnalyticsEngineDataset;
+  TRAFFIC_ANALYTICS?: AnalyticsEngineDataset;
+  EVENT_ANALYTICS?: AnalyticsEngineDataset;
   ARCHIVE_BUCKET?: R2Bucket;
   MAIN_SECRET?: string;
   DAILY_SALT_SECRET?: string;
@@ -20,6 +21,7 @@ export interface Env {
   INSIGHTFLARE_E2E?: string;
   INSIGHTFLARE_E2E_NOW?: string;
   INSIGHTFLARE_E2E_CONTROL_TOKEN?: string;
+  INSIGHTFLARE_E2E_TEST_SITE_URL?: string;
   INSIGHTFLARE_E2E_CLOUDFLARE_API_URL?: string;
   INSIGHTFLARE_E2E_RESEND_API_URL?: string;
   INSIGHTFLARE_E2E_TURNSTILE_SITEVERIFY_URL?: string;
@@ -41,11 +43,7 @@ export interface IngestTracePayload {
 }
 
 export type TrackerPayloadKind =
-  | "pageview"
-  | "leave"
-  | "visibility"
-  | "custom_event"
-  | "identify";
+  "pageview" | "leave" | "visibility" | "custom_event" | "identify";
 
 export interface TrackerPerformancePayload {
   ttfb?: number;

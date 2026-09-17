@@ -1,12 +1,26 @@
-export interface DimensionData {
-  ok: boolean;
-  data: Array<{
-    value: string;
-    label: string;
+import type { PaginatedCollection } from "./pagination";
+
+export interface DimensionRow {
+  value: string;
+  label: string;
+  views: number;
+  sessions: number;
+  visitors?: number;
+  reference?: {
     views: number;
     sessions: number;
-    visitors?: number;
-  }>;
+    visitors: number;
+  };
+  change?: {
+    views: { absolute: number; relative: number | null };
+    sessions: { absolute: number; relative: number | null };
+    visitors: { absolute: number; relative: number | null };
+  };
+}
+
+export interface DimensionData {
+  ok: boolean;
+  data: PaginatedCollection<DimensionRow>;
 }
 
 export interface DashboardFilterOption {
@@ -18,5 +32,5 @@ export interface DashboardFilterOption {
 
 export interface DashboardFilterOptionsData {
   ok: boolean;
-  data: DashboardFilterOption[];
+  data: PaginatedCollection<DashboardFilterOption>;
 }

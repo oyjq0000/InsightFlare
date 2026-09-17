@@ -134,12 +134,14 @@ import {
   demoJourneyPercentile,
   demoReportingDateKey,
   demoVisitsBySession,
+  latestDemoIdentityVisit,
   parseDemoSessionSort,
   parseDemoVisitorSort,
   summarizeDemoActivity,
   summarizeDemoEventDistribution,
   summarizeDemoVisitedPages,
 } from "@/lib/realtime/mock/journey-helpers";
+import { demoPage } from "@/lib/realtime/mock/pagination";
 import {
   buildPathTransitionGraph,
   nextPath,
@@ -225,6 +227,20 @@ function fallbackDemoVisitorId(
   return isDemoVisitorIdForSite(siteId, visitorId) ? visitorId : null;
 }
 
+function demoFunnelOutcomeMatches(
+  siteId: string,
+  identity: string,
+  params: Record<string, string | number>,
+): boolean {
+  if (String(params.analysisType ?? "") !== "funnel") return true;
+  const outcome = String(params.analysisOutcome ?? "converted");
+  const funnelId = String(params.analysisId ?? "");
+  const stepId = String(params.analysisStepId ?? "");
+  const converted =
+    fnv1a(`${siteId}::${funnelId}::${stepId}::${identity}`) % 5 < 3;
+  return outcome === "dropoff" ? !converted : converted;
+}
+
 function createFallbackDemoVisit(
   siteId: string,
   visitorId: string,
@@ -274,11 +290,6 @@ export function generateDemoVisitors(
   siteId: string,
   params: Record<string, string | number>,
 ): Record<string, unknown> {
-  const paged = params.cursor !== undefined || params.pageSize !== undefined;
-  const pageSize = paged
-    ? parseDemoLimit(params.pageSize, 80, 1, 120)
-    : parseDemoLimit(params.limit, 100, 1, 500);
-  const offset = paged ? parseDemoLimit(params.cursor, 0, 0, 1_000_000) : 0;
   const from = parseDemoNumber(params.from, Date.now() - 7 * 24 * 3600 * 1000);
   const to = parseDemoNumber(params.to, Date.now());
   const filters = parseDemoFilters(params);
@@ -286,9 +297,12 @@ export function generateDemoVisitors(
   const search = normalizeDemoSearch(params);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
+  const analysisVisits = filtered.visits.filter((visit) =>
+    demoFunnelOutcomeMatches(siteId, visit.visitorId, params),
+  );
   const matchedVisitorIds = search
     ? new Set(
-        filtered.visits
+        analysisVisits
           .filter((visit) =>
             demoVisitMatchesJourneySearch(dataset, visit, search),
           )
@@ -308,7 +322,7 @@ export function generateDemoVisitors(
       latestVisit: DemoVisitFact;
     }
   >();
-  for (const visit of filtered.visits) {
+  for (const visit of analysisVisits) {
     if (matchedVisitorIds && !matchedVisitorIds.has(visit.visitorId)) continue;
     const bucket = buckets.get(visit.visitorId) ?? {
       firstSeenAt: visit.startedAt,
@@ -333,54 +347,69 @@ export function generateDemoVisitors(
     buckets.set(visit.visitorId, bucket);
   }
 
-  const requestedRows = Array.from(buckets.entries())
-    .map(([visitorId, bucket]) => ({
-      visitorId,
-      sessionId: bucket.latestVisit.sessionId,
-      firstSeenAt: bucket.firstSeenAt,
-      lastSeenAt: bucket.lastSeenAt,
-      views: Math.max(0, Math.round(bucket.views)),
-      sessions: Math.max(
-        0,
-        Math.round(weightedSessionCount(dataset, bucket.sessions)),
-      ),
-      events: bucket.events,
-      country: bucket.latestVisit.country,
-      region: bucket.latestVisit.regionName || bucket.latestVisit.region,
-      regionCode: bucket.latestVisit.regionCode,
-      city: bucket.latestVisit.cityName || bucket.latestVisit.city,
-      referrerHost: bucket.firstVisit.referrerHost,
-      referrerUrl: bucket.firstVisit.referrerUrl,
-      browser: bucket.latestVisit.browser,
-      browserVersion: bucket.latestVisit.browserVersion,
-      os: demoOperatingSystemLabel(bucket.latestVisit.osVersion),
-      osVersion: bucket.latestVisit.osVersion,
-      deviceType: bucket.latestVisit.deviceType,
-      screenWidth: parseDemoScreenSize(bucket.latestVisit.screenSize)
-        .screenWidth,
-      screenHeight: parseDemoScreenSize(bucket.latestVisit.screenSize)
-        .screenHeight,
-    }))
+  const rows = Array.from(buckets.entries())
+    .map(([visitorId, bucket]) => {
+      const identityVisit = latestDemoIdentityVisit(
+        analysisVisits.filter((visit) => visit.visitorId === visitorId),
+      );
+      return {
+        visitorId,
+        sessionId: bucket.latestVisit.sessionId,
+        userId: identityVisit?.userId ?? "",
+        userName: identityVisit?.userName ?? "",
+        firstSeenAt: bucket.firstSeenAt,
+        lastSeenAt: bucket.lastSeenAt,
+        views: Math.max(0, Math.round(bucket.views)),
+        sessions: Math.max(
+          0,
+          Math.round(weightedSessionCount(dataset, bucket.sessions)),
+        ),
+        events: bucket.events,
+        country: bucket.latestVisit.country,
+        region: bucket.latestVisit.regionName || bucket.latestVisit.region,
+        regionCode: bucket.latestVisit.regionCode,
+        city: bucket.latestVisit.cityName || bucket.latestVisit.city,
+        referrerHost: bucket.firstVisit.referrerHost,
+        referrerUrl: bucket.firstVisit.referrerUrl,
+        browser: bucket.latestVisit.browser,
+        browserVersion: bucket.latestVisit.browserVersion,
+        os: demoOperatingSystemLabel(bucket.latestVisit.osVersion),
+        osVersion: bucket.latestVisit.osVersion,
+        deviceType: bucket.latestVisit.deviceType,
+        screenWidth: parseDemoScreenSize(bucket.latestVisit.screenSize)
+          .screenWidth,
+        screenHeight: parseDemoScreenSize(bucket.latestVisit.screenSize)
+          .screenHeight,
+      };
+    })
     .sort(
       (left, right) =>
         compareDemoNumericField(left, right, sort.key, sort.direction) ||
         right.lastSeenAt - left.lastSeenAt ||
         right.views - left.views ||
         left.visitorId.localeCompare(right.visitorId),
-    )
-    .slice(offset, offset + pageSize + (paged ? 1 : 0));
-  const hasMore = paged && requestedRows.length > pageSize;
-  const rows = hasMore ? requestedRows.slice(0, pageSize) : requestedRows;
+    );
+  const page = demoPage(
+    rows,
+    params,
+    {
+      operation: "visitors",
+      siteId,
+      from,
+      to,
+      filters,
+      search,
+      sort: { key: sort.key, direction: sort.direction },
+    },
+    80,
+    120,
+    true,
+    { search: "" },
+  );
 
   return {
     ok: true,
-    data: rows,
-    meta: {
-      pageSize,
-      returned: rows.length,
-      hasMore,
-      nextCursor: hasMore ? String(offset + pageSize) : null,
-    },
+    data: page,
   };
 }
 
@@ -388,11 +417,6 @@ export function generateDemoSessions(
   siteId: string,
   params: Record<string, string | number>,
 ): Record<string, unknown> {
-  const paged = params.cursor !== undefined || params.pageSize !== undefined;
-  const pageSize = paged
-    ? parseDemoLimit(params.pageSize, 80, 1, 120)
-    : parseDemoLimit(params.limit, 100, 1, 500);
-  const offset = paged ? parseDemoLimit(params.cursor, 0, 0, 1_000_000) : 0;
   const from = parseDemoNumber(params.from, Date.now() - 7 * 24 * 3600 * 1000);
   const to = parseDemoNumber(params.to, Date.now());
   const filters = parseDemoFilters(params);
@@ -400,18 +424,19 @@ export function generateDemoSessions(
   const search = normalizeDemoSearch(params);
   const dataset = buildDemoFactDataset(siteId, from, to);
   const filtered = applyDemoFilters(dataset, filters);
+  const analysisVisits = filtered.visits.filter((visit) =>
+    demoFunnelOutcomeMatches(siteId, visit.sessionId, params),
+  );
   const matchedSessionIds = search
     ? new Set(
-        filtered.visits
+        analysisVisits
           .filter((visit) =>
             demoVisitMatchesJourneySearch(dataset, visit, search),
           )
           .map((visit) => visit.sessionId),
       )
     : null;
-  const requestedRows = Array.from(
-    demoVisitsBySession(filtered.visits).entries(),
-  )
+  const rows = Array.from(demoVisitsBySession(analysisVisits).entries())
     .filter(([sessionId]) =>
       matchedSessionIds ? matchedSessionIds.has(sessionId) : true,
     )
@@ -424,20 +449,28 @@ export function generateDemoSessions(
         String(left.sessionId ?? "").localeCompare(
           String(right.sessionId ?? ""),
         ),
-    )
-    .slice(offset, offset + pageSize + (paged ? 1 : 0));
-  const hasMore = paged && requestedRows.length > pageSize;
-  const rows = hasMore ? requestedRows.slice(0, pageSize) : requestedRows;
+    );
+  const page = demoPage(
+    rows,
+    params,
+    {
+      operation: "sessions",
+      siteId,
+      from,
+      to,
+      filters,
+      search,
+      sort: { key: sort.key, direction: sort.direction },
+    },
+    80,
+    120,
+    true,
+    { search: "" },
+  );
 
   return {
     ok: true,
-    data: rows,
-    meta: {
-      pageSize,
-      returned: rows.length,
-      hasMore,
-      nextCursor: hasMore ? String(offset + pageSize) : null,
-    },
+    data: page,
   };
 }
 
@@ -473,9 +506,16 @@ export function generateDemoVisitorDetail(
       (left, right) =>
         Number(right.startedAt ?? 0) - Number(left.startedAt ?? 0),
     );
-  const events = createDemoJourneyEvents(detailVisits, {
+  const allEvents = createDemoJourneyEvents(detailVisits, {
     includeSessionStart: true,
   });
+  const events =
+    "from" in params || "to" in params
+      ? allEvents.filter((event) => {
+          const occurredAt = Number(event.occurredAt ?? 0);
+          return occurredAt >= from && occurredAt < to;
+        })
+      : allEvents;
   const customEventCount = events.filter(
     (event) => event.kind === "custom",
   ).length;
@@ -487,6 +527,7 @@ export function generateDemoVisitorDetail(
     [...detailVisits].sort(
       (left, right) => left.startedAt - right.startedAt,
     )[0] ?? detailVisits[0];
+  const identityVisit = latestDemoIdentityVisit(detailVisits);
   const firstSeenAt = Math.min(...detailVisits.map((visit) => visit.startedAt));
   const lastSeenAt = Math.max(...detailVisits.map((visit) => visit.startedAt));
   const screen = parseDemoScreenSize(latest.screenSize);
@@ -502,6 +543,8 @@ export function generateDemoVisitorDetail(
   ).size;
   const visitor = {
     visitorId,
+    userId: identityVisit?.userId ?? "",
+    userName: identityVisit?.userName ?? "",
     firstSeenAt,
     lastSeenAt,
     views: detailVisits.length,
@@ -589,10 +632,17 @@ export function generateDemoSessionDetail(
         : [];
   const session = createDemoJourneySession(sessionId, detailVisits);
   if (!session) return { ok: true, data: null };
-  const events = createDemoJourneyEvents(detailVisits, {
+  const allEvents = createDemoJourneyEvents(detailVisits, {
     includeSessionStart: true,
     includeSessionEnd: true,
   });
+  const events =
+    "from" in params || "to" in params
+      ? allEvents.filter((event) => {
+          const occurredAt = Number(event.occurredAt ?? 0);
+          return occurredAt >= from && occurredAt < to;
+        })
+      : allEvents;
   const locationPoints = createDemoJourneyLocationPoints(detailVisits);
 
   return {
@@ -766,6 +816,7 @@ export function generateDemoJourneyEventDetail(
   const country = String(event.country ?? "");
   const queryString = demoQueryStringForVisit(resolvedSourceVisit);
   const hash = demoHashFragmentForVisit(resolvedSourceVisit);
+  const identitySource = isBoundaryEvent ? session : resolvedSourceVisit;
 
   return {
     ok: true,
@@ -798,10 +849,8 @@ export function generateDemoJourneyEventDetail(
         visitId: String(event.visitId ?? ""),
         sessionId: resolvedSessionId,
         visitorId,
-        userId: visitorId ? `demo-user-${visitorId}` : "",
-        userName: visitorId
-          ? `Demo visitor ${visitorId.slice(-6).toUpperCase()}`
-          : "",
+        userId: String(identitySource.userId ?? ""),
+        userName: String(identitySource.userName ?? ""),
         pathname: String(event.pathname ?? ""),
         queryString,
         hash,

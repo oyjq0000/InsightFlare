@@ -183,11 +183,15 @@ After filling in the variables, wait about 3 minutes for the deployment to finis
 
 ### Enable Analytics Engine for Deep Analysis
 
-Some optional InsightFlare features, such as bot traffic detection, use Cloudflare Analytics Engine for enhanced analysis while keeping pressure off the primary database.
+Analytics Engine is InsightFlare's optional high-throughput analytical layer. It keeps request observability and future traffic/event projections separate from the primary database:
+
+- `REQUEST_ANALYTICS` → request observation and abnormal traffic
+- `TRAFFIC_ANALYTICS` → sampled traffic facts
+- `EVENT_ANALYTICS` → sampled custom-event facts
 
 This requires enabling Analytics Engine manually. Open the [Cloudflare Dashboard](https://dash.cloudflare.com/?to=/:account/workers/analytics-engine) and click the "Enable" button on the right. After that, InsightFlare will automatically bind Analytics Engine to your Cloudflare account during deployment.
 
-Once enabled, InsightFlare can write data to Analytics Engine. Reading those datasets requires an API Token. In system settings, enter your Cloudflare Account ID and an API Token with the "Account Analytics" read permission. See the "Guide" button in the InsightFlare dashboard settings page for details.
+Once enabled, InsightFlare writes the three datasets above. The current version uses the new `REQUEST_ANALYTICS` dataset for the Request Observation page; the Traffic and Event datasets are accumulated for future Analytics Engine providers. Reading the datasets requires an API Token. In system settings, enter your Cloudflare Account ID and an API Token with the "Account Analytics" read permission. Reader configuration remains in the primary D1 database. See the "Guide" button in the InsightFlare dashboard settings page for details.
 
 ### Connect AI Agents for Analysis
 
@@ -274,6 +278,25 @@ Available methods:
 - `setGlobalProperties(props)`: Add shared properties to subsequent events.
 - `clearGlobalProperties()`: Clear shared properties.
 
+#### Identify Users
+
+Associate the current visit with a signed-in user without changing the anonymous visitor boundary:
+
+```html
+<script>
+  window.insightflare.identify("user-123", { name: "Alice" });
+</script>
+```
+
+Call `identify` after sign-in so the current and subsequent visits can be analyzed together. Calling it before the first page view is also supported. On logout, call `reset()` to end the current identity, create a new anonymous visitor boundary, and prevent later events from inheriting the old account:
+
+```js
+window.insightflare.reset();
+window.insightflare.identify("user-456", { name: "Bob" });
+```
+
+Use `reset()` before switching accounts. Calling `identify("user-456")` alone does not create a new visitor boundary.
+
 #### Automatic Reporting via DOM Attributes
 
 ```html
@@ -309,14 +332,6 @@ Available methods:
   ...
 </form>
 
-<!-- 5. Trigger once when an element enters the viewport -->
-<section
-  data-insightflare-event="pricing_viewed"
-  data-insightflare-event-trigger="enterviewport"
-  data-insightflare-event-plan="pro"
->
-  ...
-</section>
 ```
 
 ## Tech Stack

@@ -61,8 +61,8 @@ describe("dashboard client empty data builders", () => {
   });
 
   it("preserves requested empty metadata values", () => {
-    expect(emptyEventsRecords(33).meta).toMatchObject({
-      pageSize: 33,
+    expect(emptyEventsRecords(33).data.pagination).toMatchObject({
+      limit: 33,
       returned: 0,
       hasMore: false,
       nextCursor: null,
@@ -73,14 +73,22 @@ describe("dashboard client empty data builders", () => {
       ok: true,
       fieldPath: "payload.plan",
       fieldValueType: "string",
-      data: [],
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
     });
   });
 
   it("builds empty dashboard dimension containers", () => {
-    expect(emptyVisitors().meta.pageSize).toBe(0);
-    expect(emptySessions().meta).toEqual({
-      pageSize: 0,
+    expect(emptyVisitors().data.pagination.limit).toBe(1);
+    expect(emptySessions().data.pagination).toEqual({
+      limit: 1,
       returned: 0,
       hasMore: false,
       nextCursor: null,
@@ -116,12 +124,78 @@ describe("dashboard client empty data builders", () => {
       visitors: 0,
       approximateVisitors: false,
     });
-    expect(emptyPages()).toEqual({ ok: true, data: [] });
-    expect(emptyReferrers()).toEqual({ ok: true, data: [] });
-    expect(emptyDimension()).toEqual({ ok: true, data: [] });
-    expect(emptyOverviewTab()).toEqual({ ok: true, data: [] });
-    expect(emptyOverviewGeoTab()).toEqual({ ok: true, data: [] });
-    expect(emptyDashboardFilterOptions()).toEqual({ ok: true, data: [] });
+    expect(emptyPages()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
+    expect(emptyReferrers()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
+    expect(emptyDimension()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
+    expect(emptyOverviewTab()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
+    expect(emptyOverviewGeoTab()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
+    expect(emptyDashboardFilterOptions()).toEqual({
+      ok: true,
+      data: {
+        items: [],
+        pagination: {
+          limit: 1,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      },
+    });
     expect(emptyPageCardTabs()).toEqual({
       path: [],
       title: [],

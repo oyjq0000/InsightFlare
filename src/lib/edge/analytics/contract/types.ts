@@ -1,6 +1,14 @@
 import type { ZonedInterval } from "@/lib/dashboard/time-zone";
+import type { PageRequest, PageResult, PaginationMeta } from "@/lib/pagination";
 
 import type { FilterDocument } from "./filters";
+import type { FunnelProgressionScope, FunnelStepV2 } from "./funnel-config";
+import type {
+  FilterScope,
+  FilterScopePreference,
+  ScopedDatasetSql,
+  ScopedFilterPlan,
+} from "./scoped-filter";
 
 /** Branded primitives keep protocol strings and unvalidated numbers out of the domain layer. */
 export type Brand<T, Name extends string> = T & {
@@ -23,6 +31,8 @@ export interface QueryTime {
   readonly range: TimeRange;
   readonly reportingTimeZone: ReportingTimeZone;
   readonly capturedAtMs: EpochMs;
+  /** API v1 raw-request identity used to keep preset cursors stable. */
+  readonly paginationBinding?: string;
 }
 
 export interface CalendarBucket {
@@ -76,6 +86,9 @@ export type QueryOperation =
   | "event-field-values"
   | "event-context"
   | "event-records"
+  | "visitor-events"
+  | "visitor-sessions"
+  | "session-events"
   | "event-record-detail"
   | "journey-event-detail"
   | "visitors"
@@ -83,6 +96,8 @@ export type QueryOperation =
   | "sessions"
   | "session-detail"
   | "funnel-analysis"
+  | "goal-summary"
+  | "goal-timeseries"
   | "team-dashboard"
   | "explore";
 
@@ -104,12 +119,9 @@ export interface QueryLimits {
   readonly maxRangeMs?: number;
   readonly maxBuckets?: number;
   readonly maxLimit?: number;
-  readonly maxOffset?: number;
   readonly maxFilterClauses?: number;
   readonly maxCursorBytes?: number;
 }
-
-export type PaginationKind = "none" | "offset" | "keyset";
 
 export interface QueryPolicy {
   readonly revision: string;
@@ -119,7 +131,8 @@ export interface QueryPolicy {
   readonly allowedFilters: ReadonlySet<string>;
   readonly allowedDetails: ReadonlySet<DetailCapability>;
   readonly limits: QueryLimits;
-  readonly allowedPagination: ReadonlySet<PaginationKind>;
+  /** Whether this operation exposes a cursor-bounded collection. */
+  readonly cursorPagination: boolean;
 }
 
 export interface QueryContext {
@@ -131,6 +144,12 @@ export interface QueryContext {
 export interface QueryInput {
   readonly context: QueryContext;
   readonly filters?: FilterDocument;
+  /** Missing scope is normalized to Auto at the application boundary. */
+  readonly scopePreference?: FilterScopePreference;
+  /** Internal compiled plan attached before a provider is invoked. */
+  readonly scopePlan?: ScopedFilterPlan;
+  /** Internal provider relation bundle for a resolved historical dataset. */
+  readonly scopedDataset?: ScopedDatasetSql;
 }
 
 export type SortDirection = "asc" | "desc";
@@ -140,44 +159,16 @@ export interface Sort<Key extends string = string> {
   readonly direction: SortDirection;
 }
 
-export interface OffsetPageRequest {
-  readonly kind: "offset";
-  readonly offset: number;
-  readonly limit: number;
-}
-
-export interface KeysetPageRequest<Cursor> {
-  readonly kind: "keyset";
-  readonly limit: number;
-  readonly after: Cursor | null;
-}
-
-export interface OffsetPage<T> {
-  readonly items: readonly T[];
-  readonly page: {
-    readonly kind: "offset";
-    readonly offset: number;
-    readonly limit: number;
-    readonly total: number;
-  };
-}
-
-export interface KeysetPage<T, Cursor> {
-  readonly items: readonly T[];
-  readonly page: {
-    readonly kind: "keyset";
-    readonly limit: number;
-    readonly next: Cursor | null;
-    readonly hasMore: boolean;
-  };
-}
-
 export type QuerySource = "raw" | "rollup" | "mixed" | "mock";
 
 export interface QueryResultMeta {
   readonly time: QueryTime;
   readonly source: QuerySource;
   readonly approximateVisitors: boolean;
+  readonly filterScope?: {
+    readonly requested: FilterScopePreference;
+    readonly resolved: FilterScope;
+  };
 }
 
 export interface InputIssue {
@@ -220,6 +211,8 @@ export interface BaseQuery extends QueryInput {
   readonly time: QueryTime;
 }
 
+export type { PageRequest, PageResult, PaginationMeta } from "@/lib/pagination";
+
 export const COMPARISON_METRIC_KEYS = [
   "views",
   "sessions",
@@ -238,10 +231,28 @@ export type ComparisonMetricKey = (typeof COMPARISON_METRIC_KEYS)[number];
 export interface ComparisonDatasetQuery {
   readonly time: QueryTime;
   readonly filters?: FilterDocument;
+  readonly scopePreference?: FilterScopePreference;
+}
+
+/**
+ * The table comparison contract is intentionally smaller than the public
+ * comparison-breakdown API.  Overview table endpoints keep their existing
+ * route and receive both concrete datasets in one request.
+ */
+export type OverviewTableMetric = "views" | "visitors" | "sessions";
+export type OverviewTableSortBy = "current" | "reference" | "change";
+
+export interface OverviewTableComparisonQuery {
+  readonly current: ComparisonDatasetQuery;
+  readonly reference: ComparisonDatasetQuery;
+  readonly metric: OverviewTableMetric;
+  readonly sortBy: OverviewTableSortBy;
+  readonly direction: SortDirection;
 }
 
 export interface ComparisonQuery {
   readonly context: QueryContext;
+  readonly scopePreference?: FilterScopePreference;
   readonly current: ComparisonDatasetQuery;
   readonly reference: ComparisonDatasetQuery;
   readonly metrics: readonly ComparisonMetricKey[];
@@ -360,11 +371,14 @@ export interface ComparisonBreakdownResult {
 export interface DimensionQuery extends BaseQuery {
   readonly dimension?: AnalyticsDimension;
   readonly limit?: number;
+  readonly page?: PageRequest;
   readonly sort?: Sort;
+  readonly search?: string;
+  readonly comparison?: OverviewTableComparisonQuery;
 }
 
 export interface PageQuery extends BaseQuery {
-  readonly pagination?: OffsetPageRequest | KeysetPageRequest<CanonicalObject>;
+  readonly page?: PageRequest;
   readonly sort?: Sort;
 }
 
@@ -393,14 +407,16 @@ export type FilterOptionsQuery = DimensionQuery;
 export interface FilterValuesQuery extends BaseQuery {
   readonly field: string;
   readonly search?: string;
-  readonly limit: number;
+  readonly limit?: number;
+  readonly page?: PageRequest;
 }
 export interface EventFieldValuesQuery extends BaseQuery {
   readonly eventName: string;
   readonly fieldPath: string;
   readonly fieldValueType: string;
   readonly search?: string;
-  readonly limit: number;
+  readonly limit?: number;
+  readonly page?: PageRequest;
 }
 export type GeoPointsQuery = BaseQuery;
 export type TopPagesQuery = PagesQuery;
@@ -458,11 +474,18 @@ export interface ChannelItem {
 export interface PagesQuery extends BaseQuery {
   readonly limit: number;
   readonly includeDetails: boolean;
+  readonly page?: PageRequest;
 }
 
 export interface ReferrersQuery extends BaseQuery {
   readonly limit: number;
   readonly includeFullUrl: boolean;
+  readonly search?: string;
+  readonly page?: PageRequest;
+  readonly sort?: "views" | "visitors";
+  readonly direction?: SortDirection;
+  readonly variant?: "list" | "summary";
+  readonly topN?: number;
 }
 
 export interface ChannelsQuery extends BaseQuery {
@@ -471,49 +494,66 @@ export interface ChannelsQuery extends BaseQuery {
 
 export interface PagesResult {
   readonly items: readonly PageItem[];
+  readonly pagination: PaginationMeta;
 }
 
 export interface ReferrersResult {
   readonly items: readonly ReferrerItem[];
+  readonly pagination: PaginationMeta;
+}
+
+export interface ReferrerSummaryResult {
+  readonly totalViews: number;
+  readonly directViews: number;
+  readonly externalViews: number;
+  readonly uniqueDomains: number;
+  readonly uniqueLinks: number;
+  readonly truncated: boolean;
+  readonly topSources: readonly {
+    readonly referrer: string;
+    readonly views: number;
+  }[];
 }
 
 export interface ChannelsResult {
   readonly items: readonly ChannelItem[];
 }
 
-export interface FunnelStepConfig {
-  readonly type: "pageview" | "event";
-  readonly value: string;
-}
+export type FunnelStepConfig = FunnelStepV2;
 
 export interface FunnelDefinition {
   readonly id: string;
   readonly siteId: string;
   readonly name: string;
-  readonly steps: FunnelStepConfig[];
+  readonly filterDslVersion: 1;
+  readonly progressionScope: FunnelProgressionScope;
+  readonly conversionWindowMs: number | null;
+  readonly steps: FunnelStepV2[];
+  readonly semanticFingerprint: string;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
 
 export interface FunnelAnalysisStep {
+  readonly stepId: string;
   readonly index: number;
-  readonly label: string;
-  readonly type: FunnelStepConfig["type"];
   readonly sessions: number;
   readonly visitors: number;
-  readonly conversionRate: number;
-  readonly stepConversionRate: number;
-  readonly dropOffSessions: number;
-  readonly dropOffRate: number;
+  readonly progression: {
+    readonly count: number;
+    readonly conversionRate: number;
+    readonly stepConversionRate: number;
+    readonly dropOffCount: number;
+    readonly dropOffRate: number;
+  };
 }
 
 export interface FunnelAnalysis {
+  readonly progressionScope: FunnelProgressionScope;
   readonly steps: FunnelAnalysisStep[];
   readonly summary: {
-    readonly totalSessions: number;
-    readonly convertedSessions: number;
-    readonly totalVisitors: number;
-    readonly convertedVisitors: number;
+    readonly totalProgressions: number;
+    readonly convertedProgressions: number;
     readonly overallConversionRate: number;
     readonly largestDropOffStepIndex: number | null;
   };
@@ -563,7 +603,10 @@ export interface FilterValueOption {
 }
 export interface FilterValuesResult {
   readonly field: string;
-  readonly data: readonly FilterValueOption[];
+  readonly data: {
+    readonly items: readonly FilterValueOption[];
+    readonly pagination: PaginationMeta;
+  };
 }
 export type GeoPointsResult = CanonicalObject;
 export type TopPagesResult = PagesResult;
@@ -581,13 +624,11 @@ export interface EventQueryOperations {
   trend(input: EventQuery): Promise<AnalyticsResult<CanonicalObject>>;
   records(
     input: PageQuery,
-  ): Promise<AnalyticsResult<KeysetPage<CanonicalObject, CanonicalObject>>>;
+  ): Promise<AnalyticsResult<PageResult<CanonicalObject>>>;
 }
 
 export interface JourneyQueryOperations {
-  list(
-    input: PageQuery,
-  ): Promise<AnalyticsResult<KeysetPage<CanonicalObject, CanonicalObject>>>;
+  list(input: PageQuery): Promise<AnalyticsResult<PageResult<CanonicalObject>>>;
   detail(input: JourneyQuery): Promise<AnalyticsResult<CanonicalObject>>;
 }
 
@@ -623,7 +664,7 @@ export interface TypedQueryOperations {
     top(input: TopPagesQuery): Promise<AnalyticsResult<TopPagesResult>>;
     dashboard(
       input: PagesDashboardQuery,
-    ): Promise<AnalyticsResult<OffsetPage<DashboardPage>>>;
+    ): Promise<AnalyticsResult<PageResult<DashboardPage>>>;
     referrers(input: ReferrerQuery): Promise<AnalyticsResult<ReferrerResult>>;
   };
   readonly channels: {

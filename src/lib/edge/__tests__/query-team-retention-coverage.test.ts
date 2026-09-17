@@ -286,6 +286,8 @@ describe("edge team query coverage", () => {
     for (const migration of [
       "migrations/0008_rebuild_analytics.sql",
       "migrations/0013_add_visit_performance_metrics.sql",
+      "migrations/0017_structured_custom_events.sql",
+      "migrations/0019_add_user_identity.sql",
     ]) {
       database.exec(readFileSync(migration, "utf8"));
     }
@@ -753,7 +755,13 @@ describe("edge journey retention coverage", () => {
       ],
     });
     expect(calls[0].sql).toContain("MIN(bucket) AS cohort_bucket");
-    expect(calls[0].bindings).toEqual([...visitBindings(), "us"]);
+    expect(calls[0].sql).toContain("FROM scope_final_visits");
+    expect(calls[0].bindings).toEqual([
+      ...visitBindings(),
+      ...visitBindings(),
+      "us",
+      "us",
+    ]);
   });
 
   it("materializes retention visits once while preserving cohort results", async () => {
@@ -764,6 +772,16 @@ describe("edge journey retention coverage", () => {
     database.exec(
       readFileSync("migrations/0013_add_visit_performance_metrics.sql", "utf8"),
     );
+    database.exec(
+      readFileSync("migrations/0017_structured_custom_events.sql", "utf8"),
+    );
+    database.exec(
+      readFileSync("migrations/0019_add_user_identity.sql", "utf8"),
+    );
+    database.exec(`
+      ALTER TABLE custom_event_names ADD COLUMN site_pk INTEGER;
+      ALTER TABLE custom_events ADD COLUMN site_pk INTEGER;
+    `);
     addSiteIdentityFixture(database, [siteId]);
     const calls: Array<{ sql: string; bindings: QueryBinding[] }> = [];
     const env = {

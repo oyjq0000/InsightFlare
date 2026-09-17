@@ -114,6 +114,11 @@ export interface FilterFieldDefinition {
   readonly valueKind: FilterValueKind;
   readonly operators: ReadonlySet<FilterOperator>;
   readonly audiences: ReadonlySet<QueryAudience>;
+  readonly number?: {
+    readonly min?: number;
+    readonly max?: number;
+    readonly step?: number;
+  };
   /** Set-to-scalar reduction is only sound when the storage profile proves it. */
   readonly singletonSetEquivalent?: boolean;
   readonly canonicalize?: (value: FilterValue) => FilterValue;
@@ -350,6 +355,33 @@ function canonicalValue(
       fail("invalid_number", path, "Expected a finite numeric filter value.");
     }
     value = Object.is(raw, -0) ? 0 : raw;
+    if (definition.number?.min !== undefined && value < definition.number.min) {
+      fail(
+        "number_below_minimum",
+        path,
+        "Numeric filter value is below the field minimum.",
+      );
+    }
+    if (definition.number?.max !== undefined && value > definition.number.max) {
+      fail(
+        "number_above_maximum",
+        path,
+        "Numeric filter value is above the field maximum.",
+      );
+    }
+    if (definition.number?.step !== undefined) {
+      const step = definition.number.step;
+      const base = definition.number.min ?? 0;
+      const quotient = (value - base) / step;
+      const tolerance = Number.EPSILON * Math.max(1, Math.abs(quotient)) * 8;
+      if (Math.abs(quotient - Math.round(quotient)) > tolerance) {
+        fail(
+          "number_not_on_step",
+          path,
+          "Numeric filter value does not match the field step.",
+        );
+      }
+    }
   } else if (definition.valueKind === "boolean") {
     if (typeof raw !== "boolean") {
       fail("invalid_boolean", path, "Expected a boolean filter value.");
@@ -924,6 +956,19 @@ export function hasEffectiveFilters(document: FilterDocument): boolean {
   return document.root !== null;
 }
 
+function filterDocumentWithRoot(
+  document: FilterDocument,
+  root: FilterExpression | null,
+): FilterDocument {
+  const result = { version: document.version, root } as FilterDocument;
+  for (const key of Reflect.ownKeys(document)) {
+    if (typeof key !== "symbol") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(document, key);
+    if (descriptor) Object.defineProperty(result, key, descriptor);
+  }
+  return result;
+}
+
 /**
  * Removes only the target field's atomic conditions at the top facet level.
  * Nested OR/NOT (and compound AND) expressions are deliberately preserved.
@@ -940,17 +985,17 @@ export function stripTopLevelFacet(
     expression.target.field === field;
 
   if (targetsField(root)) {
-    return { version: document.version, root: null };
+    return filterDocumentWithRoot(document, null);
   }
   if (root.kind !== "and") return document;
 
   const children = root.children.filter((child) => !targetsField(child));
   if (children.length === root.children.length) return document;
-  if (children.length === 0) return { version: document.version, root: null };
+  if (children.length === 0) return filterDocumentWithRoot(document, null);
   if (children.length === 1) {
-    return { version: document.version, root: children[0]! };
+    return filterDocumentWithRoot(document, children[0]!);
   }
-  return { version: document.version, root: { kind: "and", children } };
+  return filterDocumentWithRoot(document, { kind: "and", children });
 }
 
 export function filterConditionCount(document: FilterDocument): number {

@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   ANALYTICS_FILTER_FIELD_IDS,
+  analyticsFilterDefinition,
   analyticsFilterRegistry,
   assertFilterAudience,
+  attachFilterScopePreference,
   type FilterFieldDefinition,
   type FilterFieldRegistry,
   filterFingerprint,
+  filterScopePreferenceFromDocument,
   hasEffectiveFilters,
   normalizeFilterDocument,
   queryPolicyForAudience,
@@ -115,6 +118,15 @@ describe("typed filter contract", () => {
       analyticsFilterRegistry.get("geo.country")?.operators.has("contains"),
     ).toBe(false);
     expect(analyticsFilterRegistry.get("page.path")?.valueKind).toBe("string");
+    expect([
+      ...(analyticsFilterDefinition("page.path")?.observationKinds ?? []),
+    ]).toEqual(["visit", "event"]);
+    expect([
+      ...(analyticsFilterDefinition("event.name")?.observationKinds ?? []),
+    ]).toEqual(["event"]);
+    expect([
+      ...(analyticsFilterDefinition("event.payload")?.observationKinds ?? []),
+    ]).toEqual(["event"]);
     expect(analyticsFilterRegistry.get("event.payload")?.valueKind).toBe(
       "json-scalar",
     );
@@ -142,6 +154,28 @@ describe("typed filter contract", () => {
     expect(publicPolicy.allowedFilters.has("referrer.url")).toBe(false);
     expect(publicPolicy.allowedFilters.has("event.payload")).toBe(false);
     expect(analyticsFilterRegistry.has("geo.country")).toBe(true);
+
+    const privateEventDocument = normalizeFilterDocument(
+      {
+        version: 1,
+        root: fieldCondition("event.name", "eq", "purchase"),
+      },
+      analyticsFilterRegistry,
+    );
+    expect(() =>
+      assertFilterAudience(
+        privateEventDocument,
+        analyticsFilterRegistry,
+        "public-share",
+      ),
+    ).toThrow(/not allowed/);
+    expect(() =>
+      assertFilterAudience(
+        privateEventDocument,
+        analyticsFilterRegistry,
+        "api-v1",
+      ),
+    ).not.toThrow();
   });
 
   it("normalizes dot-namespaced fields, values, and commutative groups", () => {
@@ -186,7 +220,18 @@ describe("typed filter contract", () => {
       { version: 1, root: { kind: "and", children: [target, other] } },
       registry,
     );
-    expect(stripTopLevelFacet(conjunction, "page.path").root).toEqual(other);
+    const scopedConjunction = attachFilterScopePreference(
+      conjunction,
+      "visitor",
+    );
+    const strippedConjunction = stripTopLevelFacet(
+      scopedConjunction,
+      "page.path",
+    );
+    expect(strippedConjunction.root).toEqual(other);
+    expect(filterScopePreferenceFromDocument(strippedConjunction)).toBe(
+      "visitor",
+    );
 
     const nestedOr = normalizeFilterDocument(
       {

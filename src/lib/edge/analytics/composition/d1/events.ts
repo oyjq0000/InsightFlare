@@ -5,7 +5,6 @@ import {
   mapEventAnalyticsContextCards,
   mapEventField,
   mapEventFieldValue,
-  mapEventRecord,
   mapEventSummaryCards,
   mapTabs,
 } from "@/lib/edge/analytics/providers/d1/internal/core";
@@ -14,23 +13,26 @@ import {
   queryEventAnalyticsContextCardsFromD1,
 } from "@/lib/edge/analytics/providers/d1/internal/events-context";
 import {
-  queryEventFieldsFromD1,
-  queryEventFieldValuesFromD1,
+  queryEventFieldsPageFromD1,
+  queryEventFieldValuesPageFromD1,
+} from "@/lib/edge/analytics/providers/d1/internal/events-fields";
+import {
+  decodeEventFieldCursor,
+  decodeEventFieldValueCursor,
 } from "@/lib/edge/analytics/providers/d1/internal/events-fields";
 import { queryEventTypeOverviewFromD1 } from "@/lib/edge/analytics/providers/d1/internal/events-overview";
+import { queryEventRecordDetailFromD1 } from "@/lib/edge/analytics/providers/d1/internal/events-records";
 import {
-  queryEventRecordDetailFromD1,
-  queryEventRecordPageFromD1,
-  serializeEventRecordCursor,
-} from "@/lib/edge/analytics/providers/d1/internal/events-records";
-import {
+  decodeEventTypeCursor,
   queryEventsSummaryFromD1,
-  queryEventTypeAggregate,
+  queryEventTypePageFromD1,
 } from "@/lib/edge/analytics/providers/d1/internal/events-summary";
 import {
   queryEventsTrendFromD1,
   queryEventTypeTrendFromD1,
 } from "@/lib/edge/analytics/providers/d1/internal/events-trend";
+import { readSiteEventRecords } from "@/lib/edge/analytics/providers/d1/operations/site-event-records";
+import { InvalidCursorError } from "@/lib/pagination";
 
 import {
   arrayField,
@@ -52,17 +54,36 @@ export function registerEventProviders(
       "event-types",
       typedQueryProvider(async (input) => {
         const request = query(input!);
+        const limit = numberField(request, "limit", 20);
+        const search = stringField(request, "search") || undefined;
+        const cursorText = stringField(request, "cursor") || null;
+        const window = timeWindow(request.time);
+        const filters = request.filters ?? EMPTY_FILTER_DOCUMENT;
+        const cursor = await decodeEventTypeCursor(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          search,
+          cursorText,
+          request.context.policy.audience,
+        );
+        if (cursorText && !cursor) throw new InvalidCursorError("event-types");
+        const page = await queryEventTypePageFromD1(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          limit,
+          search,
+          cursor,
+          request.context.policy.audience,
+        );
         return {
-          value: mapTabs(
-            await queryEventTypeAggregate(
-              options.env,
-              options.siteId,
-              timeWindow(request.time),
-              request.filters ?? EMPTY_FILTER_DOCUMENT,
-              numberField(request, "limit", 20),
-              stringField(request, "search") || undefined,
-            ),
-          ),
+          value: {
+            items: mapTabs([...page.items]),
+            pagination: page.pagination,
+          },
         };
       }),
     )
@@ -117,31 +138,24 @@ export function registerEventProviders(
       "event-records",
       typedQueryProvider(async (input) => {
         const request = query(input!);
-        const page = await queryEventRecordPageFromD1(
-          options.env,
-          options.siteId,
-          timeWindow(request.time),
-          request.filters ?? EMPTY_FILTER_DOCUMENT,
-          {
-            pageSize: numberField(request, "pageSize", 80),
-            sort: request.sort as never,
+        return {
+          value: await readSiteEventRecords({
+            env: options.env,
+            siteId: options.siteId,
+            window: timeWindow(request.time),
+            filters: request.filters ?? EMPTY_FILTER_DOCUMENT,
+            audience: request.context.policy.audience,
+            sort: (request.sort as never) ?? {
+              field: "occurredAt",
+              direction: "desc",
+            },
             search: stringField(request, "search") || undefined,
             eventName: stringField(request, "eventName") || undefined,
-            cursor: (request.cursor as never) ?? null,
-          },
-        );
-        return {
-          value: {
-            data: page.rows.map(mapEventRecord),
-            meta: {
-              pageSize: numberField(request, "pageSize", 80),
-              returned: page.rows.length,
-              hasMore: page.nextCursor !== null,
-              nextCursor: page.nextCursor
-                ? serializeEventRecordCursor(page.nextCursor)
-                : null,
-            },
-          },
+            page:
+              request.page && typeof request.page === "object"
+                ? (request.page as { limit: number; cursor?: string | null })
+                : { limit: numberField(request, "limit", 80), cursor: null },
+          }),
         };
       }),
     )
@@ -152,23 +166,46 @@ export function registerEventProviders(
         const eventName = stringField(request, "eventName") || undefined;
         const fieldPath = stringField(request, "fieldPath");
         const fieldValueType = stringField(request, "fieldValueType");
+        const limit = numberField(request, "limit", 25);
+        const search = stringField(request, "search") || undefined;
+        const window = timeWindow(request.time);
+        const filters = request.filters ?? EMPTY_FILTER_DOCUMENT;
+        const cursorText = stringField(request, "cursor") || null;
+        const cursor = await decodeEventFieldValueCursor(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          eventName,
+          fieldPath,
+          fieldValueType,
+          search,
+          cursorText,
+          request.context.policy.audience,
+        );
+        if (cursorText && !cursor)
+          throw new InvalidCursorError("event-field-values");
+        const page = await queryEventFieldValuesPageFromD1(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          eventName,
+          fieldPath,
+          fieldValueType,
+          limit,
+          search,
+          cursor,
+          request.context.policy.audience,
+        );
         return {
           value: {
             fieldPath,
             fieldValueType,
-            data: (
-              await queryEventFieldValuesFromD1(
-                options.env,
-                options.siteId,
-                timeWindow(request.time),
-                request.filters ?? EMPTY_FILTER_DOCUMENT,
-                eventName,
-                fieldPath,
-                fieldValueType,
-                numberField(request, "limit", 25),
-                stringField(request, "search") || undefined,
-              )
-            ).map(mapEventFieldValue),
+            data: {
+              items: page.items.map(mapEventFieldValue),
+              pagination: page.pagination,
+            },
           },
         };
       }),
@@ -178,21 +215,37 @@ export function registerEventProviders(
       typedQueryProvider(async (input) => {
         const request = query(input!);
         const eventName = stringField(request, "eventName") || undefined;
+        const limit = numberField(request, "limit", 100);
+        const window = timeWindow(request.time);
+        const filters = request.filters ?? EMPTY_FILTER_DOCUMENT;
+        const cursorText = stringField(request, "cursor") || null;
+        const cursor = await decodeEventFieldCursor(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          eventName,
+          cursorText,
+          request.context.policy.audience,
+        );
+        if (cursorText && !cursor) throw new InvalidCursorError("event-fields");
+        const page = await queryEventFieldsPageFromD1(
+          options.env,
+          options.siteId,
+          window,
+          filters,
+          eventName,
+          limit,
+          cursor,
+          request.context.policy.audience,
+        );
         return {
           value: {
             eventName,
-            fields: (
-              await measured("event_type_fields", () =>
-                queryEventFieldsFromD1(
-                  options.env,
-                  options.siteId,
-                  timeWindow(request.time),
-                  request.filters ?? EMPTY_FILTER_DOCUMENT,
-                  eventName,
-                  numberField(request, "limit", 100),
-                ),
-              )
-            ).map(mapEventField),
+            data: {
+              items: page.items.map(mapEventField),
+              pagination: page.pagination,
+            },
           },
         };
       }),
@@ -236,8 +289,7 @@ export function registerEventProviders(
         const eventName = stringField(request, "eventName");
         const includeContext = request.includeContext !== false;
         const includeBreakdowns = request.includeBreakdowns !== false;
-        const includeFields = request.includeFields !== false;
-        const [overview, trend, fields, cards] = await Promise.all([
+        const [overview, trend, cards] = await Promise.all([
           measured("event_type_detail.overview", () =>
             queryEventTypeOverviewFromD1(
               options.env,
@@ -258,18 +310,6 @@ export function registerEventProviders(
               eventName,
             ),
           ),
-          includeFields
-            ? measured("event_type_detail.fields", () =>
-                queryEventFieldsFromD1(
-                  options.env,
-                  options.siteId,
-                  timeWindow(request.time),
-                  request.filters ?? EMPTY_FILTER_DOCUMENT,
-                  eventName,
-                  100,
-                ),
-              )
-            : Promise.resolve([]),
           includeContext
             ? measured("event_type_detail.context_cards", () =>
                 queryEventAnalyticsContextCardsFromD1(
@@ -297,7 +337,6 @@ export function registerEventProviders(
             cards: cards
               ? mapEventAnalyticsContextCards(cards)
               : emptyEventContextCards(),
-            fields: fields.map(mapEventField),
           },
         };
       }),

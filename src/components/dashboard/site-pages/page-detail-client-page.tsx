@@ -1,7 +1,10 @@
 import { memo, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { AsyncDimensionBreakdownCard } from "@/components/dashboard/async-dimension-breakdown-card";
+import {
+  AsyncDimensionBreakdownCard,
+  type AsyncDimensionBreakdownLoader,
+} from "@/components/dashboard/async-dimension-breakdown-card";
 import {
   OverviewMetricsSection,
   OverviewPagesSection,
@@ -102,17 +105,51 @@ export const PageDetailClientPage = memo(function PageDetailClientPage({
         requestedSiteId: string,
         requestedWindow: TimeWindow,
         requestedFilters: FilterDocument,
+        _resolvedScope?: unknown,
+        options?: {
+          limit?: number;
+          cursor?: string | null;
+          search?: string;
+          sort?: "views" | "visitors" | "sessions";
+          direction?: "asc" | "desc";
+          signal?: AbortSignal;
+        },
       ) =>
         fetchPageHashTab(requestedSiteId, requestedWindow, requestedFilters, {
-          limit: 100,
+          limit: options?.limit ?? 100,
+          cursor: options?.cursor,
+          search: options?.search,
+          sort: options?.sort,
+          direction: options?.direction,
+          signal: options?.signal,
         }),
       query: (
         requestedSiteId: string,
         requestedWindow: TimeWindow,
         requestedFilters: FilterDocument,
+        resolvedScope?: unknown,
+        options?: {
+          limit?: number;
+          cursor?: string | null;
+          search?: string;
+          sort?: "views" | "visitors" | "sessions";
+          direction?: "asc" | "desc";
+          signal?: AbortSignal;
+        },
       ) =>
         fetchPageQueryTab(requestedSiteId, requestedWindow, requestedFilters, {
-          limit: 100,
+          limit: options?.limit ?? 100,
+          cursor: options?.cursor,
+          search: options?.search,
+          sort: options?.sort,
+          direction: options?.direction,
+          signal: options?.signal,
+          resolvedScope:
+            resolvedScope === "event" ||
+            resolvedScope === "session" ||
+            resolvedScope === "visitor"
+              ? resolvedScope
+              : undefined,
         }),
     }),
     [],
@@ -219,6 +256,24 @@ export const PageDetailClientPage = memo(function PageDetailClientPage({
       messages.pages.eventsMetric,
     ],
   );
+  const eventLoader = useMemo<AsyncDimensionBreakdownLoader<"event">>(
+    () =>
+      async ({ cursor, limit, search, signal, sort }) => {
+        const page = await fetchEventTypesTab(siteId, window, detailFilters, {
+          cursor,
+          limit,
+          search,
+          sort: sort.key === "visitors" ? "visitors" : "views",
+          direction: sort.direction,
+          signal,
+        });
+        const items = mapOverviewRows(page.items, messages.common.unknown, {
+          mono: true,
+        });
+        return { items, pagination: page.pagination };
+      },
+    [detailFilters, messages.common.unknown, siteId, window],
+  );
 
   const { data: titleRows, isFetching: titlesLoading } = useQuery({
     queryKey: ["dashboard", "page-detail-titles", detailRequestKey],
@@ -231,7 +286,7 @@ export const PageDetailClientPage = memo(function PageDetailClientPage({
   });
   const titles = useMemo(
     () =>
-      (titleRows ?? [])
+      (titleRows?.items ?? [])
         .map((row) => String(row.label ?? "").trim())
         .filter((value) => value.length > 0)
         .slice(0, 3),
@@ -343,15 +398,7 @@ export const PageDetailClientPage = memo(function PageDetailClientPage({
         messages={messages}
         tabs={eventTabs}
         requestKey={`${detailRequestKey}:event`}
-        loadRows={async () =>
-          mapOverviewRows(
-            await fetchEventTypesTab(siteId, window, detailFilters, {
-              limit: 100,
-            }),
-            messages.common.unknown,
-            { mono: true },
-          )
-        }
+        loader={eventLoader}
       />
     </div>
   );

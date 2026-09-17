@@ -15,7 +15,9 @@ import {
   handlePlannedSiteEventTypeDetail,
   handlePlannedSiteEventTypes,
   handlePlannedSiteFilterValues,
+  handlePlannedSiteJourneyEventDetail,
   handlePlannedSitePages,
+  handlePlannedSitePerformanceBreakdown,
   handlePlannedSitePerformanceSummary,
   handlePlannedSitePerformanceTimeseries,
   handlePlannedSiteRealtimeActiveVisitors,
@@ -40,7 +42,9 @@ import {
   type SiteEventTypeDetailReader,
   type SiteEventTypesReader,
   type SiteFilterValuesReader,
+  type SiteJourneyEventDetailReader,
   type SitePagesReader,
+  type SitePerformanceBreakdownReader,
   type SitePerformanceSummaryReader,
   type SitePerformanceTimeseriesReader,
   type SiteRealtimeActiveVisitorsReader,
@@ -101,6 +105,7 @@ function request(
     | "filter-values"
     | "retention/cohorts"
     | "performance/summary"
+    | "performance/breakdown"
     | "performance/timeseries"
     | "events/summary"
     | "events/timeseries"
@@ -136,21 +141,83 @@ function request(
 }
 
 describe("planned site list analytics adapters", () => {
+  it("keeps API v1 preset cursors stable across captured times", async () => {
+    const pages = vi.fn<SitePagesReader>().mockResolvedValue({
+      items: [],
+      pagination: {
+        limit: 20,
+        returned: 0,
+        hasMore: false,
+        nextCursor: null,
+      },
+    });
+    const providerRegistry = createTestProviderRegistry(pages);
+    const first = await handlePlannedSitePages(
+      request("pages", {
+        timeRange: { kind: "preset", preset: "today", timeZone: "UTC" },
+      }),
+      principal,
+      "site-1",
+      providerRegistry,
+      { capturedAtMs: Date.parse("2026-09-06T12:00:00.000Z") },
+    );
+    const second = await handlePlannedSitePages(
+      request("pages", {
+        timeRange: { kind: "preset", preset: "today", timeZone: "UTC" },
+        page: { limit: 20, cursor: "opaque-cursor" },
+      }),
+      principal,
+      "site-1",
+      providerRegistry,
+      { capturedAtMs: Date.parse("2026-09-06T12:01:00.000Z") },
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(pages).toHaveBeenCalledTimes(2);
+    const firstQuery = pages.mock.calls[0]?.[0] as unknown as {
+      time: { paginationBinding?: string };
+    };
+    const secondQuery = pages.mock.calls[1]?.[0] as unknown as {
+      time: { paginationBinding?: string };
+    };
+    expect(firstQuery.time.paginationBinding).toBe(
+      secondQuery.time.paginationBinding,
+    );
+  });
+
   it("serves strict page and referrer envelopes with DTO defaults", async () => {
     const pages = vi.fn<SitePagesReader>().mockResolvedValue({
       items: [
         { pathname: "/pricing", query: "", hash: "", views: 10, sessions: 4 },
       ],
+      pagination: {
+        limit: 20,
+        returned: 1,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     const referrers = vi.fn<SiteReferrersReader>().mockResolvedValue({
       items: [
         { referrer: "search.example", views: 10, sessions: 4, visitors: 3 },
       ],
+      pagination: {
+        limit: 20,
+        returned: 1,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     const filterValues = vi.fn<SiteFilterValuesReader>().mockResolvedValue({
       field: "page.path",
       items: [{ value: "/pricing", label: "/pricing", occurrences: 10 }],
-      page: { limit: 50, hasMore: false, nextCursor: null },
+      pagination: {
+        limit: 50,
+        returned: 1,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     const pageResponse = await handlePlannedSitePages(
       request("pages", { timeRange }),
@@ -182,10 +249,16 @@ describe("planned site list analytics adapters", () => {
     );
     expect(filterValuesBody.data.field).toBe("page.path");
     expect(pages).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 20, includeDetails: false }),
+      expect.objectContaining({
+        page: { limit: 20 },
+        includeDetails: false,
+      }),
     );
     expect(referrers).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 20, includeFullUrl: false }),
+      expect.objectContaining({
+        page: { limit: 20 },
+        includeFullUrl: false,
+      }),
     );
     expect(filterValues).toHaveBeenCalledWith(
       expect.objectContaining({ field: "page.path", page: { limit: 50 } }),
@@ -218,6 +291,9 @@ describe("planned site list analytics adapters", () => {
     const performanceSummary = vi
       .fn<SitePerformanceSummaryReader>()
       .mockResolvedValue({ metrics });
+    const performanceBreakdown = vi
+      .fn<SitePerformanceBreakdownReader>()
+      .mockResolvedValue({ dimension: "page.path", metric: "lcp", items: [] });
     const performanceTimeseries = vi
       .fn<SitePerformanceTimeseriesReader>()
       .mockResolvedValue({
@@ -231,6 +307,13 @@ describe("planned site list analytics adapters", () => {
         "site-1",
         createTestProviderRegistry(performanceSummary),
       );
+    const performanceBreakdownResponse =
+      await handlePlannedSitePerformanceBreakdown(
+        request("performance/breakdown", { timeRange }),
+        principal,
+        "site-1",
+        createTestProviderRegistry(performanceBreakdown),
+      );
     const performanceTimeseriesResponse =
       await handlePlannedSitePerformanceTimeseries(
         request("performance/timeseries", { timeRange, interval: "day" }),
@@ -243,6 +326,10 @@ describe("planned site list analytics adapters", () => {
         await performanceSummaryResponse.json(),
       ).success,
     ).toBe(true);
+    expect(performanceBreakdownResponse.status).toBe(200);
+    expect(performanceBreakdown).toHaveBeenCalledWith(
+      expect.objectContaining({ metric: "lcp", limit: 100 }),
+    );
     expect(
       AnalyticsPerformanceTimeseriesResponseSchema.safeParse(
         await performanceTimeseriesResponse.json(),
@@ -319,7 +406,7 @@ describe("planned site list analytics adapters", () => {
     };
     const search = vi.fn<SiteEventsSearchReader>().mockResolvedValue({
       items: [record],
-      page: { limit: 80, hasMore: false, nextCursor: null },
+      pagination: { limit: 80, returned: 1, hasMore: false, nextCursor: null },
     });
     const detail = vi.fn<SiteEventDetailReader>().mockResolvedValue({
       event: record,
@@ -371,12 +458,22 @@ describe("planned site list analytics adapters", () => {
       items: [
         { key: "signup", label: "signup", events: 3, sessions: 2, visitors: 2 },
       ],
-      page: { limit: 20 },
+      pagination: {
+        limit: 20,
+        returned: 1,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     const eventFields = vi.fn<SiteEventFieldsReader>().mockResolvedValue({
       eventName: "signup",
-      fields: [],
-      page: { limit: 100 },
+      items: [],
+      pagination: {
+        limit: 100,
+        returned: 0,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     const eventFieldValues = vi
       .fn<SiteEventFieldValuesReader>()
@@ -385,7 +482,12 @@ describe("planned site list analytics adapters", () => {
         fieldPath: "plan",
         fieldValueType: "string",
         items: [],
-        page: { limit: 25 },
+        pagination: {
+          limit: 25,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
       });
     const eventTypeDetail = vi
       .fn<SiteEventTypeDetailReader>()
@@ -427,7 +529,6 @@ describe("planned site list analytics adapters", () => {
             organization: [],
           },
         },
-        fields: [],
       });
     const eventTypesResponse = await handlePlannedSiteEventTypes(
       request("event-types", { timeRange }),
@@ -588,7 +689,15 @@ describe("planned site list analytics adapters", () => {
       ...principal,
       scopes: ["analytics:read", "analysis:read"],
     };
-    const pages = vi.fn<SitePagesReader>().mockResolvedValue({ items: [] });
+    const pages = vi.fn<SitePagesReader>().mockResolvedValue({
+      items: [],
+      pagination: {
+        limit: 20,
+        returned: 0,
+        hasMore: false,
+        nextCursor: null,
+      },
+    });
     const saved = request("pages", {
       timeRange,
       filter: { type: "saved", id: "filter-1" },
@@ -726,7 +835,12 @@ describe("planned site list analytics adapters", () => {
     const filterValues = vi.fn<SiteFilterValuesReader>().mockResolvedValue({
       field: "page.path",
       items: [],
-      page: { limit: 50, hasMore: false, nextCursor: null },
+      pagination: {
+        limit: 50,
+        returned: 0,
+        hasMore: false,
+        nextCursor: null,
+      },
     });
     expect(
       (
@@ -764,7 +878,12 @@ describe("planned site list analytics adapters", () => {
         return {
           field: "page.path",
           items: [],
-          page: { limit: 50, hasMore: false, nextCursor: null },
+          pagination: {
+            limit: 50,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         };
       });
     expect(
@@ -866,21 +985,33 @@ describe("planned site list analytics adapters", () => {
     const sessionDetail = vi
       .fn<SiteSessionDetailReader>()
       .mockResolvedValue({} as never);
-    const visitors = vi
-      .fn<SiteVisitorsSearchReader>()
-      .mockResolvedValue({ items: [], page: {} });
-    const sessions = vi
-      .fn<SiteSessionsSearchReader>()
-      .mockResolvedValue({ items: [], page: {} });
-    const visitorEvents = vi
-      .fn<SiteVisitorEventsReader>()
-      .mockResolvedValue({ items: [] });
+    const visitors = vi.fn<SiteVisitorsSearchReader>().mockResolvedValue({
+      items: [],
+      pagination: { limit: 100, returned: 0, hasMore: false, nextCursor: null },
+    });
+    const sessions = vi.fn<SiteSessionsSearchReader>().mockResolvedValue({
+      items: [],
+      pagination: { limit: 100, returned: 0, hasMore: false, nextCursor: null },
+    });
+    const visitorEvents = vi.fn<SiteVisitorEventsReader>().mockResolvedValue({
+      items: [],
+      pagination: { limit: 100, returned: 0, hasMore: false, nextCursor: null },
+    });
     const visitorSessions = vi
       .fn<SiteVisitorSessionsReader>()
-      .mockResolvedValue({ items: [] });
-    const sessionEvents = vi
-      .fn<SiteSessionEventsReader>()
-      .mockResolvedValue({ items: [] });
+      .mockResolvedValue({
+        items: [],
+        pagination: {
+          limit: 100,
+          returned: 0,
+          hasMore: false,
+          nextCursor: null,
+        },
+      });
+    const sessionEvents = vi.fn<SiteSessionEventsReader>().mockResolvedValue({
+      items: [],
+      pagination: { limit: 100, returned: 0, hasMore: false, nextCursor: null },
+    });
     const responses = await Promise.all([
       handlePlannedSiteVisitorDetail(
         request("visitors/detail", { timeRange, visitorId: "visitor-1" }),
@@ -928,5 +1059,29 @@ describe("planned site list analytics adapters", () => {
     expect(responses).toHaveLength(7);
     for (const response of responses)
       expect(response.status).toBeGreaterThanOrEqual(200);
+  });
+
+  it("invokes the planned journey event detail adapter", async () => {
+    const journey = vi
+      .fn<SiteJourneyEventDetailReader>()
+      .mockResolvedValue({ event: {}, context: {} });
+    const response = await handlePlannedSiteJourneyEventDetail(
+      new Request(
+        "https://app.test/api/v1/sites/site-1/analytics/journey-event-detail",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ timeRange, eventId: "event-1" }),
+        },
+      ),
+      principal,
+      "site-1",
+      createTestProviderRegistry(journey),
+    );
+
+    expect(response.status).toBe(200);
+    expect(journey).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: "event-1" }),
+    );
   });
 });

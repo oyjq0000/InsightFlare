@@ -3,19 +3,30 @@ import type { z } from "zod";
 import {
   type ApiV1ApplicationOperationId,
   CreateFunnelInputSchema,
+  CreateGoalInputSchema,
   CreateSiteInputSchema,
   DeleteSiteInputSchema,
   GetFunnelInputSchema,
+  GetGoalInputSchema,
   GetSiteInputSchema,
+  ListFunnelsInputSchema,
+  ListGoalsInputSchema,
   ListSitesInputSchema,
   SiteSettingsInputSchema,
   TrackingScriptInputSchema,
   UpdateFunnelInputSchema,
+  UpdateGoalInputSchema,
   UpdatePrivacySettingsInputSchema,
   UpdateSharingSettingsInputSchema,
   UpdateSiteInputSchema,
   UpdateTrackingSettingsInputSchema,
 } from "@/lib/api-v1/application-registry";
+import {
+  type ApiV1ErrorIssue,
+  fromInputIssues,
+  fromRequestBodyError,
+  fromZodIssues,
+} from "@/lib/api-v1/errors";
 import { readBoundedJson } from "@/lib/api-v1/request-budget";
 import { createResourceApplicationService } from "@/lib/api-v1/resource-application-service";
 import {
@@ -44,7 +55,12 @@ type ResourceRouteId =
   | "funnels.create"
   | "funnels.get"
   | "funnels.update"
-  | "funnels.delete";
+  | "funnels.delete"
+  | "goals.list"
+  | "goals.create"
+  | "goals.get"
+  | "goals.update"
+  | "goals.delete";
 
 interface ResourceRouteConfig {
   readonly operation: ResourceRouteId;
@@ -139,7 +155,7 @@ const routeConfigs: Record<ResourceRouteId, ResourceRouteConfig> = {
     operation: "funnels.list",
     method: "GET",
     scope: "analysis:read",
-    schema: SiteSettingsInputSchema,
+    schema: ListFunnelsInputSchema,
   },
   "funnels.create": {
     operation: "funnels.create",
@@ -165,6 +181,38 @@ const routeConfigs: Record<ResourceRouteId, ResourceRouteConfig> = {
     method: "DELETE",
     scope: "analysis:write",
     schema: GetFunnelInputSchema,
+    successStatus: 204,
+  },
+  "goals.list": {
+    operation: "goals.list",
+    method: "GET",
+    scope: "analysis:read",
+    schema: ListGoalsInputSchema,
+  },
+  "goals.create": {
+    operation: "goals.create",
+    method: "POST",
+    scope: "analysis:write",
+    schema: CreateGoalInputSchema,
+    successStatus: 201,
+  },
+  "goals.get": {
+    operation: "goals.get",
+    method: "GET",
+    scope: "analysis:read",
+    schema: GetGoalInputSchema,
+  },
+  "goals.update": {
+    operation: "goals.update",
+    method: "PATCH",
+    scope: "analysis:write",
+    schema: UpdateGoalInputSchema,
+  },
+  "goals.delete": {
+    operation: "goals.delete",
+    method: "DELETE",
+    scope: "analysis:write",
+    schema: GetGoalInputSchema,
     successStatus: 204,
   },
 };
@@ -193,8 +241,11 @@ function error(
     | "missing_scope"
     | "unsupported_media_type"
     | "not_acceptable"
+    | "invalid_cursor"
+    | "invalid_input"
     | "internal_error"
     | "conflict",
+  issues?: readonly ApiV1ErrorIssue[],
 ): Response {
   const map = {
     validation_failed: [400, "Request validation failed"],
@@ -206,11 +257,13 @@ function error(
     missing_scope: [403, "The API key lacks the required scope"],
     unsupported_media_type: [415, "Expected application/json"],
     not_acceptable: [406, "Only application/json is supported"],
+    invalid_cursor: [400, "The pagination cursor is invalid"],
+    invalid_input: [400, "The analysis configuration is invalid"],
     internal_error: [500, "An internal error occurred"],
     conflict: [409, "The resource conflicts with an existing resource"],
   } as const;
   const [status, message] = map[code];
-  return jsonError(code, message, status, undefined, request);
+  return jsonError(code, message, status, undefined, request, issues);
 }
 
 /** Strict HTTP adapter for typed non-analytics API v1 resources. */
@@ -221,6 +274,7 @@ export async function handlePlannedResourceRoute(input: {
   readonly routeId: ResourceRouteId;
   readonly siteId?: string;
   readonly funnelId?: string;
+  readonly goalId?: string;
   readonly allow?: string;
 }): Promise<Response> {
   const config = routeConfigs[input.routeId];
@@ -257,19 +311,45 @@ export async function handlePlannedResourceRoute(input: {
         readError instanceof Error && readError.message === "body_too_large"
           ? "payload_too_large"
           : "validation_failed",
+        fromRequestBodyError(readError),
       );
     }
   }
+  const isPaginatedCollection =
+    config.operation === "sites.list" ||
+    config.operation === "funnels.list" ||
+    config.operation === "goals.list";
+  const query = new URL(request.url).searchParams;
+  const queryInput = isPaginatedCollection
+    ? [...query.keys()].every((key) => key === "limit" || key === "cursor")
+      ? {
+          page: {
+            ...(query.has("limit")
+              ? { limit: Number(query.get("limit")) }
+              : {}),
+            ...(query.has("cursor") ? { cursor: query.get("cursor") } : {}),
+          },
+        }
+      : null
+    : {};
   const base = {
     ...(body && typeof body === "object" ? body : {}),
+    ...(queryInput ?? {}),
     ...(input.siteId ? { siteId: input.siteId } : {}),
     ...(input.funnelId ? { funnelId: input.funnelId } : {}),
+    ...(input.goalId ? { goalId: input.goalId } : {}),
     ...(config.operation === "settings.trackingScript.get"
       ? { origin: new URL(request.url).origin }
       : {}),
   };
   const parsed = config.schema.safeParse(base);
-  if (!parsed.success) return error(request, "validation_failed");
+  if (!parsed.success) {
+    return error(
+      request,
+      "validation_failed",
+      fromZodIssues(parsed.error.issues),
+    );
+  }
   const service = createResourceApplicationService(input.env);
   const result = await service.execute(
     { teamId: principal.teamId, siteIds: principal.siteIds },
@@ -287,7 +367,20 @@ export async function handlePlannedResourceRoute(input: {
           ? "conflict"
           : code === "forbidden"
             ? "missing_scope"
-            : "internal_error",
+            : code === "invalid_cursor"
+              ? "invalid_cursor"
+              : code === "invalid_input"
+                ? "validation_failed"
+                : "internal_error",
+      code === "invalid_input"
+        ? fromInputIssues([
+            {
+              path: "",
+              code: "invalid_input",
+              message: "The resource request is invalid.",
+            },
+          ])
+        : undefined,
     );
   }
   if (config.successStatus === 204) return new Response(null, { status: 204 });

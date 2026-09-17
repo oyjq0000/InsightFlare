@@ -54,6 +54,7 @@ vi.mock("@tanstack/react-start/server", async (importOriginal) => {
 
 vi.mock("@/lib/dashboard/server", () => ({
   getDashboardRootContext: vi.fn(),
+  getDashboardTeamSites: vi.fn(),
   getDashboardTeamContext: vi.fn(),
   getTeamSiteContext: vi.fn(),
   readDashboardAdmin: vi.fn(),
@@ -78,10 +79,6 @@ vi.mock("@/lib/edge/runtime", () => ({
 vi.mock("@/lib/edge-client", () => ({
   fetchPublicSite: vi.fn(),
   normalizeNotificationPreferencesData: vi.fn((value: unknown) => value),
-}));
-
-vi.mock("@/lib/github-releases", () => ({
-  fetchGithubReleases: vi.fn(),
 }));
 
 vi.mock("@/lib/dashboard/client-request", () => ({
@@ -110,9 +107,11 @@ import {
   loadTeamDashboardSnapshot,
   loadTeamManagementInitialData,
   loadTeamNotificationsInitialData,
-  loadVersionReleases,
 } from "@/lib/dashboard/route-data";
-import { readDashboardAdmin } from "@/lib/dashboard/server";
+import {
+  getDashboardTeamSites,
+  readDashboardAdmin,
+} from "@/lib/dashboard/server";
 import { resolveTeamDashboardRequest } from "@/lib/dashboard/server-query";
 import { readTeamDashboard } from "@/lib/edge/analytics/providers/d1/operations/team-dashboard";
 import { resolveEdgeRuntime } from "@/lib/edge/runtime";
@@ -120,11 +119,10 @@ import {
   fetchPublicSite,
   normalizeNotificationPreferencesData,
 } from "@/lib/edge-client";
-import { fetchGithubReleases } from "@/lib/github-releases";
 
-function headersOf(init: Record<string, string>) {
+function headersOf(init: Record<string, string>, url = "https://app.test/") {
   return {
-    url: "https://app.test/",
+    url,
     headers: {
       get: (name: string) => init[name] ?? null,
     },
@@ -151,9 +149,6 @@ describe("Dashboard route data loaders", () => {
       name: "Site",
       domain: "app.test",
     } as never);
-    vi.mocked(fetchGithubReleases).mockResolvedValue([
-      { tag_name: "v1.0.0", name: "v1.0.0", url: "", html_url: "" },
-    ] as never);
     vi.mocked(resolveEdgeRuntime).mockResolvedValue({
       env: { DB: {} },
     } as never);
@@ -173,6 +168,7 @@ describe("Dashboard route data loaders", () => {
       data: { sites: [], trend: [] },
       source: "raw",
     } as never);
+    vi.mocked(getDashboardTeamSites).mockResolvedValue([]);
   });
 
   describe("loadRequestOrigin", () => {
@@ -230,27 +226,6 @@ describe("Dashboard route data loaders", () => {
     });
   });
 
-  describe("loadVersionReleases", () => {
-    it("returns releases on success", async () => {
-      await expect(loadVersionReleases()).resolves.toEqual({
-        releases: [
-          { tag_name: "v1.0.0", name: "v1.0.0", url: "", html_url: "" },
-        ],
-        error: null,
-      });
-    });
-
-    it("returns an error message when the fetch throws", async () => {
-      vi.mocked(fetchGithubReleases).mockRejectedValueOnce(new Error("boom"));
-      const result = (await loadVersionReleases()) as {
-        error: string;
-        releases: [];
-      };
-      expect(result.error).toBe("boom");
-      expect(result.releases).toEqual([]);
-    });
-  });
-
   describe("loadShareSite", () => {
     it("returns the site and public id on success", async () => {
       const result = (await loadShareSite({
@@ -303,7 +278,9 @@ describe("Dashboard route data loaders", () => {
           timeZone: "Asia/Tokyo",
         },
         interval: "day",
+        filters: { version: 1, root: null },
         allowedSiteIds: ["site-1"],
+        preloadedSites: [],
       });
     });
 
@@ -316,6 +293,33 @@ describe("Dashboard route data loaders", () => {
         } as never),
       ).rejects.toThrow("internal");
       expect(readTeamDashboard).toHaveBeenCalled();
+    });
+
+    it("passes URL filters to the SSR team dashboard reader", async () => {
+      vi.mocked(getRequest).mockReturnValue(
+        headersOf(
+          { host: "app.test" },
+          "https://app.test/?filter%5Bpage.path%5D=%2Fdocs",
+        ) as never,
+      );
+
+      await loadTeamDashboardSnapshot({
+        data: { teamId: "team-requested" },
+      } as never);
+
+      expect(readTeamDashboard).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filters: {
+            version: 1,
+            root: {
+              kind: "condition",
+              target: { kind: "field", field: "page.path" },
+              operator: "eq",
+              value: "/docs",
+            },
+          },
+        }),
+      );
     });
 
     it("loads the dashboard root context", async () => {
@@ -549,12 +553,12 @@ describe("Dashboard route data loaders", () => {
       );
 
       mockAdminReads({
-        "bot-analytics-config": { enabled: true },
+        "analytics-engine-config": { enabled: true },
         "login-turnstile": { enabled: true },
         "notification-email": { enabled: true },
       });
       await expect(loadSystemSettingsInitialData()).resolves.toMatchObject({
-        botAnalytics: { enabled: true },
+        analyticsEngine: { enabled: true },
         loginTurnstile: { enabled: true },
         notificationEmail: { enabled: true },
         fetchedAt: expect.any(Number),
@@ -567,16 +571,25 @@ describe("Dashboard route data loaders", () => {
         generatedAt: 100,
         retentionDays: 30,
         tasks: [],
-        runs: [],
-        runsMeta: {
-          page: 1,
-          pageSize: 50,
-          returned: 0,
-          hasMore: false,
-          nextPage: null,
+        runs: {
+          items: [],
+          pagination: {
+            limit: 50,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
+        logs: {
+          items: [],
+          pagination: {
+            limit: 200,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
         selectedRun: null,
-        logs: [],
         health: {
           totalRuns24h: 0,
           failedRuns24h: 0,
@@ -594,8 +607,7 @@ describe("Dashboard route data loaders", () => {
         fetchedAt: expect.any(Number),
       });
       expect(readDashboardAdmin).toHaveBeenCalledWith("scheduled-tasks", {
-        page: 1,
-        pageSize: 50,
+        limit: 50,
       });
 
       const systemPerformance = {

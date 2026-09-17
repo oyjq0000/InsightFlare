@@ -4,7 +4,10 @@ import path from "path";
 import { defineConfig } from "vitest/config";
 import { parse } from "yaml";
 
-const VITEST_MAX_WORKERS = Math.max(1, osCpus().length);
+// Keep the test pool bounded on high-core machines.  V8 coverage writes one
+// temporary file per worker; an unbounded pool makes that merge flaky under
+// the full check and can also starve the integration tests of CPU.
+const VITEST_MAX_WORKERS = Math.min(16, Math.max(1, osCpus().length));
 
 export default defineConfig({
   plugins: [
@@ -28,6 +31,14 @@ export default defineConfig({
   },
   test: {
     environment: "happy-dom",
+    environmentOptions: {
+      happyDOM: {
+        // Keep URL parsing deterministic across local and Linux CI runs. Without
+        // an explicit origin, happy-dom may start at about:blank, whose pathname
+        // is "blank" and makes history.replaceState-based browser tests flaky.
+        url: "http://localhost:3000/",
+      },
+    },
     globals: true,
     pool: "threads",
     maxWorkers: VITEST_MAX_WORKERS,
@@ -38,7 +49,13 @@ export default defineConfig({
         "./src/test/shims/cloudflare-workers.ts",
       ),
     },
-    exclude: ["**/node_modules/**", "**/dist/**", "**/.cache/**", "**/e2e/**"],
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/.cache/**",
+      "**/.tmp/**",
+      "**/e2e/**",
+    ],
     coverage: {
       thresholds: {
         statements: 95,
@@ -47,19 +64,24 @@ export default defineConfig({
         lines: 96,
       },
       include: [
-        "src/routes/**/*.ts",
+        // The default project measures server/business logic only. UI route
+        // modules and the browser SDK are measured by separate coverage
+        // projects so their execution model does not distort this aggregate.
         "src/components/dashboard/**/*.ts",
         "src/hooks/**/*.ts",
         "src/lib/**/*.ts",
         "src/schemas/**/*.ts",
         "src/middleware.ts",
-        "src/tracker/sdk.ts",
       ],
       exclude: [
         "src/**/*.d.ts",
         "src/**/*.test.{ts,tsx}",
         "src/**/*.spec.{ts,tsx}",
         "src/**/__tests__/**",
+        // Reserve React route/component coverage for a separate UI project;
+        // keep browser rendering out of the server/business aggregate.
+        "src/routes/**",
+        "src/components/**/*.tsx",
         "src/app/.well-known/**",
         "src/**/types.ts",
         "src/**/*types*.ts",
@@ -83,9 +105,12 @@ export default defineConfig({
         "src/lib/edge/ingest-flush-types.ts",
         "src/lib/edge/ingest-types.ts",
         "src/lib/realtime/mock/events-helpers.ts",
-        "src/tracker/sdk.ts",
         "src/lib/system-performance.ts",
         "src/components/dashboard/site-pages/use-dashboard-query.ts",
+        // The query provider is browser orchestration. Its hydration and
+        // route-sync behavior has a focused component test, while its broad
+        // control-state matrix is not part of the global query coverage budget.
+        "src/components/dashboard/dashboard-query-provider.tsx",
       ],
     },
   },

@@ -1,5 +1,12 @@
 import {
-  SCHEDULED_TASK_LOG_RETENTION_DAYS,
+  decodePageCursor,
+  encodePageCursor,
+  hasExactKeys,
+  InvalidCursorError,
+  paginationBinding,
+} from "@/lib/pagination";
+import { mergeRetentionConfig } from "@/lib/retention";
+import {
   type ScheduledTaskLogLevel,
   type ScheduledTaskRun,
   type ScheduledTaskRunGroup,
@@ -9,8 +16,15 @@ import {
   type ScheduledTaskSummary,
 } from "@/lib/scheduled-tasks";
 
-import { paginationOffset } from "./analytics/providers/d1/internal/core-parsers";
-import { bad as badRequest, forb, jsonResponseFor, na } from "./admin-response";
+import {
+  bad as badRequest,
+  bool,
+  forb,
+  jsonResponseFor,
+  na,
+  parseJson,
+} from "./admin-response";
+import { readRetentionConfig, writeRetentionConfig } from "./retention-config";
 import { SCHEDULED_TASKS } from "./scheduled-task-registry";
 import type { Env } from "./types";
 
@@ -27,10 +41,12 @@ const STATUS_VALUES = new Set<ScheduledTaskStatus>([
   "failed",
   "skipped",
 ]);
-const RETENTION_MS = SCHEDULED_TASK_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const STATS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const STALE_RUNNING_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_RUN_PAGE_SIZE = 50;
 const MAX_RUN_PAGE_SIZE = 100;
+const DEFAULT_LOG_PAGE_SIZE = 200;
+const MAX_LOG_PAGE_SIZE = 500;
 const RUN_GROUP_STARTED_AT_BUCKET_MS = 10 * 60 * 1000;
 
 interface RunRow {
@@ -65,6 +81,13 @@ interface LogRow {
   dataJson: string;
   createdAt: number;
   runStartedAt?: number;
+}
+
+interface LogCursor {
+  readonly runStartedAt: number;
+  readonly runId: string;
+  readonly sequence: number;
+  readonly logId: string;
 }
 
 interface RunGroupRow {
@@ -102,6 +125,31 @@ interface HealthRow {
   staleRunningRuns: number;
   successRuns24h: number;
   lastRunAt: number | null;
+}
+
+interface ScheduleStateRow {
+  taskKey: string;
+  enabled: number;
+  nextRunAt: number;
+}
+
+async function loadScheduleStates(env: Env): Promise<ScheduleStateRow[]> {
+  try {
+    const result = await env.DB.prepare(
+      `
+        SELECT
+          task_key AS taskKey,
+          enabled,
+          next_run_at AS nextRunAt
+        FROM scheduled_task_schedule_state
+      `,
+    )
+      .bind()
+      .all<ScheduleStateRow>();
+    return result.results;
+  } catch {
+    return [];
+  }
 }
 
 function safeParseRecord(value: string): Record<string, unknown> {
@@ -204,6 +252,19 @@ function aggregateRunSummary(
   return summary;
 }
 
+function runSubtaskCount(run: ScheduledTaskRun): number {
+  const summary = run.summary;
+  const key = Object.prototype.hasOwnProperty.call(summary, "rulesScanned")
+    ? "rulesScanned"
+    : Object.prototype.hasOwnProperty.call(summary, "candidateSites")
+      ? "candidateSites"
+      : Object.prototype.hasOwnProperty.call(summary, "sitesProcessed")
+        ? "sitesProcessed"
+        : null;
+  const value = key ? summary[key] : 0;
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function mapRunGroup(
   row: RunGroupRow,
   runs: ScheduledTaskRun[] = [],
@@ -226,6 +287,7 @@ function mapRunGroup(
     durationMs:
       finishedAt === null ? null : Math.max(0, finishedAt - startedAt),
     taskCount: Number(row.taskCount ?? runs.length),
+    subtaskCount: runs.reduce((total, run) => total + runSubtaskCount(run), 0),
     successCount: Number(row.successCount ?? 0),
     partialCount: Number(row.partialCount ?? 0),
     failedCount: Number(row.failedCount ?? 0),
@@ -294,7 +356,7 @@ function runGroupSelectSql(whereClause: string): string {
           ELSE MAX(finished_at_ms)
         END AS finishedAt,
         COUNT(*) AS taskCount,
-        SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END) AS successCount,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successCount,
         SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partialCount,
         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedCount,
         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skippedCount,
@@ -310,6 +372,7 @@ function runGroupSelectSql(whereClause: string): string {
           WHEN failedCount > 0 THEN 'failed'
           WHEN runningCount > 0 THEN 'running'
           WHEN partialCount > 0 THEN 'partial'
+          WHEN skippedCount > 0 AND successCount = 0 THEN 'skipped'
           ELSE 'success'
         END AS status
       FROM grouped
@@ -345,7 +408,35 @@ async function countRunLogs(env: Env, runIds: string[]): Promise<number> {
   return total;
 }
 
-async function loadRunLogs(env: Env, runIds: string[]): Promise<LogRow[]> {
+function decodeScheduledLogCursor(value: unknown): LogCursor | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  return hasExactKeys(candidate, [
+    "runStartedAt",
+    "runId",
+    "sequence",
+    "logId",
+  ]) &&
+    Number.isSafeInteger(candidate.runStartedAt) &&
+    typeof candidate.runId === "string" &&
+    Number.isSafeInteger(candidate.sequence) &&
+    typeof candidate.logId === "string"
+    ? {
+        runStartedAt: candidate.runStartedAt as number,
+        runId: candidate.runId,
+        sequence: candidate.sequence as number,
+        logId: candidate.logId,
+      }
+    : null;
+}
+
+async function loadRunLogsPage(
+  env: Env,
+  runIds: string[],
+  limit: number,
+  cursor: LogCursor | null,
+): Promise<{ rows: LogRow[]; hasMore: boolean; last: LogRow | undefined }> {
+  if (runIds.length === 0) return { rows: [], hasMore: false, last: undefined };
   const rows: LogRow[] = [];
   for (
     let offset = 0;
@@ -353,6 +444,9 @@ async function loadRunLogs(env: Env, runIds: string[]): Promise<LogRow[]> {
     offset += MAX_LOG_RUN_IDS_PER_QUERY
   ) {
     const chunk = runIds.slice(offset, offset + MAX_LOG_RUN_IDS_PER_QUERY);
+    const cursorClause = cursor
+      ? "AND (runs.started_at_ms > ? OR (runs.started_at_ms = ? AND (logs.run_id > ? OR (logs.run_id = ? AND (logs.sequence > ? OR (logs.sequence = ? AND logs.id > ?))))))"
+      : "";
     const result = await env.DB.prepare(
       `
         SELECT
@@ -369,23 +463,60 @@ async function loadRunLogs(env: Env, runIds: string[]): Promise<LogRow[]> {
         FROM scheduled_task_run_logs logs
         INNER JOIN scheduled_task_runs runs ON runs.id = logs.run_id
         WHERE logs.run_id IN (${chunk.map(() => "?").join(", ")})
-        ORDER BY runs.started_at_ms ASC, logs.sequence ASC
+          ${cursorClause}
+        ORDER BY runs.started_at_ms ASC, logs.run_id ASC, logs.sequence ASC, logs.id ASC
+        LIMIT ?
       `,
     )
-      .bind(...chunk)
+      .bind(
+        ...chunk,
+        ...(cursor
+          ? [
+              cursor.runStartedAt,
+              cursor.runStartedAt,
+              cursor.runId,
+              cursor.runId,
+              cursor.sequence,
+              cursor.sequence,
+              cursor.logId,
+            ]
+          : []),
+        limit + 1,
+      )
       .all<LogRow>();
     rows.push(...result.results);
   }
-  return rows
-    .sort(
-      (left, right) =>
-        Number(left.runStartedAt ?? 0) - Number(right.runStartedAt ?? 0) ||
-        Number(left.sequence ?? 0) - Number(right.sequence ?? 0),
-    )
-    .slice(0, 1000);
+  rows.sort(
+    (left, right) =>
+      Number(left.runStartedAt ?? 0) - Number(right.runStartedAt ?? 0) ||
+      String(left.runId).localeCompare(String(right.runId)) ||
+      Number(left.sequence ?? 0) - Number(right.sequence ?? 0) ||
+      String(left.id).localeCompare(String(right.id)),
+  );
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  return { rows: pageRows, hasMore, last: pageRows.at(-1) };
 }
 
-function runGroupPageSelectSql(whereClause: string): string {
+function scheduledLogsBinding(groupId: string, runIds: readonly string[]) {
+  return paginationBinding([
+    "scheduled-task-logs-v1",
+    groupId,
+    [...runIds].sort(),
+    "runStartedAt:asc,runId:asc,sequence:asc,logId:asc",
+  ]);
+}
+
+function runGroupPageSelectSql(
+  whereClause: string,
+  cursor?: {
+    readonly startedAt: number;
+    readonly groupId: string;
+  } | null,
+): string {
+  const cursorClause = cursor
+    ? "WHERE (startedAt < ? OR (startedAt = ? AND id > ?))"
+    : "";
   return `
     WITH grouped AS (
       SELECT
@@ -399,7 +530,7 @@ function runGroupPageSelectSql(whereClause: string): string {
           ELSE MAX(finished_at_ms)
         END AS finishedAt,
         COUNT(*) AS taskCount,
-        SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END) AS successCount,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successCount,
         SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partialCount,
         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedCount,
         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skippedCount,
@@ -415,6 +546,7 @@ function runGroupPageSelectSql(whereClause: string): string {
           WHEN failedCount > 0 THEN 'failed'
           WHEN runningCount > 0 THEN 'running'
           WHEN partialCount > 0 THEN 'partial'
+          WHEN skippedCount > 0 AND successCount = 0 THEN 'skipped'
           ELSE 'success'
         END AS status
       FROM grouped
@@ -427,8 +559,9 @@ function runGroupPageSelectSql(whereClause: string): string {
     page_groups AS (
       SELECT *
       FROM filtered_groups
+      ${cursorClause}
       ORDER BY startedAt DESC, id ASC
-      LIMIT ? OFFSET ?
+      LIMIT ?
     ),
     page_runs AS (
       SELECT
@@ -469,24 +602,42 @@ function scheduledRunGroupId(run: ScheduledTaskRun): string {
   ].join(":");
 }
 
-function parseIntegerParam(
-  url: URL,
-  key: string,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  const value = Math.trunc(Number(url.searchParams.get(key) ?? fallback));
-  if (!Number.isFinite(value)) return fallback;
-  return Math.min(max, Math.max(min, value));
-}
-
-function parseRunPageSize(url: URL): number {
-  const pageSize = url.searchParams.get("pageSize");
-  const limit = url.searchParams.get("limit");
-  const value = Math.trunc(Number(pageSize ?? limit ?? DEFAULT_RUN_PAGE_SIZE));
+function parseRunLimit(url: URL): number {
+  const value = Math.trunc(
+    Number(url.searchParams.get("limit") ?? DEFAULT_RUN_PAGE_SIZE),
+  );
   if (!Number.isFinite(value)) return DEFAULT_RUN_PAGE_SIZE;
   return Math.min(MAX_RUN_PAGE_SIZE, Math.max(1, value));
+}
+
+function parseLogLimit(url: URL): number {
+  const value = Math.trunc(
+    Number(url.searchParams.get("logLimit") ?? DEFAULT_LOG_PAGE_SIZE),
+  );
+  if (!Number.isFinite(value)) return DEFAULT_LOG_PAGE_SIZE;
+  return Math.min(MAX_LOG_PAGE_SIZE, Math.max(1, value));
+}
+
+function scheduledRunsBinding(status: string): Promise<string> {
+  return paginationBinding([
+    "admin-scheduled-runs-v1",
+    status,
+    "startedAt:desc,groupId:asc",
+  ]);
+}
+
+function scheduledRunCursor(value: unknown): {
+  readonly startedAt: number;
+  readonly groupId: string;
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  return hasExactKeys(candidate, ["startedAt", "groupId"]) &&
+    typeof candidate.startedAt === "number" &&
+    Number.isFinite(candidate.startedAt) &&
+    typeof candidate.groupId === "string"
+    ? { startedAt: candidate.startedAt, groupId: candidate.groupId }
+    : null;
 }
 
 export async function handleScheduledTasksAdmin(
@@ -499,22 +650,51 @@ export async function handleScheduledTasksAdmin(
   if (actor instanceof Response) return actor;
   if (!actor.isAdmin)
     return forb("Only system admin can view scheduled tasks", undefined, req);
-  if (req.method !== "GET") return na(req);
+  if (req.method !== "GET" && req.method !== "PATCH") return na(req);
+
+  if (req.method === "PATCH") {
+    const body = await parseJson(req);
+    const taskKey = typeof body.taskKey === "string" ? body.taskKey.trim() : "";
+    if (body.enabled !== undefined) {
+      const task = SCHEDULED_TASKS.find((item) => item.key === taskKey);
+      if (!task) return badRequest("Unknown scheduled task", undefined, req);
+      await env.DB.prepare(
+        `
+          UPDATE scheduled_task_schedule_state
+          SET enabled = ?, updated_at = unixepoch()
+          WHERE task_key = ?
+        `,
+      )
+        .bind(bool(body.enabled) ? 1 : 0, task.key)
+        .run();
+    }
+
+    const retentionPatch =
+      body.retention &&
+      typeof body.retention === "object" &&
+      !Array.isArray(body.retention)
+        ? (body.retention as Record<string, unknown>)
+        : {};
+    if (body.retentionDays !== undefined) {
+      retentionPatch.scheduledTaskLogsDays = body.retentionDays;
+    }
+    if (Object.keys(retentionPatch).length > 0) {
+      const current = await readRetentionConfig(env);
+      await writeRetentionConfig(
+        env,
+        mergeRetentionConfig(current, retentionPatch),
+      );
+    }
+  }
 
   const generatedAt = Date.now();
-  const since30d = generatedAt - RETENTION_MS;
+  // The rolling stats window is concrete for each request, but intentionally
+  // does not participate in the grouped run-list cursor identity. This keeps
+  // a cursor usable when the request crosses a minute boundary.
+  const since30d = Math.floor(generatedAt / 60_000) * 60_000 - STATS_WINDOW_MS;
   const since24h = generatedAt - 24 * 60 * 60 * 1000;
   const staleBefore = generatedAt - STALE_RUNNING_MS;
-  const page = parseIntegerParam(url, "page", 1, 1, 10_000);
-  const pageSize = parseRunPageSize(url);
-  const offset = paginationOffset(page, pageSize);
-  if (offset === null) {
-    return badRequest(
-      "Pagination depth exceeds 20,000 rows; narrow the time range or filters",
-      undefined,
-      req,
-    );
-  }
+  const limit = parseRunLimit(url);
   const status = (url.searchParams.get("status") || "").trim();
   const runId = (
     url.searchParams.get("runId") ||
@@ -526,7 +706,23 @@ export async function handleScheduledTasksAdmin(
   const statusFilter = STATUS_VALUES.has(status as ScheduledTaskStatus)
     ? status
     : "";
-
+  const rawCursor = url.searchParams.get("cursor");
+  const runsBinding = await scheduledRunsBinding(statusFilter);
+  let cursor: { readonly startedAt: number; readonly groupId: string } | null;
+  try {
+    cursor = await decodePageCursor(
+      env,
+      runsBinding,
+      rawCursor,
+      "scheduled-runs",
+      scheduledRunCursor,
+    );
+  } catch (error) {
+    if (error instanceof InvalidCursorError) {
+      return badRequest("Invalid cursor", undefined, req);
+    }
+    throw error;
+  }
   const [healthRow, statsRows, latestRows, runRows] = await Promise.all([
     env.DB.prepare(
       `
@@ -534,9 +730,10 @@ export async function handleScheduledTasksAdmin(
           SELECT
             ${RUN_GROUP_KEY_SQL} AS id,
             MIN(started_at_ms) AS startedAt,
-            SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END) AS successCount,
+            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successCount,
             SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partialCount,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedCount,
+            SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skippedCount,
             SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS runningCount,
             SUM(CASE WHEN status = 'running' AND started_at_ms < ? THEN 1 ELSE 0 END) AS staleRunningCount
           FROM scheduled_task_runs
@@ -550,6 +747,7 @@ export async function handleScheduledTasksAdmin(
               WHEN failedCount > 0 THEN 'failed'
               WHEN runningCount > 0 THEN 'running'
               WHEN partialCount > 0 THEN 'partial'
+              WHEN skippedCount > 0 AND successCount = 0 THEN 'skipped'
               ELSE 'success'
             END AS status
           FROM grouped
@@ -572,7 +770,7 @@ export async function handleScheduledTasksAdmin(
         SELECT
           task_key AS taskKey,
           COUNT(*) AS runs30d,
-          SUM(CASE WHEN status IN ('success', 'skipped') THEN 1 ELSE 0 END) AS success30d,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success30d,
           SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partial30d,
           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed30d,
           SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped30d,
@@ -601,14 +799,22 @@ export async function handleScheduledTasksAdmin(
     )
       .bind(since30d)
       .all<RunRow>(),
-    env.DB.prepare(runGroupPageSelectSql(`WHERE ${runFilters.join(" AND ")}`))
-      .bind(...runBindings, statusFilter, statusFilter, pageSize + 1, offset)
+    env.DB.prepare(
+      runGroupPageSelectSql(`WHERE ${runFilters.join(" AND ")}`, cursor),
+    )
+      .bind(
+        ...runBindings,
+        statusFilter,
+        statusFilter,
+        ...(cursor ? [cursor.startedAt, cursor.startedAt, cursor.groupId] : []),
+        limit + 1,
+      )
       .all<RunGroupRow>(),
   ]);
 
-  const hasMoreRuns = runRows.results.length > pageSize;
+  const hasMoreRuns = runRows.results.length > limit;
   const requestedGroupRows = hasMoreRuns
-    ? runRows.results.slice(0, pageSize)
+    ? runRows.results.slice(0, limit)
     : runRows.results;
   const groupIds = requestedGroupRows.map((row) => String(row.id ?? ""));
   const pageTaskRows =
@@ -681,14 +887,51 @@ export async function handleScheduledTasksAdmin(
     }
   }
 
-  const logRows = selectedRun
-    ? {
-        results: await loadRunLogs(
-          env,
-          selectedTaskRuns.map((run) => run.id),
-        ),
-      }
-    : { results: [] as LogRow[] };
+  const logLimit = parseLogLimit(url);
+  const selectedRunIds = selectedTaskRuns.map((run) => run.id);
+  const logsBinding = await scheduledLogsBinding(
+    selectedRun?.id ?? "none",
+    selectedRunIds,
+  );
+  let logCursor: LogCursor | null = null;
+  try {
+    logCursor = await decodePageCursor(
+      env,
+      logsBinding,
+      url.searchParams.get("logCursor"),
+      "scheduled-task-logs",
+      decodeScheduledLogCursor,
+    );
+  } catch (error) {
+    if (error instanceof InvalidCursorError) {
+      return badRequest("Invalid log cursor", undefined, req);
+    }
+    throw error;
+  }
+  const logPage = await loadRunLogsPage(
+    env,
+    selectedRunIds,
+    logLimit,
+    logCursor,
+  );
+  const lastLog = logPage.last;
+  const nextLogCursor =
+    logPage.hasMore && lastLog
+      ? await encodePageCursor(env, logsBinding, {
+          runStartedAt: Number(lastLog.runStartedAt ?? 0),
+          runId: lastLog.runId,
+          sequence: Number(lastLog.sequence ?? 0),
+          logId: lastLog.id,
+        })
+      : null;
+
+  const [scheduleStates, retention] = await Promise.all([
+    loadScheduleStates(env),
+    readRetentionConfig(env),
+  ]);
+  const stateByTask = new Map(
+    scheduleStates.map((row) => [String(row.taskKey), row]),
+  );
 
   const statsByTask = new Map(
     statsRows.results.map((row) => [String(row.taskKey ?? ""), row]),
@@ -700,13 +943,21 @@ export async function handleScheduledTasksAdmin(
     const stats = statsByTask.get(task.key);
     const runs30d = Number(stats?.runs30d ?? 0);
     const success30d = Number(stats?.success30d ?? 0);
+    const state = stateByTask.get(task.key);
     return {
       key: task.key,
       name: task.name,
       description: task.description,
       schedule: task.schedule,
       trigger: task.trigger,
-      enabled: task.enabled,
+      enabled: state ? state.enabled !== 0 : task.enabled,
+      nextRunAt:
+        !state ||
+        state.enabled === 0 ||
+        state.nextRunAt === undefined ||
+        Number(state.nextRunAt) <= 0
+          ? null
+          : Number(state.nextRunAt) * 1000,
       lastRun: lastRunByTask.get(task.key) ?? null,
       runs30d,
       success30d,
@@ -722,23 +973,42 @@ export async function handleScheduledTasksAdmin(
     };
   });
 
+  const lastGroup = requestedGroupRows.at(-1);
+  const nextCursor =
+    hasMoreRuns && lastGroup
+      ? await encodePageCursor(env, runsBinding, {
+          startedAt: Number(lastGroup.startedAt),
+          groupId: String(lastGroup.id),
+        })
+      : null;
+
   const totalRuns24h = Number(healthRow?.totalRuns24h ?? 0);
   const successRuns24h = Number(healthRow?.successRuns24h ?? 0);
   const data: ScheduledTasksData = {
     ok: true,
     generatedAt,
-    retentionDays: SCHEDULED_TASK_LOG_RETENTION_DAYS,
+    retentionDays: retention.scheduledTaskLogsDays,
+    retention,
     tasks,
-    runs,
-    runsMeta: {
-      page,
-      pageSize,
-      returned: runs.length,
-      hasMore: hasMoreRuns,
-      nextPage: hasMoreRuns ? page + 1 : null,
+    runs: {
+      items: runs,
+      pagination: {
+        limit,
+        returned: runs.length,
+        hasMore: hasMoreRuns,
+        nextCursor,
+      },
     },
     selectedRun,
-    logs: logRows.results.map(mapLog),
+    logs: {
+      items: logPage.rows.map(mapLog),
+      pagination: {
+        limit: logLimit,
+        returned: logPage.rows.length,
+        hasMore: logPage.hasMore,
+        nextCursor: nextLogCursor,
+      },
+    },
     health: {
       totalRuns24h,
       failedRuns24h: Number(healthRow?.failedRuns24h ?? 0),

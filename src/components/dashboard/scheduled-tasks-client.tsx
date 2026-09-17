@@ -15,7 +15,7 @@ import {
   RiRefreshLine,
   RiTimeLine,
 } from "@remixicon/react";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { AnalyticsDataTable } from "@/components/dashboard/analytics-data-table";
@@ -23,9 +23,7 @@ import { useDashboardQueryControls } from "@/components/dashboard/dashboard-quer
 import { DataTableSwitch } from "@/components/dashboard/data-table-switch";
 import { JsonTreePanel } from "@/components/dashboard/json-tree";
 import { PageHeading } from "@/components/dashboard/page-heading";
-import { EVENT_RECORD_DRAWER_Z_INDEX } from "@/components/dashboard/site-pages/floating-layer";
 import { TableActionButton } from "@/components/dashboard/table-action-button";
-import { AppOverlay, overlayZIndexFor } from "@/components/ui/app-overlay";
 import { AutoResizer } from "@/components/ui/auto-resizer";
 import { AutoTransition } from "@/components/ui/auto-transition";
 import { Badge } from "@/components/ui/badge";
@@ -69,7 +67,6 @@ import type {
   ScheduledTaskRun,
   ScheduledTaskRunGroup,
   ScheduledTaskRunLog,
-  ScheduledTaskRunsMeta,
   ScheduledTasksData,
   ScheduledTaskStatus,
 } from "@/lib/scheduled-tasks";
@@ -91,31 +88,34 @@ const STATUS_OPTIONS: Array<ScheduledTaskStatus | "all"> = [
 ];
 const RUN_PAGE_SIZE = 50;
 const RUN_TABLE_COLUMN_COUNT = 10;
-const INITIAL_RUN_META: ScheduledTaskRunsMeta = {
-  page: 1,
-  pageSize: RUN_PAGE_SIZE,
+const INITIAL_RUN_META = {
+  limit: RUN_PAGE_SIZE,
   returned: 0,
   hasMore: false,
-  nextPage: null,
+  nextCursor: null,
 };
 
 async function fetchScheduledTasks(params: {
   status?: string;
   runId?: string;
-  page?: number;
-  pageSize?: number;
+  limit?: number;
+  cursor?: string | null;
+  logLimit?: number;
+  logCursor?: string | null;
   signal?: AbortSignal;
 }): Promise<ScheduledTasksData> {
   const query: Record<string, string | number> = {
-    page: params.page ?? 1,
-    pageSize: params.pageSize ?? RUN_PAGE_SIZE,
+    limit: params.limit ?? RUN_PAGE_SIZE,
   };
+  if (params.cursor) query.cursor = params.cursor;
   if (params.status && params.status !== "all") {
     query.status = params.status;
   }
   if (params.runId) {
     query.runId = params.runId;
   }
+  if (params.logLimit) query.logLimit = params.logLimit;
+  if (params.logCursor) query.logCursor = params.logCursor;
   return requestAdminService<ScheduledTasksData>("scheduled-tasks", {
     params: query,
     signal: params.signal,
@@ -256,12 +256,7 @@ function numericSummaryValue(
 function runSubtaskCount(
   run: ScheduledTaskRun | ScheduledTaskRunGroup,
 ): number {
-  if ("runs" in run) {
-    return run.runs.reduce(
-      (total, taskRun) => total + runSubtaskCount(taskRun),
-      0,
-    );
-  }
+  if ("runs" in run) return Number(run.subtaskCount ?? 0);
   if (Object.prototype.hasOwnProperty.call(run.summary, "rulesScanned")) {
     return numericSummaryValue(run, "rulesScanned");
   }
@@ -309,7 +304,9 @@ function localizedTaskInfo(
       ? labels.taskDefinitions.visit_hourly_rollup
       : task.key === "notification_tick"
         ? labels.taskDefinitions.notification_tick
-        : null;
+        : task.key === "database_maintenance"
+          ? labels.taskDefinitions.database_maintenance
+          : null;
   return {
     name: definition?.name ?? task.name,
     description: definition?.description ?? task.description ?? "",
@@ -319,9 +316,9 @@ function localizedTaskInfo(
 
 function appendUniqueRuns(
   current: ScheduledTaskRunGroup[],
-  incoming: ScheduledTaskRunGroup[],
+  incoming: readonly ScheduledTaskRunGroup[],
 ): ScheduledTaskRunGroup[] {
-  if (current.length === 0) return incoming;
+  if (current.length === 0) return [...incoming];
   const seen = new Set(current.map((run) => run.id));
   const nextRuns = incoming.filter((run) => !seen.has(run.id));
   return nextRuns.length > 0 ? [...current, ...nextRuns] : current;
@@ -442,6 +439,12 @@ function ScheduledTaskRunsTable({
                   <span className="font-mono text-emerald-600 dark:text-emerald-400">
                     {labels.status.success}:
                     {numberFormat(locale, run.successCount)}
+                  </span>
+                ) : null}
+                {run.skippedCount > 0 ? (
+                  <span className="font-mono text-muted-foreground">
+                    {labels.status.skipped}:
+                    {numberFormat(locale, run.skippedCount)}
                   </span>
                 ) : null}
                 {run.failedCount > 0 ? (
@@ -572,6 +575,9 @@ function ScheduledTaskRunLogDrawer({
   run,
   logs,
   loading,
+  loadingMore,
+  hasMore,
+  onLoadMore,
   locale,
   timeZone,
   messages,
@@ -580,8 +586,11 @@ function ScheduledTaskRunLogDrawer({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   run: ScheduledTaskRunGroup | null;
-  logs: ScheduledTaskRunLog[];
+  logs: readonly ScheduledTaskRunLog[];
   loading: boolean;
+  loadingMore: boolean;
+  hasMore: boolean;
+  onLoadMore: () => void;
   locale: Locale;
   timeZone: string | undefined;
   messages: AppMessages;
@@ -600,28 +609,11 @@ function ScheduledTaskRunLogDrawer({
 
   return (
     <>
-      <AppOverlay
-        layerId="scheduled-task-run-drawer"
-        open={open}
-        portal
-        zIndex={overlayZIndexFor(EVENT_RECORD_DRAWER_Z_INDEX)}
-        onPointerDown={(event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          onOpenChange(false);
-        }}
-      />
-      <Drawer
-        open={open}
-        onOpenChange={onOpenChange}
-        direction="right"
-        modal={false}
-      >
+      <Drawer open={open} onOpenChange={onOpenChange} direction="right">
         <DrawerContent
           data-dashboard-floating-layer="scheduled-task-run-drawer"
           className="!w-full !max-w-none sm:!w-[min(58vw,34rem)]"
           overlayClassName="hidden"
-          style={{ zIndex: EVENT_RECORD_DRAWER_Z_INDEX }}
         >
           <DrawerHeader className="border-b">
             <DrawerTitle>{labels.logTitle}</DrawerTitle>
@@ -796,9 +788,14 @@ function ScheduledTaskRunLogDrawer({
                                   </div>
                                 ) : null}
                                 <div className="mt-3 space-y-2">
-                                  <h4 className="text-xs font-medium">
-                                    {labels.logs}
-                                  </h4>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <h4 className="text-xs font-medium">
+                                      {labels.logs}
+                                    </h4>
+                                    <span className="font-mono text-[11px] text-muted-foreground">
+                                      {numberFormat(locale, taskLogs.length)}
+                                    </span>
+                                  </div>
                                   {taskLogs.length > 0 ? (
                                     taskLogs.map((log) => (
                                       <ScheduledTaskLogEntry
@@ -825,6 +822,25 @@ function ScheduledTaskRunLogDrawer({
                               </div>
                             );
                           })}
+                          {hasMore ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="w-full"
+                              disabled={loadingMore}
+                              onClick={onLoadMore}
+                            >
+                              {loadingMore ? (
+                                <span className="inline-flex items-center gap-2">
+                                  <Spinner className="size-4" />
+                                  {messages.common.loading}
+                                </span>
+                              ) : (
+                                labels.loadMore
+                              )}
+                            </Button>
+                          ) : null}
                         </div>
                       ) : (
                         <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
@@ -860,24 +876,25 @@ export function ScheduledTasksClient({
   const [status, setStatus] = useState("all");
   const [selectedRunId, setSelectedRunId] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [updatingTaskKey, setUpdatingTaskKey] = useState<string | null>(null);
   const runsQuery = useInfiniteQuery({
     queryKey: ["dashboard", "scheduled-tasks", status],
     queryFn: ({ pageParam, signal }) =>
       fetchScheduledTasks({
         status,
-        page: pageParam,
-        pageSize: RUN_PAGE_SIZE,
+        cursor: pageParam,
+        limit: RUN_PAGE_SIZE,
         signal,
       }),
-    initialPageParam: 1,
+    initialPageParam: null as string | null,
     getNextPageParam: (lastPage) =>
-      lastPage.runsMeta.hasMore
-        ? (lastPage.runsMeta.nextPage ?? undefined)
+      lastPage.runs.pagination.hasMore
+        ? lastPage.runs.pagination.nextCursor
         : undefined,
     initialData: initialData
       ? {
           pages: [initialData],
-          pageParams: [1],
+          pageParams: [null],
         }
       : undefined,
     initialDataUpdatedAt: initialData?.fetchedAt,
@@ -887,13 +904,13 @@ export function ScheduledTasksClient({
   const runs = useMemo(
     () =>
       runsQuery.data?.pages.reduce<ScheduledTaskRunGroup[]>(
-        (current, page) => appendUniqueRuns(current, page.runs),
+        (current, page) => appendUniqueRuns(current, page.runs.items),
         [],
       ) ?? [],
     [runsQuery.data?.pages],
   );
   const data = runsQuery.data?.pages.at(-1) ?? null;
-  const runsMeta = data?.runsMeta ?? INITIAL_RUN_META;
+  const runsMeta = data?.runs.pagination ?? INITIAL_RUN_META;
   const loadingInitial = runsQuery.isPending;
   const loadingMore = runsQuery.isFetchingNextPage;
   const error = runsQuery.isError && runs.length === 0;
@@ -914,24 +931,38 @@ export function ScheduledTasksClient({
     void runsQuery.fetchNextPage();
   });
 
-  const detailQuery = useQuery({
+  const detailQuery = useInfiniteQuery({
     queryKey: ["dashboard", "scheduled-task-run", selectedRunId],
-    queryFn: ({ signal }) =>
+    queryFn: ({ pageParam, signal }) =>
       fetchScheduledTasks({
         runId: selectedRunId,
-        page: 1,
-        pageSize: 1,
+        limit: 1,
+        cursor: null,
+        logLimit: 200,
+        logCursor: pageParam,
         signal,
       }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =>
+      lastPage.logs.pagination.hasMore
+        ? lastPage.logs.pagination.nextCursor
+        : undefined,
     enabled:
       typeof window !== "undefined" && drawerOpen && Boolean(selectedRunId),
   });
   const selectedRun =
-    detailQuery.data?.selectedRun ??
+    detailQuery.data?.pages.at(-1)?.selectedRun ??
     runs.find((run) => run.id === selectedRunId) ??
     null;
-  const selectedLogs = selectedRun ? (detailQuery.data?.logs ?? []) : [];
+  const selectedLogs = selectedRun
+    ? (detailQuery.data?.pages.flatMap((page) => page.logs.items) ?? [])
+    : [];
   const detailLoading = detailQuery.isPending;
+  const detailLoadingMore = detailQuery.isFetchingNextPage;
+  const loadMoreLogs = useEffectEvent(() => {
+    if (detailLoadingMore || !detailQuery.hasNextPage) return;
+    void detailQuery.fetchNextPage();
+  });
 
   useEffect(() => {
     if (!runsQuery.isError || runs.length > 0) return;
@@ -964,6 +995,23 @@ export function ScheduledTasksClient({
     setSelectedRunId("");
     setDrawerOpen(false);
   };
+  async function toggleTask(task: ScheduledTasksData["tasks"][number]) {
+    setUpdatingTaskKey(task.key);
+    try {
+      await requestAdminService<ScheduledTasksData>("scheduled-tasks", {
+        method: "PATCH",
+        body: { taskKey: task.key, enabled: !task.enabled },
+      });
+      await runsQuery.refetch();
+      toast.success(t.taskStateSaved);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t.taskStateSaveFailed,
+      );
+    } finally {
+      setUpdatingTaskKey(null);
+    }
+  }
   const openRun = (run: ScheduledTaskRunGroup) => {
     setSelectedRunId(run.id);
     setDrawerOpen(true);
@@ -1104,7 +1152,7 @@ export function ScheduledTasksClient({
             hasContent={(data?.tasks.length ?? 0) > 0}
             loadingLabel={messages.common.loading}
             emptyLabel={t.empty}
-            colSpan={8}
+            colSpan={9}
             header={
               <TableRow>
                 <TableHead>{t.task}</TableHead>
@@ -1115,6 +1163,7 @@ export function ScheduledTasksClient({
                 <TableHead className="text-right">{t.successRate30d}</TableHead>
                 <TableHead className="text-right">{t.avgDuration}</TableHead>
                 <TableHead>{t.lastRun}</TableHead>
+                <TableHead>{t.nextRun}</TableHead>
               </TableRow>
             }
             rows={(data?.tasks ?? []).map((task) => {
@@ -1133,9 +1182,21 @@ export function ScheduledTasksClient({
                     {taskInfo.schedule}
                   </TableCell>
                   <TableCell>
-                    <Badge variant={task.enabled ? "secondary" : "outline"}>
-                      {task.enabled ? t.enabledYes : t.enabledNo}
-                    </Badge>
+                    <button
+                      type="button"
+                      className="cursor-pointer disabled:cursor-wait"
+                      disabled={updatingTaskKey === task.key}
+                      aria-label={`${taskInfo.name}: ${task.enabled ? t.enabledYes : t.enabledNo}`}
+                      onClick={() => void toggleTask(task)}
+                    >
+                      <Badge variant={task.enabled ? "secondary" : "outline"}>
+                        {updatingTaskKey === task.key
+                          ? messages.common.loading
+                          : task.enabled
+                            ? t.enabledYes
+                            : t.enabledNo}
+                      </Badge>
+                    </button>
                   </TableCell>
                   <TableCell>
                     {task.lastRun ? (
@@ -1161,6 +1222,15 @@ export function ScheduledTasksClient({
                       ? shortDateTimeWithSeconds(
                           locale,
                           task.lastRun.startedAt,
+                          timeZone,
+                        )
+                      : "--"}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">
+                    {task.enabled && task.nextRunAt
+                      ? shortDateTimeWithSeconds(
+                          locale,
+                          task.nextRunAt,
                           timeZone,
                         )
                       : "--"}
@@ -1201,6 +1271,9 @@ export function ScheduledTasksClient({
         run={selectedRun}
         logs={selectedLogs}
         loading={detailLoading}
+        loadingMore={detailLoadingMore}
+        hasMore={Boolean(detailQuery.hasNextPage)}
+        onLoadMore={loadMoreLogs}
         locale={locale}
         timeZone={timeZone}
         messages={messages}

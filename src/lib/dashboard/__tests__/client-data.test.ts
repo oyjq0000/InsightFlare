@@ -51,11 +51,23 @@ import {
   toQueryString,
   withFilters,
 } from "@/lib/dashboard/client-data";
+import { withComparison } from "@/lib/dashboard/client-utils";
 import { dashboardFilterDocumentFromPresentation } from "@/lib/dashboard/filter-state";
+import { attachFilterScopePreference } from "@/lib/filter-contract";
 import { handleDemoRequest } from "@/lib/realtime/mock";
 import { isErrorEnvelope } from "@/lib/realtime/mock/envelope";
 
 describe("Dashboard Client Data Processing Utilities", () => {
+  const emptyPaginatedCollection = {
+    items: [],
+    pagination: {
+      limit: 1,
+      returned: 0,
+      hasMore: false,
+      nextCursor: null,
+    },
+  };
+
   describe("normalizeOverviewRows", () => {
     it("should correctly normalize standard valid rows", () => {
       const input = [
@@ -91,6 +103,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
       ];
       const result = normalizeOverviewRows(input as any);
       expect(result[0]).toEqual({
+        value: "Edge",
         label: "Edge",
         views: 0,
         sessions: 0,
@@ -104,6 +117,40 @@ describe("Dashboard Client Data Processing Utilities", () => {
       expect(result[0].views).toBe(50);
       expect(result[0].sessions).toBe(0);
       expect(result[0].visitors).toBe(0);
+    });
+
+    it("should normalize comparison reference and change metrics", () => {
+      const result = normalizeOverviewRows([
+        {
+          key: "edge",
+          value: "Edge",
+          label: "Edge",
+          views: "10",
+          sessions: 5,
+          visitors: 4,
+          reference: { views: "8", sessions: null, visitors: undefined },
+          change: {
+            views: { absolute: "2", relative: 0.25 },
+            sessions: null,
+            visitors: { absolute: 1, relative: null },
+          },
+        },
+      ]);
+
+      expect(result[0]).toEqual({
+        key: "edge",
+        value: "Edge",
+        label: "Edge",
+        views: 10,
+        sessions: 5,
+        visitors: 4,
+        reference: { views: 8, sessions: 0, visitors: 0 },
+        change: {
+          views: { absolute: 2, relative: 0.25 },
+          sessions: { absolute: 0, relative: null },
+          visitors: { absolute: 1, relative: null },
+        },
+      });
     });
 
     it("should return empty array for non-array inputs", () => {
@@ -169,9 +216,77 @@ describe("Dashboard Client Data Processing Utilities", () => {
       expect(withResult["filter[page.path]"]).toBe("/docs");
     });
 
+    it("passes the resolved scope alongside the filter expression", () => {
+      const filters = attachFilterScopePreference(
+        dashboardFilterDocumentFromPresentation({ path: "/docs" }),
+        "visitor",
+      );
+
+      expect(withFilters({ siteId: "123" }, filters)).toMatchObject({
+        siteId: "123",
+        scope: "visitor",
+        "filter[page.path]": "/docs",
+      });
+      expect(
+        withFilters({ siteId: "123", scope: "event" }, filters, "session"),
+      ).toMatchObject({ scope: "session" });
+    });
+
     it("should skip mapping filters if filters object is empty or undefined", () => {
       const baseParams = { siteId: "123" };
       expect(withFilters(baseParams, undefined)).toEqual(baseParams);
+    });
+
+    it("should omit a scope preference when the filter document is empty", () => {
+      const filters = attachFilterScopePreference(
+        dashboardFilterDocumentFromPresentation({}),
+        "visitor",
+      );
+
+      expect(withFilters({ siteId: "123" }, filters)).toEqual({
+        siteId: "123",
+      });
+    });
+
+    it("should serialize comparison filters without leaking stale parameters", () => {
+      const filters = dashboardFilterDocumentFromPresentation({
+        browser: "Chrome",
+        path: "/pricing",
+      });
+      const result = withComparison(
+        {
+          siteId: "123",
+          "compareFilter[page.path]": "/old",
+        },
+        {
+          mode: "same",
+          window: {
+            preset: "24h",
+            from: 100,
+            to: 200,
+            timeZone: "UTC",
+            interval: "hour",
+          },
+          filters,
+        },
+        { metric: "visitors", sortBy: "change" },
+      );
+
+      expect(result).toMatchObject({
+        siteId: "123",
+        compare: "same",
+        metric: "visitors",
+        sortBy: "change",
+        "compareFilter[client.browser]": "Chrome",
+        "compareFilter[page.path]": "/pricing",
+      });
+      expect(result["compareFilter[page.path]"]).toBe("/pricing");
+      expect(
+        withComparison(
+          { siteId: "123", "compareFilter[page.path]": "/old" },
+          null,
+        ),
+      ).toEqual({ siteId: "123" });
     });
   });
 
@@ -441,7 +556,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
         "",
         "string",
       );
-      expect(emptyEvtField.data).toHaveLength(0);
+      expect(emptyEvtField.data.items).toHaveLength(0);
 
       const emptyEvtRecord = await fetchEventRecordDetail("demo-site-001", "");
       expect(emptyEvtRecord.data).toBeNull();
@@ -545,6 +660,21 @@ describe("Dashboard Client Data Processing Utilities", () => {
       });
     }
 
+    function geoTabResponse(items: unknown[]): Response {
+      return freshJsonResponse({
+        ok: true,
+        data: {
+          items,
+          pagination: {
+            limit: 100,
+            returned: items.length,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
+      });
+    }
+
     function paramsFromCall(fetchMock: any, callIndex = 0): URLSearchParams {
       const calledUrl = String(fetchMock.mock.calls[callIndex][0]);
       return new URLSearchParams(calledUrl.split("?")[1] ?? "");
@@ -574,8 +704,15 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards query cancellation signals for overview and trend requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockImplementation(() =>
-          Promise.resolve(freshJsonResponse({ ok: true, data: [] })),
+        .mockImplementation((url: string) =>
+          Promise.resolve(
+            freshJsonResponse(
+              url.includes("/api/private/pages-dashboard") ||
+                url.includes("/api/private/event-types")
+                ? { ok: true, data: emptyPaginatedCollection }
+                : { ok: true, data: [] },
+            ),
+          ),
         );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
@@ -603,8 +740,15 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards query cancellation signals for share trend data sources", async () => {
       const fetchMock = vi
         .fn()
-        .mockImplementation(() =>
-          Promise.resolve(freshJsonResponse({ ok: true, data: [] })),
+        .mockImplementation((url: string) =>
+          Promise.resolve(
+            freshJsonResponse(
+              url.includes("/api/private/pages-dashboard") ||
+                url.includes("/api/private/event-types")
+                ? { ok: true, data: emptyPaginatedCollection }
+                : { ok: true, data: [] },
+            ),
+          ),
         );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
@@ -720,8 +864,16 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("should serialize optional request params for overview, lists, events, and details", async () => {
       const fetchMock = vi
         .fn()
-        .mockImplementation(() =>
-          Promise.resolve(freshJsonResponse({ ok: true, data: [] })),
+        .mockImplementation((url: string) =>
+          Promise.resolve(
+            freshJsonResponse(
+              url.includes("/api/private/events-trend")
+                ? { ok: true, data: { interval: "day", series: [], data: [] } }
+                : url.includes("/api/private/events-records")
+                  ? { ok: true, data: emptyPaginatedCollection }
+                  : { ok: true, data: [] },
+            ),
+          ),
         );
       globalThis.fetch = fetchMock as any;
 
@@ -736,7 +888,6 @@ describe("Dashboard Client Data Processing Utilities", () => {
 
       await fetchVisitors("option-visitors", mockWindow, undefined, {
         cursor: "visitor-cursor",
-        pageSize: 25,
         limit: 7,
         sortBy: "lastSeenAt",
         sortDir: "asc",
@@ -744,23 +895,21 @@ describe("Dashboard Client Data Processing Utilities", () => {
       });
       params = paramsFromCall(fetchMock, 1);
       expect(params.get("cursor")).toBe("visitor-cursor");
-      expect(params.get("pageSize")).toBe("25");
       expect(params.get("limit")).toBe("7");
       expect(params.get("sortBy")).toBe("lastSeenAt");
       expect(params.get("sortDir")).toBe("asc");
       expect(params.get("search")).toBe("alice");
 
       await fetchVisitors("option-visitors-pagesize", mockWindow, undefined, {
-        pageSize: 25,
+        limit: 25,
         search: "   ",
       });
       params = paramsFromCall(fetchMock, 2);
-      expect(params.has("limit")).toBe(false);
+      expect(params.get("limit")).toBe("25");
       expect(params.has("search")).toBe(false);
 
       await fetchSessions("option-sessions", mockWindow, undefined, {
         cursor: "session-cursor",
-        pageSize: 30,
         limit: 9,
         sortBy: "durationMs",
         sortDir: "desc",
@@ -768,18 +917,17 @@ describe("Dashboard Client Data Processing Utilities", () => {
       });
       params = paramsFromCall(fetchMock, 3);
       expect(params.get("cursor")).toBe("session-cursor");
-      expect(params.get("pageSize")).toBe("30");
       expect(params.get("limit")).toBe("9");
       expect(params.get("sortBy")).toBe("durationMs");
       expect(params.get("sortDir")).toBe("desc");
       expect(params.get("search")).toBe("session");
 
       await fetchSessions("option-sessions-pagesize", mockWindow, undefined, {
-        pageSize: 30,
+        limit: 30,
         search: "   ",
       });
       params = paramsFromCall(fetchMock, 4);
-      expect(params.has("limit")).toBe(false);
+      expect(params.get("limit")).toBe("30");
       expect(params.has("search")).toBe(false);
 
       await fetchEventsTrend("option-events-trend", mockWindow, undefined, {
@@ -792,7 +940,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
 
       await fetchEventsRecords("option-events-records", mockWindow, undefined, {
         cursor: "event-cursor",
-        pageSize: 15,
+        limit: 15,
         sortBy: "pathname",
         sortDir: "desc",
         search: "  /pricing  ",
@@ -801,7 +949,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
       params = paramsFromCall(fetchMock, 6);
       expect(params.get("cursor")).toBe("event-cursor");
       expect(params.has("page")).toBe(false);
-      expect(params.get("pageSize")).toBe("15");
+      expect(params.get("limit")).toBe("15");
       expect(params.get("sortBy")).toBe("pathname");
       expect(params.get("sortDir")).toBe("desc");
       expect(params.get("search")).toBe("/pricing");
@@ -843,8 +991,16 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("should apply list and event defaults while omitting blank optional params", async () => {
       const fetchMock = vi
         .fn()
-        .mockImplementation(() =>
-          Promise.resolve(freshJsonResponse({ ok: true, data: [] })),
+        .mockImplementation((url: string) =>
+          Promise.resolve(
+            freshJsonResponse(
+              url.includes("/api/private/events-trend")
+                ? { ok: true, data: { interval: "day", series: [], data: [] } }
+                : url.includes("/api/private/events-records")
+                  ? { ok: true, data: emptyPaginatedCollection }
+                  : { ok: true, data: [] },
+            ),
+          ),
         );
       globalThis.fetch = fetchMock as any;
 
@@ -877,7 +1033,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
         },
       );
       params = paramsFromCall(fetchMock, 3);
-      expect(params.get("pageSize")).toBe("80");
+      expect(params.get("limit")).toBe("80");
       expect(params.has("cursor")).toBe(false);
       expect(params.has("search")).toBe(false);
       expect(params.has("eventName")).toBe(false);
@@ -1049,13 +1205,13 @@ describe("Dashboard Client Data Processing Utilities", () => {
         mockWindow,
         undefined,
         {
-          page: 5,
-          pageSize: 14,
+          limit: 14,
+          cursor: "pages-cursor",
         },
       );
       params = paramsFromCall(fetchMock, 10);
-      expect(params.get("page")).toBe("5");
-      expect(params.get("pageSize")).toBe("14");
+      expect(params.get("limit")).toBe("14");
+      expect(params.get("cursor")).toBe("pages-cursor");
 
       await fetchRetention("option-retention", mockWindow, undefined, {
         granularity: "day",
@@ -1084,7 +1240,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for overview source tabs", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [] }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1120,7 +1278,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for session list requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [], meta: {} }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1148,7 +1308,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for visitor list requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [], meta: {} }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1215,7 +1377,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for event record requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [], meta: {} }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1279,7 +1443,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for event field values", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [] }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1300,9 +1466,20 @@ describe("Dashboard Client Data Processing Utilities", () => {
     });
 
     it("forwards cancellation signals for UTM dimension requests", async () => {
-      const fetchMock = vi
-        .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [] }));
+      const fetchMock = vi.fn().mockResolvedValue(
+        freshJsonResponse({
+          ok: true,
+          data: {
+            items: [],
+            pagination: {
+              limit: 100,
+              returned: 0,
+              hasMore: false,
+              nextCursor: null,
+            },
+          },
+        }),
+      );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1495,7 +1672,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for overview geo dimension requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [] }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1559,7 +1738,9 @@ describe("Dashboard Client Data Processing Utilities", () => {
     it("forwards cancellation signals for overview page tab requests", async () => {
       const fetchMock = vi
         .fn()
-        .mockResolvedValue(freshJsonResponse({ ok: true, data: [] }));
+        .mockResolvedValue(
+          freshJsonResponse({ ok: true, data: emptyPaginatedCollection }),
+        );
       globalThis.fetch = fetchMock as any;
       const controller = new AbortController();
 
@@ -1611,24 +1792,28 @@ describe("Dashboard Client Data Processing Utilities", () => {
         fetchVisitors("fallback-visitors", mockWindow),
       ).resolves.toEqual({
         ok: true,
-        data: [],
-        meta: {
-          pageSize: 0,
-          returned: 0,
-          hasMore: false,
-          nextCursor: null,
+        data: {
+          items: [],
+          pagination: {
+            limit: 1,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
       });
       await expect(
         fetchSessions("fallback-sessions", mockWindow),
       ).resolves.toEqual({
         ok: true,
-        data: [],
-        meta: {
-          pageSize: 0,
-          returned: 0,
-          hasMore: false,
-          nextCursor: null,
+        data: {
+          items: [],
+          pagination: {
+            limit: 1,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
         },
       });
 
@@ -1654,10 +1839,10 @@ describe("Dashboard Client Data Processing Utilities", () => {
         "fallback-events-records",
         mockWindow,
         undefined,
-        { pageSize: 33 },
+        { limit: 33 },
       );
-      expect(eventsRecords.meta.pageSize).toBe(33);
-      expect(eventsRecords.data).toEqual([]);
+      expect(eventsRecords.data.pagination.limit).toBe(33);
+      expect(eventsRecords.data.items).toEqual([]);
 
       const eventTypeDetail = await fetchEventTypeDetail(
         "fallback-event-type",
@@ -1679,7 +1864,15 @@ describe("Dashboard Client Data Processing Utilities", () => {
         ok: true,
         fieldPath: "payload.plan",
         fieldValueType: "string",
-        data: [],
+        data: {
+          items: [],
+          pagination: {
+            limit: 1,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
       });
 
       const recordDetail = await fetchEventRecordDetail(
@@ -1720,29 +1913,29 @@ describe("Dashboard Client Data Processing Utilities", () => {
       });
       await expect(
         fetchOverviewPageCardTab("fallback-page-tab", mockWindow, "path"),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
       await expect(
         fetchPageHashTab("fallback-hash", mockWindow),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
       await expect(
         fetchOverviewSourceCardTab("fallback-source", mockWindow, "link"),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
       await expect(
         fetchEventTypesTab("fallback-types", mockWindow),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
       await expect(
         fetchOverviewClientDimensionTab(
           "fallback-client-tab",
           mockWindow,
           "language",
         ),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
       await expect(
         fetchOverviewGeoDimensionTab("fallback-geo-tab", mockWindow, "country"),
       ).resolves.toEqual([]);
       await expect(
         fetchFilterValues("fallback-filter-options", mockWindow, "geo.country"),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual(emptyPaginatedCollection);
     });
 
     it("should normalize geo point and count payloads", async () => {
@@ -1853,61 +2046,52 @@ describe("Dashboard Client Data Processing Utilities", () => {
       const fetchMock = vi
         .fn()
         .mockResolvedValueOnce(
-          freshJsonResponse({
-            ok: true,
-            data: [
-              {
-                value: "US::CA::California",
-                label: "United States :: CA :: California",
-                views: "4",
-                sessions: null,
-                visitors: undefined,
-              },
-              {
-                value: "JP::13::Tokyo",
-                label: "  ",
-                views: 1,
-                sessions: 2,
-                visitors: 3,
-              },
-              {
-                value: "raw-region",
-                label: "",
-                views: 0,
-              },
-            ],
-          }),
+          geoTabResponse([
+            {
+              value: "US::CA::California",
+              label: "United States :: CA :: California",
+              views: "4",
+              sessions: null,
+              visitors: undefined,
+            },
+            {
+              value: "JP::13::Tokyo",
+              label: "  ",
+              views: 1,
+              sessions: 2,
+              visitors: 3,
+            },
+            {
+              value: "raw-region",
+              label: "",
+              views: 0,
+            },
+          ]),
         )
         .mockResolvedValueOnce(
-          freshJsonResponse({
-            ok: true,
-            data: [
-              {
-                value: "US::CA::California::San Francisco",
-                label: "United States :: CA :: California :: San Francisco",
-                views: "9",
-              },
-              {
-                value: "raw-city",
-                label: "",
-                sessions: "2",
-              },
-            ],
-          }),
+          geoTabResponse([
+            {
+              value: "US::CA::California::San Francisco",
+              label: "United States :: CA :: California :: San Francisco",
+              views: "9",
+            },
+            {
+              value: "raw-city",
+              label: "",
+              sessions: "2",
+            },
+          ]),
         )
         .mockResolvedValueOnce(
-          freshJsonResponse({
-            ok: true,
-            data: [
-              {
-                value: "  ",
-                label: "Canada",
-                views: "6",
-                sessions: "3",
-                visitors: "2",
-              },
-            ],
-          }),
+          geoTabResponse([
+            {
+              value: "  ",
+              label: "Canada",
+              views: "6",
+              sessions: "3",
+              visitors: "2",
+            },
+          ]),
         )
         .mockResolvedValueOnce(freshJsonResponse({ ok: true, data: null }));
       globalThis.fetch = fetchMock as any;
@@ -1959,7 +2143,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
 
       await expect(
         fetchOverviewGeoDimensionTab("geo-non-array", mockWindow, "country"),
-      ).resolves.toEqual([]);
+      ).rejects.toThrow("pagination_contract_violation");
     });
 
     it("should fall back to empty page card tabs when tabs are omitted", async () => {
@@ -1986,24 +2170,25 @@ describe("Dashboard Client Data Processing Utilities", () => {
             freshJsonResponse({
               ok: true,
               interval: "hour",
-              data: [
-                {
-                  pathname: "/docs",
-                  metrics: { views: 8, sessions: 2 },
-                  trend: [{ timestampMs: 2000, views: 8 }, { views: null }],
+              data: {
+                items: [
+                  {
+                    pathname: "/docs",
+                    metrics: { views: 8, sessions: 2 },
+                    trend: [{ timestampMs: 2000, views: 8 }, { views: null }],
+                  },
+                  {
+                    pathname: "/blog",
+                    metrics: { views: 3, sessions: 1 },
+                    trend: [{ timestampMs: 1000, views: 3 }],
+                  },
+                ],
+                pagination: {
+                  limit: 12,
+                  returned: 2,
+                  hasMore: false,
+                  nextCursor: null,
                 },
-                {
-                  pathname: "/blog",
-                  metrics: { views: 3, sessions: 1 },
-                  trend: [{ timestampMs: 1000, views: 3 }],
-                },
-              ],
-              meta: {
-                page: 1,
-                pageSize: 12,
-                returned: 2,
-                hasMore: false,
-                nextPage: null,
               },
             }),
           );
@@ -2029,7 +2214,7 @@ describe("Dashboard Client Data Processing Utilities", () => {
         { limit: 20 },
       );
 
-      expect(paramsFromCall(fetchMock, 0).get("pageSize")).toBe("12");
+      expect(paramsFromCall(fetchMock, 0).get("limit")).toBe("12");
       expect(trend.series).toEqual([
         {
           key: "page_0",
@@ -2119,7 +2304,15 @@ describe("Dashboard Client Data Processing Utilities", () => {
         ok: true,
         fieldPath: "",
         fieldValueType: "string",
-        data: [],
+        data: {
+          items: [],
+          pagination: {
+            limit: 1,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
       });
     });
   });

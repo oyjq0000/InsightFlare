@@ -8,14 +8,19 @@ import {
 } from "@/lib/edge/analytics/application/cost";
 import type {
   AnalyticsResult,
+  EntitySetExpression,
+  FilterScope,
   QueryInput,
   QueryOperation,
   QueryTime,
+  ScopedFilterPlan,
 } from "@/lib/edge/analytics/contract";
+import { prepareScopedQuery } from "@/lib/edge/analytics/contract/scoped-filter";
 import {
   currentInvocationLogger,
   errorLogData,
 } from "@/lib/edge/observability-logger";
+import { InvalidCursorError } from "@/lib/pagination";
 
 import type { AnalyticsProviderRegistry } from "./provider-registry";
 import type { TypedQueryProviderResult } from "./provider-registry";
@@ -42,13 +47,12 @@ export interface QueryExecutionContext {
 export interface AnalyticsQueryEvent {
   readonly operation: string;
   readonly phase:
-    | "start"
-    | "success"
-    | "cancelled"
-    | "deadline"
-    | "cost"
-    | "failure";
+    "start" | "success" | "cancelled" | "deadline" | "cost" | "failure";
   readonly cost?: number;
+  readonly requestedScope?: string;
+  readonly resolvedScope?: FilterScope;
+  readonly requiredSources?: readonly string[];
+  readonly requiresRawSource?: boolean;
 }
 
 /**
@@ -91,16 +95,62 @@ function emit(
   context: QueryExecutionContext,
   phase: AnalyticsQueryEvent["phase"],
   cost?: number,
+  query?: QueryInput,
 ): void {
   try {
+    const plan = query?.scopePlan;
     context.onEvent?.({
       operation: context.operation ?? "unknown",
       phase,
       ...(cost === undefined ? {} : { cost }),
+      ...(plan
+        ? {
+            requestedScope: query?.scopePreference ?? "auto",
+            resolvedScope: plan.scope,
+            requiredSources: [...plan.requiredSources].sort(),
+            requiresRawSource: plan.requiresRawSource,
+          }
+        : {}),
     });
   } catch {
     // Observability must never change query behavior.
   }
+}
+
+function entityExpressionComplexity(
+  expression: EntitySetExpression | null,
+): number {
+  if (!expression || expression.kind === "condition") return 1;
+  if (expression.kind === "not") {
+    return 1 + entityExpressionComplexity(expression.child);
+  }
+  return Math.max(
+    1,
+    1 +
+      expression.children.reduce(
+        (total, child) => total + entityExpressionComplexity(child),
+        0,
+      ),
+  );
+}
+
+function scopeAwareCostInput(
+  input: QueryCostInput | undefined,
+  query: QueryInput,
+): QueryCostInput | undefined {
+  const plan: ScopedFilterPlan | undefined = query.scopePlan;
+  if (!input || !plan) return input;
+  return {
+    ...input,
+    scope: plan.scope,
+    requiredSourceCount: Math.max(1, plan.requiredSources.size),
+    entityAlgebraComplexity:
+      plan.membership.kind === "entity"
+        ? entityExpressionComplexity(plan.membership.expression)
+        : 1,
+    eventPayloadComplexity: plan.requiredSources.has("payload") ? 2 : 1,
+    requiresRawSource: plan.requiresRawSource,
+  };
 }
 
 class UncacheableResult extends Error {
@@ -109,21 +159,50 @@ class UncacheableResult extends Error {
   }
 }
 
+/**
+ * Provider payloads for the legacy API overview/timeseries adapters contain
+ * an inner AnalyticsResult envelope. That envelope is still a provider
+ * payload for cache purposes, so refresh its request metadata after a cache
+ * hit instead of making requested Auto/concrete scope part of semantic
+ * identity.
+ */
+function rehydrateScopedProviderValue<Result>(
+  value: Result,
+  query: QueryInput,
+): Result {
+  if (!query.scopePlan || !value || typeof value !== "object") return value;
+  const candidate = value as {
+    readonly ok?: unknown;
+    readonly meta?: Record<string, unknown>;
+  };
+  if (candidate.ok !== true || !candidate.meta) return value;
+  return {
+    ...(value as Record<string, unknown>),
+    meta: {
+      ...candidate.meta,
+      filterScope: {
+        requested: query.scopePreference ?? "auto",
+        resolved: query.scopePlan.scope,
+      },
+    },
+  } as Result;
+}
+
 export class TypedQueryApplicationService {
   constructor(
     private readonly cache?: OperationResultCache,
     private readonly costPolicy: QueryCostPolicy = defaultQueryCostPolicy,
   ) {}
 
-  private costError(executionContext: QueryExecutionContext): {
+  private costError(costInput: QueryCostInput | undefined): {
     readonly ok: false;
     readonly error: {
       readonly kind: "query-cost-exceeded";
       readonly cost: number;
     };
   } | null {
-    if (!executionContext.cost) return null;
-    const cost = calculateQueryCost(executionContext.cost, this.costPolicy);
+    if (!costInput) return null;
+    const cost = calculateQueryCost(costInput, this.costPolicy);
     return cost >= this.costPolicy.maxCost
       ? { ok: false, error: { kind: "query-cost-exceeded", cost } }
       : null;
@@ -144,16 +223,55 @@ export class TypedQueryApplicationService {
       return before;
     }
 
-    const validationError = validateTypedQueryInput(
+    // Validate the caller's document before scope planning. Scope planning
+    // deliberately works with trusted FilterExpression nodes, while this
+    // boundary is also responsible for returning the public invalid-filter
+    // error for malformed documents.
+    const initialValidationError = validateTypedQueryInput(
       invocation.operation,
       invocation.query,
+    );
+    if (initialValidationError) {
+      emit(executionContext, "failure");
+      return { ok: false, error: initialValidationError };
+    }
+
+    let preparedQuery: QueryInput;
+    try {
+      preparedQuery = prepareScopedQuery(
+        invocation.operation,
+        invocation.query,
+      );
+    } catch (error) {
+      const code =
+        error instanceof Error ? error.message : "invalid_filter_scope";
+      emit(executionContext, "failure");
+      if (error instanceof InvalidCursorError) {
+        return {
+          ok: false,
+          error: { kind: "invalid-cursor", cursorKind: error.cursorKind },
+        };
+      }
+      return {
+        ok: false,
+        error: {
+          kind: "invalid-input",
+          issues: [{ path: "scope", code }],
+        },
+      };
+    }
+
+    const validationError = validateTypedQueryInput(
+      invocation.operation,
+      preparedQuery,
     );
     if (validationError) {
       emit(executionContext, "failure");
       return { ok: false, error: validationError };
     }
 
-    const costError = this.costError(executionContext);
+    const costInput = scopeAwareCostInput(executionContext.cost, preparedQuery);
+    const costError = this.costError(costInput);
     if (costError) {
       emit(
         executionContext,
@@ -161,6 +279,7 @@ export class TypedQueryApplicationService {
         costError.error.kind === "query-cost-exceeded"
           ? costError.error.cost
           : undefined,
+        preparedQuery,
       );
       return costError;
     }
@@ -177,7 +296,7 @@ export class TypedQueryApplicationService {
         };
       }
       const load = async (): Promise<TypedQueryProviderResult<Result>> =>
-        provider.execute(invocation.query, executionContext);
+        provider.execute(preparedQuery, executionContext);
       let result: TypedQueryProviderResult<Result>;
       if (!invocation.cache || !this.cache) {
         result = await load();
@@ -201,10 +320,19 @@ export class TypedQueryApplicationService {
           result = error.value as TypedQueryProviderResult<Result>;
         }
       }
+      result = {
+        ...result,
+        value: rehydrateScopedProviderValue(result.value, preparedQuery),
+      };
       const time =
-        "time" in invocation.query
-          ? (invocation.query as QueryInput & { readonly time: QueryTime }).time
-          : undefined;
+        "time" in preparedQuery
+          ? (preparedQuery as QueryInput & { readonly time: QueryTime }).time
+          : "current" in preparedQuery &&
+              preparedQuery.current &&
+              typeof preparedQuery.current === "object" &&
+              "time" in preparedQuery.current
+            ? (preparedQuery.current as { readonly time: QueryTime }).time
+            : undefined;
       if (!time) {
         emit(executionContext, "failure");
         return {
@@ -220,7 +348,7 @@ export class TypedQueryApplicationService {
         );
         return after;
       }
-      emit(executionContext, "success");
+      emit(executionContext, "success", undefined, preparedQuery);
       return {
         ok: true,
         data: result.value,
@@ -228,6 +356,14 @@ export class TypedQueryApplicationService {
           time,
           source: result.source ?? "raw",
           approximateVisitors: Boolean(result.approximateVisitors),
+          ...(preparedQuery.scopePlan
+            ? {
+                filterScope: {
+                  requested: preparedQuery.scopePreference ?? "auto",
+                  resolved: preparedQuery.scopePlan.scope,
+                },
+              }
+            : {}),
         },
       };
     } catch (error) {
@@ -241,6 +377,12 @@ export class TypedQueryApplicationService {
         ...errorLogData(error),
       });
       emit(executionContext, "failure");
+      if (error instanceof InvalidCursorError) {
+        return {
+          ok: false,
+          error: { kind: "invalid-cursor", cursorKind: error.cursorKind },
+        };
+      }
       return {
         ok: false,
         error: { kind: "internal", operation: invocation.operation },

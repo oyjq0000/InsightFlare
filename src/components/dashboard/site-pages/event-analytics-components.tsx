@@ -11,8 +11,10 @@ import {
 } from "react";
 import type { RemixiconComponentType } from "@remixicon/react";
 import {
+  RiArrowDownLine,
   RiArrowDownSLine,
   RiArrowLeftLine,
+  RiArrowUpLine,
   RiArrowUpSLine,
   RiCheckLine,
   RiDatabase2Line,
@@ -40,6 +42,7 @@ import { AnimatedDataTableRow } from "@/components/dashboard/animated-data-table
 import {
   createEventTrendChartData,
   createEventTrendChartSeries,
+  createEventTrendComparisonChartSeries,
   EventTrendBarChart,
 } from "@/components/dashboard/charts/event-trend-bar-chart";
 import { DataTableSwitch } from "@/components/dashboard/data-table-switch";
@@ -55,7 +58,7 @@ import {
 } from "@/components/dashboard/journey-display";
 import { PageHeading } from "@/components/dashboard/page-heading";
 import { EventDetailDrawer } from "@/components/dashboard/site-pages/event-detail-drawer";
-import { EVENT_FILTER_DIALOG_Z_INDEX } from "@/components/dashboard/site-pages/floating-layer";
+import { useInfiniteTableSentinel } from "@/components/dashboard/use-infinite-table-sentinel";
 import { AutoResizer } from "@/components/ui/auto-resizer";
 import { AutoTransition } from "@/components/ui/auto-transition";
 import { Badge } from "@/components/ui/badge";
@@ -75,11 +78,17 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { TableCell, TableHead, TableRow } from "@/components/ui/table";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   fetchEventRecordDetail,
   fetchEventsRecords,
   fetchEventTypeFields,
   fetchEventTypeFieldValues,
 } from "@/lib/dashboard/client-data";
+import { filterQueryKey } from "@/lib/dashboard/filter-query-key";
 import { appendEventPayloadFilter } from "@/lib/dashboard/filter-state";
 import { numberFormat, percentFormat } from "@/lib/dashboard/format";
 import type { TimeWindow } from "@/lib/dashboard/query-state";
@@ -93,6 +102,7 @@ import type {
 import type { FilterDocument, FilterValue } from "@/lib/filter-contract";
 import type { Locale } from "@/lib/i18n/config";
 import type { AppMessages } from "@/lib/i18n/messages";
+import { formatI18nTemplate } from "@/lib/i18n/template";
 import { navigateWithTransition } from "@/lib/page-transition";
 import { useRouter } from "@/lib/router";
 import { cn } from "@/lib/utils";
@@ -489,15 +499,19 @@ function EventMetricCell({
   label,
   value,
   detail,
+  detailKey,
+  comparisonChange,
   loading = false,
 }: {
   icon: RemixiconComponentType;
   label: string;
   value: string;
-  detail: string;
+  detail: ReactNode;
+  detailKey?: string;
+  comparisonChange?: number | null;
   loading?: boolean;
 }) {
-  const contentKey = loading ? "loading" : value;
+  const contentKey = loading ? "loading" : `${value}:${comparisonChange ?? ""}`;
 
   return (
     <div className="min-w-0 bg-card p-4">
@@ -523,18 +537,23 @@ function EventMetricCell({
               <Spinner className="size-5" />
             </div>
           ) : (
-            <p
+            <div
               key={value}
-              className="h-7 min-w-0 truncate font-mono text-xl leading-7 font-semibold text-foreground"
+              className="flex h-7 min-w-0 items-end gap-1.5 leading-none"
             >
-              {value}
-            </p>
+              <span className="min-w-0 truncate font-mono text-xl leading-none font-semibold text-foreground">
+                {value}
+              </span>
+              {comparisonChange !== undefined ? (
+                <EventMetricChangeRate value={comparisonChange} />
+              ) : null}
+            </div>
           )}
         </AutoTransition>
       </AutoResizer>
       <AutoTransition
         initial={false}
-        transitionKey={loading ? "loading" : detail}
+        transitionKey={loading ? "loading" : (detailKey ?? "detail")}
         className="mt-3 h-[14px]"
         duration={0.2}
         type="fade"
@@ -547,7 +566,7 @@ function EventMetricCell({
           />
         ) : (
           <p
-            key={detail}
+            key={detailKey ?? "detail"}
             className="h-[14px] min-w-0 truncate text-[11px] leading-[14px] text-muted-foreground"
           >
             {detail}
@@ -558,23 +577,70 @@ function EventMetricCell({
   );
 }
 
+type EventMetricSummary = {
+  events: number;
+  eventTypes: number;
+  sessions: number;
+  visitors: number;
+  avgEventsPerSession: number;
+  shareOfAllEvents?: number;
+};
+
+function eventMetricDelta(current: number, comparison: number): number | null {
+  if (!Number.isFinite(current) || !Number.isFinite(comparison)) return null;
+  if (comparison === 0) return null;
+  return ((current - comparison) / comparison) * 100;
+}
+
+function EventMetricChangeRate({ value }: { value: number | null }) {
+  if (value === null) return null;
+  const ChangeIcon = value >= 0 ? RiArrowUpLine : RiArrowDownLine;
+  return (
+    <span
+      className={cn(
+        "inline-flex shrink-0 items-end gap-0.5 font-mono text-xs leading-none tabular-nums",
+        value >= 0 ? "text-emerald-600" : "text-rose-600",
+      )}
+    >
+      <ChangeIcon className="size-3.5" />
+      {value >= 0 ? "+" : ""}
+      {value.toFixed(1)}%
+    </span>
+  );
+}
+
+function EventMetricComparisonDetail({
+  locale,
+  comparisonLabel,
+  comparisonValue,
+  formatValue = (value) => numberFormat(locale, value),
+}: {
+  locale: Locale;
+  comparisonLabel: string;
+  comparisonValue: number;
+  formatValue?: (value: number) => string;
+}) {
+  return (
+    <span className="min-w-0 truncate">
+      {comparisonLabel}: {formatValue(comparisonValue)}
+    </span>
+  );
+}
+
 export const EventMetricGrid = memo(function EventMetricGrid({
   locale,
   labels,
   summary,
+  comparisonSummary,
+  comparisonLabel,
   includeShare,
   loading = false,
 }: {
   locale: Locale;
   labels: EventPageCopy;
-  summary: {
-    events: number;
-    eventTypes: number;
-    sessions: number;
-    visitors: number;
-    avgEventsPerSession: number;
-    shareOfAllEvents?: number;
-  };
+  summary: EventMetricSummary;
+  comparisonSummary?: EventMetricSummary;
+  comparisonLabel?: string;
   includeShare?: boolean;
   loading?: boolean;
 }) {
@@ -586,6 +652,62 @@ export const EventMetricGrid = memo(function EventMetricGrid({
     includeShare && summary.shareOfAllEvents !== undefined
       ? percentFormat(locale, summary.shareOfAllEvents)
       : null;
+  const comparisonDetails = comparisonSummary
+    ? {
+        events: (
+          <EventMetricComparisonDetail
+            locale={locale}
+            comparisonLabel={comparisonLabel ?? "Comparison"}
+            comparisonValue={comparisonSummary.events}
+          />
+        ),
+        eventTypes: (
+          <EventMetricComparisonDetail
+            locale={locale}
+            comparisonLabel={comparisonLabel ?? "Comparison"}
+            comparisonValue={comparisonSummary.eventTypes}
+          />
+        ),
+        sessions: (
+          <EventMetricComparisonDetail
+            locale={locale}
+            comparisonLabel={comparisonLabel ?? "Comparison"}
+            comparisonValue={comparisonSummary.sessions}
+          />
+        ),
+        visitors: (
+          <EventMetricComparisonDetail
+            locale={locale}
+            comparisonLabel={comparisonLabel ?? "Comparison"}
+            comparisonValue={comparisonSummary.visitors}
+          />
+        ),
+        average: (
+          <EventMetricComparisonDetail
+            locale={locale}
+            comparisonLabel={comparisonLabel ?? "Comparison"}
+            comparisonValue={comparisonSummary.avgEventsPerSession}
+          />
+        ),
+      }
+    : null;
+  const comparisonChanges = comparisonSummary
+    ? {
+        events: eventMetricDelta(summary.events, comparisonSummary.events),
+        eventTypes: eventMetricDelta(
+          summary.eventTypes,
+          comparisonSummary.eventTypes,
+        ),
+        visitors: eventMetricDelta(
+          summary.visitors,
+          comparisonSummary.visitors,
+        ),
+        average: eventMetricDelta(
+          summary.avgEventsPerSession,
+          comparisonSummary.avgEventsPerSession,
+        ),
+      }
+    : null;
 
   return (
     <Card className="py-0">
@@ -596,10 +718,17 @@ export const EventMetricGrid = memo(function EventMetricGrid({
             label={labels.totalEvents}
             loading={loading}
             value={numberFormat(locale, summary.events)}
+            comparisonChange={comparisonChanges?.events}
             detail={
-              share
+              comparisonDetails?.events ??
+              (share
                 ? `${labels.shareOfAllEvents}: ${share}`
-                : labels.detailSubtitle
+                : labels.detailSubtitle)
+            }
+            detailKey={
+              comparisonSummary
+                ? `comparison-events:${comparisonSummary.events}:${summary.events}`
+                : "events-detail"
             }
           />
           <EventMetricCell
@@ -607,21 +736,42 @@ export const EventMetricGrid = memo(function EventMetricGrid({
             label={labels.eventTypes}
             loading={loading}
             value={numberFormat(locale, summary.eventTypes)}
-            detail={labels.breakdownTitle}
+            comparisonChange={comparisonChanges?.eventTypes}
+            detail={comparisonDetails?.eventTypes ?? labels.breakdownTitle}
+            detailKey={
+              comparisonSummary
+                ? `comparison-event-types:${comparisonSummary.eventTypes}:${summary.eventTypes}`
+                : "event-types-detail"
+            }
           />
           <EventMetricCell
             icon={RiFileList3Line}
             label={labels.sessions}
             loading={loading}
             value={numberFormat(locale, summary.sessions)}
-            detail={`${labels.avgEventsPerSession}: ${average}`}
+            comparisonChange={comparisonChanges?.average}
+            detail={
+              comparisonDetails?.average ??
+              `${labels.avgEventsPerSession}: ${average}`
+            }
+            detailKey={
+              comparisonSummary
+                ? `comparison-average:${comparisonSummary.avgEventsPerSession}:${summary.avgEventsPerSession}`
+                : "sessions-detail"
+            }
           />
           <EventMetricCell
             icon={RiDatabase2Line}
             label={labels.visitors}
             loading={loading}
             value={numberFormat(locale, summary.visitors)}
-            detail={labels.recordsTitle}
+            comparisonChange={comparisonChanges?.visitors}
+            detail={comparisonDetails?.visitors ?? labels.recordsTitle}
+            detailKey={
+              comparisonSummary
+                ? `comparison-visitors:${comparisonSummary.visitors}:${summary.visitors}`
+                : "visitors-detail"
+            }
           />
         </div>
       </CardContent>
@@ -633,10 +783,14 @@ export const EventTrendStackedBarCard = memo(function EventTrendStackedBarCard({
   locale,
   labels,
   trend,
+  comparisonTrend,
+  comparisonWindow,
   window: timeWindow,
   title,
   loading,
   cumulativeLabel,
+  currentPeriodLabel,
+  comparisonLabel,
   onSelectEvent,
 }: {
   locale: Locale;
@@ -644,19 +798,47 @@ export const EventTrendStackedBarCard = memo(function EventTrendStackedBarCard({
   trend:
     | EventsTrendData
     | { series: EventTrendSeries[]; data: EventsTrendData["data"] };
+  comparisonTrend?:
+    | EventsTrendData
+    | { series: EventTrendSeries[]; data: EventsTrendData["data"] };
+  comparisonWindow?: Pick<TimeWindow, "from" | "to">;
   window: TimeWindow;
   title: string;
   loading?: boolean;
   cumulativeLabel: string;
+  currentPeriodLabel?: string;
+  comparisonLabel?: string;
   onSelectEvent?: (eventName: string) => void;
 }) {
-  const series = useMemo(
+  const comparisonSeries = useMemo(
+    () =>
+      comparisonTrend
+        ? createEventTrendComparisonChartSeries(
+            trend.series,
+            comparisonTrend.series,
+            labels.other,
+          )
+        : null,
+    [comparisonTrend, labels.other, trend.series],
+  );
+  const defaultSeries = useMemo(
     () => createEventTrendChartSeries(trend.series, labels.other),
     [labels.other, trend.series],
   );
+  const series = comparisonSeries?.current ?? defaultSeries;
   const chartData = useMemo(
     () => createEventTrendChartData(trend.data, series),
     [series, trend.data],
+  );
+  const comparisonChartData = useMemo(
+    () =>
+      comparisonTrend && comparisonSeries
+        ? createEventTrendChartData(
+            comparisonTrend.data,
+            comparisonSeries.comparison,
+          )
+        : undefined,
+    [comparisonSeries, comparisonTrend],
   );
 
   return (
@@ -682,6 +864,12 @@ export const EventTrendStackedBarCard = memo(function EventTrendStackedBarCard({
           emptyLabel={labels.empty}
           cumulativeLabel={cumulativeLabel}
           totalLabel={labels.totalEvents}
+          currentPeriodLabel={currentPeriodLabel}
+          comparisonData={comparisonChartData}
+          comparisonSeries={comparisonSeries?.comparison}
+          comparisonFrom={comparisonWindow?.from}
+          comparisonTo={comparisonWindow?.to}
+          comparisonLabel={comparisonLabel}
           onSelectEvent={onSelectEvent}
         />
       </CardContent>
@@ -713,6 +901,7 @@ function SortIndicator({
 
 function SortHeader({
   label,
+  ariaLabel,
   active,
   direction,
   onClick,
@@ -720,6 +909,7 @@ function SortHeader({
   className,
 }: {
   label: string;
+  ariaLabel?: string;
   active: boolean;
   direction: SortDirection;
   onClick: () => void;
@@ -742,6 +932,7 @@ function SortHeader({
       >
         <button
           type="button"
+          aria-label={ariaLabel ?? label}
           className={cn(
             "inline-flex items-center gap-1 whitespace-nowrap transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
             active ? "text-foreground" : "text-muted-foreground",
@@ -807,11 +998,12 @@ function EventRowSkeletonContent({
 
 function appendUniqueEvents(
   current: EventRecord[],
-  incoming: EventRecord[],
+  incoming: readonly EventRecord[] | null | undefined,
 ): EventRecord[] {
-  if (current.length === 0) return incoming;
+  const incomingRows = Array.isArray(incoming) ? [...incoming] : [];
+  if (current.length === 0) return incomingRows;
   const seen = new Set(current.map((row) => row.eventId));
-  const nextRows = incoming.filter((row) => !seen.has(row.eventId));
+  const nextRows = incomingRows.filter((row) => !seen.has(row.eventId));
   return nextRows.length > 0 ? [...current, ...nextRows] : current;
 }
 
@@ -1099,6 +1291,9 @@ const EventRecordsTable = memo(function EventRecordsTable({
       eventName: (
         <SortHeader
           label={labels.eventName}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.eventName,
+          })}
           active={sort.key === "eventName"}
           direction={sort.direction}
           onClick={() => onSort("eventName")}
@@ -1108,6 +1303,9 @@ const EventRecordsTable = memo(function EventRecordsTable({
       occurredAt: (
         <SortHeader
           label={labels.occurredAt}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.occurredAt,
+          })}
           active={sort.key === "occurredAt"}
           direction={sort.direction}
           onClick={() => onSort("occurredAt")}
@@ -1118,6 +1316,9 @@ const EventRecordsTable = memo(function EventRecordsTable({
       page: (
         <SortHeader
           label={labels.page}
+          ariaLabel={formatI18nTemplate(messages.common.sortBy, {
+            label: labels.page,
+          })}
           active={sort.key === "pathname"}
           direction={sort.direction}
           onClick={() => onSort("pathname")}
@@ -1135,7 +1336,7 @@ const EventRecordsTable = memo(function EventRecordsTable({
         <TableHead className="pr-4 text-right">{labels.nodeCount}</TableHead>
       ),
     }),
-    [labels, onSort, sort],
+    [labels, messages.common.sortBy, onSort, sort],
   );
   const header = useMemo(
     () => (
@@ -1257,7 +1458,7 @@ export const EventRecordsSection = memo(function EventRecordsSection({
     storageKey: "insightflare:analytics-table-columns:events",
     columns: eventColumnDefinitions,
   });
-  const filtersKey = useMemo(() => JSON.stringify(filters ?? {}), [filters]);
+  const filtersKey = useMemo(() => filterQueryKey(filters), [filters]);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -1293,7 +1494,7 @@ export const EventRecordsSection = memo(function EventRecordsSection({
     queryFn: ({ pageParam, signal }) =>
       fetchEventsRecords(siteId, timeWindow, filters, {
         cursor: pageParam,
-        pageSize: EVENT_PAGE_SIZE,
+        limit: EVENT_PAGE_SIZE,
         sortBy: sort.key,
         sortDir: sort.direction,
         search: debouncedQuery,
@@ -1301,14 +1502,18 @@ export const EventRecordsSection = memo(function EventRecordsSection({
         signal,
       }),
     initialPageParam: null as string | null,
-    getNextPageParam: (lastPage) =>
-      lastPage.meta.hasMore ? lastPage.meta.nextCursor : undefined,
+    getNextPageParam: (lastPage) => {
+      const pagination = lastPage.data?.pagination;
+      return pagination?.hasMore && pagination.nextCursor
+        ? pagination.nextCursor
+        : undefined;
+    },
     enabled: typeof window !== "undefined",
   });
   const rows = useMemo(
     () =>
       data?.pages.reduce<EventRecord[]>(
-        (current, page) => appendUniqueEvents(current, page.data),
+        (current, page) => appendUniqueEvents(current, page.data.items),
         [],
       ) ?? [],
     [data?.pages],
@@ -1434,7 +1639,6 @@ export const EventFieldsCard = memo(function EventFieldsCard({
   filters,
   eventName,
   loading,
-  fields,
 }: {
   locale: Locale;
   labels: EventPageCopy;
@@ -1443,7 +1647,6 @@ export const EventFieldsCard = memo(function EventFieldsCard({
   filters: FilterDocument;
   eventName: string;
   loading: boolean;
-  fields: EventField[];
 }) {
   const fieldsSectionRef = useRef<HTMLElement | null>(null);
   const [fieldsVisible, setFieldsVisible] = useState(false);
@@ -1473,13 +1676,10 @@ export const EventFieldsCard = memo(function EventFieldsCard({
     );
   }, [filters, payloadFilters, payloadFiltersKey]);
   const effectiveFiltersKey = useMemo(
-    () => JSON.stringify(effectiveFilters ?? {}),
+    () => filterQueryKey(effectiveFilters),
     [effectiveFilters],
   );
-  const baseFiltersKey = useMemo(
-    () => JSON.stringify(filters ?? {}),
-    [filters],
-  );
+  const baseFiltersKey = useMemo(() => filterQueryKey(filters), [filters]);
   useEffect(() => {
     const section = fieldsSectionRef.current;
     if (!section) return;
@@ -1499,7 +1699,7 @@ export const EventFieldsCard = memo(function EventFieldsCard({
     observer.observe(section);
     return () => observer.disconnect();
   }, []);
-  const fieldsQuery = useQuery({
+  const fieldsQuery = useInfiniteQuery({
     queryKey: [
       "dashboard",
       "event-type-fields",
@@ -1511,13 +1711,20 @@ export const EventFieldsCard = memo(function EventFieldsCard({
       timeWindow.timeZone,
       baseFiltersKey,
     ],
-    queryFn: ({ signal }) =>
+    initialPageParam: null as string | null,
+    queryFn: ({ signal, pageParam }) =>
       fetchEventTypeFields(siteId, timeWindow, eventName, filters, {
+        limit: 100,
+        cursor: pageParam,
         signal,
       }),
     enabled: typeof window !== "undefined" && fieldsVisible && !loading,
+    getNextPageParam: (lastPage) =>
+      lastPage.data?.pagination?.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
   });
-  const filteredFieldsQuery = useQuery({
+  const filteredFieldsQuery = useInfiniteQuery({
     queryKey: [
       "dashboard",
       "event-filtered-fields",
@@ -1529,8 +1736,11 @@ export const EventFieldsCard = memo(function EventFieldsCard({
       timeWindow.timeZone,
       effectiveFiltersKey,
     ],
-    queryFn: ({ signal }) =>
+    initialPageParam: null as string | null,
+    queryFn: ({ signal, pageParam }) =>
       fetchEventTypeFields(siteId, timeWindow, eventName, effectiveFilters, {
+        limit: 100,
+        cursor: pageParam,
         signal,
       }),
     enabled:
@@ -1538,9 +1748,15 @@ export const EventFieldsCard = memo(function EventFieldsCard({
       fieldsVisible &&
       activePayloadFilterCount > 0 &&
       !loading,
+    getNextPageParam: (lastPage) =>
+      lastPage.data?.pagination?.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
   });
-  const baseFields = fieldsQuery.data?.fields ?? fields;
-  const filteredFields = filteredFieldsQuery.data?.fields ?? [];
+  const baseFields =
+    fieldsQuery.data?.pages.flatMap((page) => page.data.items) ?? [];
+  const filteredFields =
+    filteredFieldsQuery.data?.pages.flatMap((page) => page.data.items) ?? [];
   const filteredFieldsLoading = filteredFieldsQuery.isPending;
   const filteredFieldsError = filteredFieldsQuery.isError;
   const activeFields =
@@ -1625,7 +1841,7 @@ export const EventFieldsCard = memo(function EventFieldsCard({
     setExpandedFieldKeys(new Set(defaultExpandedFieldKeys));
   }, [defaultExpandedFieldKeys, fieldRequestKey]);
 
-  const fieldValuesQuery = useQuery({
+  const fieldValuesQuery = useInfiniteQuery({
     queryKey: [
       "dashboard",
       "event-field-values",
@@ -1639,7 +1855,8 @@ export const EventFieldsCard = memo(function EventFieldsCard({
       timeWindow.timeZone,
       effectiveFiltersKey,
     ],
-    queryFn: ({ signal }) =>
+    initialPageParam: null as string | null,
+    queryFn: ({ signal, pageParam }) =>
       fetchEventTypeFieldValues(
         siteId,
         timeWindow,
@@ -1647,16 +1864,60 @@ export const EventFieldsCard = memo(function EventFieldsCard({
         selectedField?.path ?? "",
         selectedField?.valueType ?? "string",
         effectiveFilters,
-        { limit: 25, signal },
+        { limit: 25, cursor: pageParam, signal },
       ),
     enabled:
       typeof window !== "undefined" &&
       !fieldListLoading &&
       Boolean(selectedField),
+    getNextPageParam: (lastPage) =>
+      lastPage.data?.pagination?.hasMore
+        ? lastPage.data.pagination.nextCursor
+        : undefined,
   });
-  const fieldValues = fieldValuesQuery.data?.data ?? [];
+  const fieldValues =
+    fieldValuesQuery.data?.pages.flatMap((page) => page.data.items) ?? [];
   const fieldValuesLoading = fieldValuesQuery.isPending;
+  const fieldValuesLoadingMore = fieldValuesQuery.isFetchingNextPage;
   const fieldValuesError = fieldValuesQuery.isError;
+  const fieldValuesAppendError = fieldValuesQuery.isFetchNextPageError;
+  const fieldValuesHasMore = fieldValuesQuery.hasNextPage ?? false;
+  const fieldValuesLoadMoreInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!fieldValuesLoadingMore || !fieldValuesHasMore) {
+      fieldValuesLoadMoreInFlightRef.current = false;
+    }
+  }, [fieldValuesHasMore, fieldValuesLoadingMore]);
+
+  const loadMoreFieldValues = useCallback(() => {
+    if (
+      !fieldValuesHasMore ||
+      fieldValuesLoadingMore ||
+      fieldValuesLoadMoreInFlightRef.current
+    ) {
+      return;
+    }
+    fieldValuesLoadMoreInFlightRef.current = true;
+    void fieldValuesQuery.fetchNextPage();
+  }, [
+    fieldValuesHasMore,
+    fieldValuesLoadingMore,
+    fieldValuesQuery.fetchNextPage,
+  ]);
+
+  const fieldValuesSentinelRef = useInfiniteTableSentinel({
+    enabled:
+      Boolean(selectedField) &&
+      !fieldValuesLoading &&
+      !fieldValuesLoadingMore &&
+      !fieldValuesError &&
+      !fieldValuesAppendError &&
+      fieldValuesHasMore,
+    onReachEnd: loadMoreFieldValues,
+    rootMargin: "0px",
+    triggerDistance: 0,
+  });
 
   const fieldValueTotal = useMemo(
     () =>
@@ -1795,26 +2056,34 @@ export const EventFieldsCard = memo(function EventFieldsCard({
         style={indentStyle}
       >
         {hasChildren ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0 rounded-none text-primary shadow-none transition-colors hover:bg-primary/10 hover:text-primary"
-            onClick={(event) => {
-              event.stopPropagation();
-              toggleFieldExpansion(nodeKey);
-            }}
-            disabled={fieldListLoading}
-            aria-label={isExpanded ? labels.collapseField : labels.expandField}
-            title={isExpanded ? labels.collapseField : labels.expandField}
-          >
-            <RiArrowDownSLine
-              className={cn(
-                "size-3.5 transition-transform duration-200 ease-out",
-                isExpanded ? "rotate-0" : "-rotate-90",
-              )}
-            />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0 rounded-none text-primary shadow-none transition-colors hover:bg-primary/10 hover:text-primary"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleFieldExpansion(nodeKey);
+                }}
+                disabled={fieldListLoading}
+                aria-label={
+                  isExpanded ? labels.collapseField : labels.expandField
+                }
+              >
+                <RiArrowDownSLine
+                  className={cn(
+                    "size-3.5 transition-transform duration-200 ease-out",
+                    isExpanded ? "rotate-0" : "-rotate-90",
+                  )}
+                />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isExpanded ? labels.collapseField : labels.expandField}
+            </TooltipContent>
+          </Tooltip>
         ) : (
           <span className="size-6 shrink-0" />
         )}
@@ -1831,21 +2100,25 @@ export const EventFieldsCard = memo(function EventFieldsCard({
         </div>
 
         {selectableField ? (
-          <button
-            type="button"
-            className={cn(
-              "inline-flex size-6 shrink-0 items-center justify-center rounded-none text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-            )}
-            onClick={(event) => {
-              event.stopPropagation();
-              selectField();
-            }}
-            disabled={fieldListLoading}
-            aria-label={`${labels.fieldValuesTitle}: ${fieldLabel}`}
-            title={labels.fieldValuesTitle}
-          >
-            <RiSearchLine className="size-3.5" />
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "inline-flex size-6 shrink-0 items-center justify-center rounded-none text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                )}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  selectField();
+                }}
+                disabled={fieldListLoading}
+                aria-label={`${labels.fieldValuesTitle}: ${fieldLabel}`}
+              >
+                <RiSearchLine className="size-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{labels.fieldValuesTitle}</TooltipContent>
+          </Tooltip>
         ) : null}
       </div>
     );
@@ -1927,10 +2200,7 @@ export const EventFieldsCard = memo(function EventFieldsCard({
             }}
           >
             <TableCell className="whitespace-normal p-0 align-top">
-              <div
-                className="px-4 py-2 font-mono leading-5 break-words whitespace-normal"
-                title={valueLabel}
-              >
+              <div className="px-4 py-2 font-mono leading-5 break-words whitespace-normal">
                 {valueLabel}
               </div>
             </TableCell>
@@ -1944,6 +2214,40 @@ export const EventFieldsCard = memo(function EventFieldsCard({
       })}
     </AnimatePresence>
   );
+
+  const fieldValueLoadMoreRows = fieldValuesAppendError ? (
+    <TableRow>
+      <TableCell colSpan={2} className="h-16 text-center text-muted-foreground">
+        {labels.loadError}
+      </TableCell>
+    </TableRow>
+  ) : fieldValuesHasMore ? (
+    <>
+      {Array.from({ length: 3 }, (_, rowIndex) => (
+        <TableRow
+          key={`field-values-skeleton-${rowIndex}`}
+          aria-hidden="true"
+          className="pointer-events-none hover:bg-transparent"
+        >
+          <TableCell className="whitespace-normal p-0 align-top">
+            <div className="px-4 py-2">
+              <Skeleton
+                className={cn("h-4", rowIndex === 1 ? "w-[72%]" : "w-[58%]")}
+              />
+            </div>
+          </TableCell>
+          <TableCell className="p-0">
+            <div
+              ref={rowIndex === 2 ? fieldValuesSentinelRef : undefined}
+              className="flex justify-end px-4 py-2"
+            >
+              <Skeleton className="h-4 w-14" />
+            </div>
+          </TableCell>
+        </TableRow>
+      ))}
+    </>
+  ) : null;
 
   return (
     <>
@@ -2049,7 +2353,7 @@ export const EventFieldsCard = memo(function EventFieldsCard({
                 hasContent={
                   Boolean(selectedField) &&
                   !fieldValuesError &&
-                  fieldValues.length > 0
+                  (fieldValues.length > 0 || fieldValuesHasMore)
                 }
                 loadingLabel={labels.loading}
                 emptyLabel={
@@ -2058,7 +2362,8 @@ export const EventFieldsCard = memo(function EventFieldsCard({
                 colSpan={2}
                 header={fieldValueTableHeader}
                 rows={fieldValueRows}
-                contentKey={`${selectedFieldResolvedKey}-${fieldValues.length}-${fieldValueTotal}`}
+                footer={fieldValueLoadMoreRows}
+                contentKey={selectedFieldResolvedKey || "field-values"}
               />
             </CardContent>
           </Card>
@@ -2069,11 +2374,7 @@ export const EventFieldsCard = memo(function EventFieldsCard({
         open={payloadFilterDialogOpen}
         onOpenChange={setPayloadFilterDialogOpen}
       >
-        <ResponsiveDialogContent
-          data-dashboard-floating-layer="event-filter-dialog"
-          desktopClassName="max-w-xl"
-          style={{ zIndex: EVENT_FILTER_DIALOG_Z_INDEX }}
-        >
+        <ResponsiveDialogContent desktopClassName="max-w-xl">
           <ResponsiveDialogHeader>
             <ResponsiveDialogTitle icon={RiFilter3Line}>
               {labels.payloadFilterTitle}

@@ -1,5 +1,5 @@
+import type { PublicAnalyticsEngineConfig } from "@/lib/analytics-engine-config";
 import type { AdminPublicLoginTurnstileConfig } from "@/lib/auth/login-turnstile-config";
-import type { PublicBotAnalyticsConfig } from "@/lib/bot-analytics-config";
 import type { NotificationPreferencesData } from "@/lib/edge-client";
 import type {
   AccountUserData,
@@ -11,14 +11,16 @@ import type {
   TeamData,
 } from "@/lib/edge-client-types";
 import type { PublicNotificationEmailConfig } from "@/lib/notifications/email-config";
+import type { PageResult } from "@/lib/pagination";
 import type {
+  ScheduledTaskRetentionConfig,
   ScheduledTaskRun,
   ScheduledTaskRunGroup,
   ScheduledTaskRunLog,
   ScheduledTasksData,
   ScheduledTaskSummary,
 } from "@/lib/scheduled-tasks";
-import type { SiteScriptSettings } from "@/lib/site-settings";
+import type { SiteSettingsConfig } from "@/lib/site-settings";
 import type { SystemPerformanceData } from "@/lib/system-performance";
 
 export type ManagementJsonValue =
@@ -83,9 +85,13 @@ export type SerializableScheduledTasksData = Omit<
   "tasks" | "runs" | "selectedRun" | "logs"
 > & {
   tasks: SerializableScheduledTaskSummary[];
-  runs: SerializableScheduledTaskRunGroup[];
+  runs: Omit<PageResult<ScheduledTaskRunGroup>, "items"> & {
+    items: SerializableScheduledTaskRunGroup[];
+  };
   selectedRun: SerializableScheduledTaskRunGroup | null;
-  logs: SerializableScheduledTaskRunLog[];
+  logs: Omit<PageResult<ScheduledTaskRunLog>, "items"> & {
+    items: SerializableScheduledTaskRunLog[];
+  };
 };
 
 export interface TeamInviteData {
@@ -120,7 +126,7 @@ export interface ScriptSnippetData {
 }
 
 export interface SiteSettingsInitialData {
-  config: SiteScriptSettings;
+  config: SiteSettingsConfig;
   scriptSnippet: string;
   origin: string;
   fetchedAt: number;
@@ -168,9 +174,10 @@ export interface AdminUsersInitialData {
 }
 
 export interface SystemSettingsInitialData {
-  botAnalytics: PublicBotAnalyticsConfig;
+  analyticsEngine: PublicAnalyticsEngineConfig;
   loginTurnstile: AdminPublicLoginTurnstileConfig;
   notificationEmail: PublicNotificationEmailConfig;
+  scheduledTaskRetention: ScheduledTaskRetentionConfig;
   fetchedAt: number;
 }
 

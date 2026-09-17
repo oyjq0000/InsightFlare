@@ -110,24 +110,21 @@ function schemaContainsPagination(schema, seen = new Set()) {
   if (schema.$ref) {
     if (seen.has(schema.$ref)) return false;
     seen.add(schema.$ref);
-    return (
-      schema.$ref.endsWith("/PaginatedEnvelope") ||
-      schemaContainsPagination(resolvePointer(schema.$ref), seen)
-    );
+    return schemaContainsPagination(resolvePointer(schema.$ref), seen);
   }
-  if (schema.properties?.pagination) return true;
-  const page = schema.properties?.page;
-  if (page && typeof page === "object") {
-    const resolvedPage = page.$ref ? resolvePointer(page.$ref) : page;
-    const pageProperties = resolvedPage?.properties;
-    if (
-      pageProperties?.nextCursor &&
-      pageProperties?.hasMore &&
-      (pageProperties?.kind?.const === "keyset" ||
-        pageProperties?.kind?.enum?.includes("keyset"))
-    ) {
-      return true;
-    }
+  const data = schema.properties?.data;
+  const dataSchema = dereference(data);
+  const pagination = dataSchema?.properties?.pagination;
+  const paginationSchema = dereference(pagination);
+  const paginationProperties = paginationSchema?.properties;
+  if (
+    dataSchema?.properties?.items &&
+    paginationProperties?.limit &&
+    paginationProperties?.returned &&
+    paginationProperties?.hasMore &&
+    paginationProperties?.nextCursor
+  ) {
+    return true;
   }
   if (schema.properties) {
     return Object.values(schema.properties).some((value) =>
@@ -146,8 +143,45 @@ function schemaContainsPagination(schema, seen = new Set()) {
   return false;
 }
 
+let legacyPaginationShapeFound = false;
+walk(openapi, (value) => {
+  if (legacyPaginationShapeFound || !value || typeof value !== "object") {
+    return;
+  }
+  if (
+    typeof value.$ref === "string" &&
+    (value.$ref.endsWith("/PaginatedEnvelope") ||
+      value.$ref.endsWith("/Pagination"))
+  ) {
+    legacyPaginationShapeFound = true;
+    return;
+  }
+  const properties = value.properties;
+  if (
+    properties?.data?.type === "array" &&
+    Object.prototype.hasOwnProperty.call(properties, "pagination")
+  ) {
+    legacyPaginationShapeFound = true;
+    return;
+  }
+  const page = dereference(properties?.page);
+  const pageProperties = page?.properties;
+  if (
+    pageProperties?.nextCursor &&
+    pageProperties?.hasMore &&
+    (pageProperties?.kind?.const === "keyset" ||
+      pageProperties?.kind?.enum?.includes("keyset"))
+  ) {
+    legacyPaginationShapeFound = true;
+  }
+});
+if (legacyPaginationShapeFound) {
+  issues.push("OpenAPI contains a legacy pagination response shape");
+}
+
 const operationIds = new Map();
 const operations = [];
+let apiV1ErrorResponses = 0;
 
 for (const [path, pathItem] of Object.entries(openapi.paths ?? {})) {
   if (path.includes("queryName")) {
@@ -168,6 +202,24 @@ for (const [path, pathItem] of Object.entries(openapi.paths ?? {})) {
       );
     } else {
       operationIds.set(operation.operationId, key);
+    }
+
+    for (const response of Object.values(operation.responses ?? {})) {
+      if (
+        !path.startsWith("/api/v1") ||
+        !response?.description?.startsWith("API v1 error:")
+      ) {
+        continue;
+      }
+      apiV1ErrorResponses += 1;
+      if (
+        response.content?.["application/json"]?.schema?.$ref !==
+        "#/components/schemas/ApiV1ErrorEnvelope"
+      ) {
+        issues.push(
+          `${key} API v1 error response must reference ApiV1ErrorEnvelope`,
+        );
+      }
     }
 
     const parameters = [
@@ -252,6 +304,15 @@ for (const [path, pathItem] of Object.entries(openapi.paths ?? {})) {
       issues.push(`${key} authenticated operation should declare a scope`);
     }
   }
+}
+
+if (
+  apiV1ErrorResponses > 0 &&
+  !openapi.components?.schemas?.ApiV1ErrorEnvelope
+) {
+  issues.push(
+    "OpenAPI components must define ApiV1ErrorEnvelope for API v1 errors",
+  );
 }
 
 for (const [name, schema] of Object.entries(

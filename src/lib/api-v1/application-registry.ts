@@ -6,6 +6,7 @@ import {
   type FilterDocument,
   normalizeFilterDocument,
 } from "@/lib/edge/analytics/contract";
+import { FILTER_DSL_MAX_LENGTH } from "@/lib/filter-contract";
 import {
   FunnelCreateInputSchema,
   FunnelUpdateInputSchema,
@@ -55,6 +56,7 @@ export const SavedFilterDefinitionSchema = z
     name: z.string().min(1).max(120),
     description: z.string().max(2_000),
     visibility: z.literal("team"),
+    scopePreference: z.enum(["auto", "event", "session", "visitor"]),
     filter: z
       .object({
         version: z.literal(1),
@@ -69,12 +71,12 @@ export const SavedFilterDefinitionSchema = z
 export const SavedFilterPageSchema = z
   .object({
     items: z.array(SavedFilterDefinitionSchema),
-    page: z
+    pagination: z
       .object({
-        kind: z.literal("keyset"),
         limit: z.number().int().min(1).max(1000),
         nextCursor: z.string().max(12_288).nullable(),
         hasMore: z.boolean(),
+        returned: z.number().int().min(0).max(1000),
       })
       .strict(),
   })
@@ -83,8 +85,13 @@ export const SavedFilterPageSchema = z
 export const ListTeamVisibleSavedFiltersInputSchema = z
   .object({
     siteId: z.string().min(1).max(256),
-    limit: z.number().int().min(1).max(1000).default(100),
-    cursor: z.string().min(1).max(12_288).nullable().default(null),
+    page: z
+      .object({
+        limit: z.number().int().min(1).max(1000).default(100),
+        cursor: z.string().min(1).max(12_288).nullable().optional(),
+      })
+      .strict()
+      .default({ limit: 100 }),
   })
   .strict();
 
@@ -154,21 +161,70 @@ export const TrackingScriptSchema = z
   .strict();
 
 const FunnelStepSchema = z
-  .object({ type: z.enum(["pageview", "event"]), value: z.string().min(1) })
+  .object({
+    id: z.string().min(1).max(128),
+    name: z.string().max(120).optional(),
+    filterDsl: z.string().min(1),
+  })
   .strict();
 export const FunnelResourceSchema = z
   .object({
     id: SiteIdSchema,
     siteId: SiteIdSchema,
     name: z.string().min(1).max(200),
-    steps: z.array(FunnelStepSchema).min(2).max(10),
+    filterDslVersion: z.literal(1),
+    progressionScope: z.enum(["session", "visitor"]),
+    conversionWindowMs: z.number().finite().nullable(),
+    steps: z.array(FunnelStepSchema).min(1),
+    semanticFingerprint: z.string().min(1),
     createdAt: z.string().datetime({ offset: true }),
     updatedAt: z.string().datetime({ offset: true }),
     links: z.record(z.string(), z.string()),
   })
   .strict();
 
-export const ListSitesInputSchema = z.object({}).strict();
+const ResourcePageRequestSchema = z
+  .object({
+    limit: z.number().int().min(1).max(200).default(100),
+    cursor: z.string().min(1).max(12_288).nullable().optional(),
+  })
+  .strict()
+  .default({ limit: 100 });
+
+const GoalResourcePageRequestSchema = z
+  .object({
+    limit: z.number().int().min(1).max(200).default(50),
+    cursor: z.string().min(1).max(12_288).nullable().optional(),
+  })
+  .strict()
+  .default({ limit: 50 });
+
+const ResourcePaginationMetaSchema = z
+  .object({
+    limit: z.number().int().min(1).max(200),
+    returned: z.number().int().min(0).max(200),
+    hasMore: z.boolean(),
+    nextCursor: z.string().max(12_288).nullable(),
+  })
+  .strict();
+
+export const SiteResourcePageSchema = z
+  .object({
+    items: z.array(SiteResourceSchema),
+    pagination: ResourcePaginationMetaSchema,
+  })
+  .strict();
+
+export const FunnelResourcePageSchema = z
+  .object({
+    items: z.array(FunnelResourceSchema),
+    pagination: ResourcePaginationMetaSchema,
+  })
+  .strict();
+
+export const ListSitesInputSchema = z
+  .object({ page: ResourcePageRequestSchema })
+  .strict();
 export const CreateSiteInputSchema = SiteCreateInputSchema;
 export const GetSiteInputSchema = z.object({ siteId: SiteIdSchema }).strict();
 const sitePatchRefinement = (value: z.infer<typeof SiteUpdateInputSchema>) =>
@@ -268,12 +324,22 @@ export const UpdateSharingSettingsInputSchema =
 export const CreateFunnelInputSchema = FunnelCreateInputSchema.extend({
   siteId: SiteIdSchema,
 }).strict();
+/** Body schema used by generated clients; the site id comes from the path. */
+export const CreateFunnelBodySchema = FunnelCreateInputSchema;
+export const ListFunnelsInputSchema = z
+  .object({ siteId: SiteIdSchema, page: ResourcePageRequestSchema })
+  .strict();
 export const GetFunnelInputSchema = z
   .object({ siteId: SiteIdSchema, funnelId: SiteIdSchema })
   .strict();
 const funnelPatchRefinement = (
   value: z.infer<typeof FunnelUpdateInputSchema>,
-) => value.name !== undefined || value.steps !== undefined;
+) =>
+  value.name !== undefined ||
+  value.filterDslVersion !== undefined ||
+  value.progressionScope !== undefined ||
+  value.conversionWindowMs !== undefined ||
+  value.steps !== undefined;
 export const UpdateFunnelBodySchema = FunnelUpdateInputSchema.refine(
   funnelPatchRefinement,
   "A funnel patch must change at least one field",
@@ -288,17 +354,82 @@ export const UpdateFunnelInputSchema = FunnelUpdateInputSchema.extend({
     "A funnel patch must change at least one field",
   );
 
+const GoalConfigInputSchema = z
+  .object({
+    filterDslVersion: z.literal(1).default(1),
+    filterDsl: z.string().min(1).max(FILTER_DSL_MAX_LENGTH),
+  })
+  .strict();
+export const GoalResourceSchema = z
+  .object({
+    id: SiteIdSchema,
+    siteId: SiteIdSchema,
+    name: z.string().min(1).max(200),
+    filterDslVersion: z.literal(1),
+    filterDsl: z.string().min(1).max(FILTER_DSL_MAX_LENGTH),
+    semanticFingerprint: z.string().min(1),
+    createdAt: z.string().datetime({ offset: true }),
+    updatedAt: z.string().datetime({ offset: true }),
+    links: z.record(z.string(), z.string()),
+  })
+  .strict();
+export const GoalResourcePageSchema = z
+  .object({
+    items: z.array(GoalResourceSchema),
+    pagination: ResourcePaginationMetaSchema,
+  })
+  .strict();
+export const CreateGoalInputSchema = GoalConfigInputSchema.extend({
+  siteId: SiteIdSchema,
+  name: z.string().min(1).max(200),
+}).strict();
+export const CreateGoalBodySchema = GoalConfigInputSchema.extend({
+  name: z.string().min(1).max(200),
+}).strict();
+export const ListGoalsInputSchema = z
+  .object({ siteId: SiteIdSchema, page: GoalResourcePageRequestSchema })
+  .strict();
+export const GetGoalInputSchema = z
+  .object({ siteId: SiteIdSchema, goalId: SiteIdSchema })
+  .strict();
+const goalPatchRefinement = (value: {
+  name?: string;
+  filterDslVersion?: 1;
+  filterDsl?: string;
+}) =>
+  value.name !== undefined ||
+  value.filterDslVersion !== undefined ||
+  value.filterDsl !== undefined;
+const GoalPatchInputSchema = GoalConfigInputSchema.partial()
+  .extend({ name: z.string().min(1).max(200).optional() })
+  .strict();
+export const UpdateGoalBodySchema = GoalPatchInputSchema.refine(
+  goalPatchRefinement,
+  "A goal patch must change at least one field",
+);
+export const UpdateGoalInputSchema = GoalPatchInputSchema.extend({
+  siteId: SiteIdSchema,
+  goalId: SiteIdSchema,
+})
+  .strict()
+  .refine(goalPatchRefinement, "A goal patch must change at least one field");
+
 export type SiteResource = z.infer<typeof SiteResourceSchema>;
 export type TrackingSettings = z.infer<typeof TrackingSettingsSchema>;
 export type PrivacySettings = z.infer<typeof PrivacySettingsSchema>;
 export type SharingSettings = z.infer<typeof SharingSettingsSchema>;
 export type TrackingScript = z.infer<typeof TrackingScriptSchema>;
 export type FunnelResource = z.infer<typeof FunnelResourceSchema>;
+export type GoalResource = z.infer<typeof GoalResourceSchema>;
+export type ListSitesInput = z.infer<typeof ListSitesInputSchema>;
+export type ListFunnelsInput = z.infer<typeof ListFunnelsInputSchema>;
+export type ListGoalsInput = z.infer<typeof ListGoalsInputSchema>;
+export type SiteResourcePage = z.infer<typeof SiteResourcePageSchema>;
+export type FunnelResourcePage = z.infer<typeof FunnelResourcePageSchema>;
+export type GoalResourcePage = z.infer<typeof GoalResourcePageSchema>;
 
 export type ApiV1ApplicationErrorCode =
-  | "not_found"
-  | "internal_error"
-  | "invalid_cursor";
+  "not_found" | "internal_error" | "invalid_cursor";
 
 export interface ApiV1ApplicationSuccess<Result, Meta = undefined> {
   readonly data: Result;
@@ -322,8 +453,8 @@ export interface ApiV1ApplicationOperationMap {
   };
   "sites.list": {
     input: z.infer<typeof ListSitesInputSchema>;
-    result: readonly z.infer<typeof SiteResourceSchema>[];
-    error: "internal_error";
+    result: z.infer<typeof SiteResourcePageSchema>;
+    error: "internal_error" | "invalid_cursor";
   };
   "sites.create": {
     input: z.infer<typeof CreateSiteInputSchema>;
@@ -381,14 +512,14 @@ export interface ApiV1ApplicationOperationMap {
     error: "not_found" | "internal_error";
   };
   "funnels.list": {
-    input: z.infer<typeof SiteSettingsInputSchema>;
-    result: readonly z.infer<typeof FunnelResourceSchema>[];
-    error: "not_found" | "internal_error";
+    input: z.infer<typeof ListFunnelsInputSchema>;
+    result: z.infer<typeof FunnelResourcePageSchema>;
+    error: "not_found" | "internal_error" | "invalid_cursor";
   };
   "funnels.create": {
     input: z.infer<typeof CreateFunnelInputSchema>;
     result: z.infer<typeof FunnelResourceSchema>;
-    error: "not_found" | "internal_error";
+    error: "not_found" | "invalid_input" | "internal_error";
   };
   "funnels.get": {
     input: z.infer<typeof GetFunnelInputSchema>;
@@ -398,10 +529,35 @@ export interface ApiV1ApplicationOperationMap {
   "funnels.update": {
     input: z.infer<typeof UpdateFunnelInputSchema>;
     result: z.infer<typeof FunnelResourceSchema>;
-    error: "not_found" | "internal_error";
+    error: "not_found" | "invalid_input" | "internal_error";
   };
   "funnels.delete": {
     input: z.infer<typeof GetFunnelInputSchema>;
+    result: undefined;
+    error: "not_found" | "internal_error";
+  };
+  "goals.list": {
+    input: z.infer<typeof ListGoalsInputSchema>;
+    result: z.infer<typeof GoalResourcePageSchema>;
+    error: "not_found" | "internal_error" | "invalid_cursor";
+  };
+  "goals.create": {
+    input: z.infer<typeof CreateGoalInputSchema>;
+    result: z.infer<typeof GoalResourceSchema>;
+    error: "not_found" | "invalid_input" | "internal_error";
+  };
+  "goals.get": {
+    input: z.infer<typeof GetGoalInputSchema>;
+    result: z.infer<typeof GoalResourceSchema>;
+    error: "not_found" | "internal_error";
+  };
+  "goals.update": {
+    input: z.infer<typeof UpdateGoalInputSchema>;
+    result: z.infer<typeof GoalResourceSchema>;
+    error: "not_found" | "invalid_input" | "internal_error";
+  };
+  "goals.delete": {
+    input: z.infer<typeof GetGoalInputSchema>;
     result: undefined;
     error: "not_found" | "internal_error";
   };

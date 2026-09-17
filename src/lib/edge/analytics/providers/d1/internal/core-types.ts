@@ -24,12 +24,16 @@ export interface QueryWindow {
   endExclusiveMs: number;
   nowMs: number;
   timeZone: string;
+  /** Optional API v1 request binding; private/public use parsed semantics. */
+  paginationBinding?: string;
 }
 
 export interface SiteRow {
   id: string;
   name: string;
   domain: string;
+  /** Resolved once at the private-site boundary for mutation guards. */
+  canManage?: boolean;
 }
 
 export interface TeamSiteRow {
@@ -45,10 +49,7 @@ export interface TeamSiteRow {
 
 export type SortDirection = "asc" | "desc";
 export type VisitorListSortKey =
-  | "firstSeenAt"
-  | "lastSeenAt"
-  | "sessions"
-  | "views";
+  "firstSeenAt" | "lastSeenAt" | "sessions" | "views";
 export type SessionListSortKey = "startedAt" | "durationMs" | "views";
 export type EventRecordSortKey = "occurredAt" | "eventName" | "pathname";
 
@@ -307,6 +308,16 @@ export interface ReferrerRow {
   visitors: number;
 }
 
+export interface ReferrerSummaryRow {
+  totalViews: number;
+  directViews: number;
+  externalViews: number;
+  uniqueDomains: number;
+  uniqueLinks: number;
+  truncated: boolean;
+  topSources: Array<Pick<ReferrerRow, "referrer" | "views">>;
+}
+
 export interface ReferrerRadarRow {
   referrer: string;
   sessions: number;
@@ -322,6 +333,8 @@ export interface ReferrerRadarRow {
 export interface VisitorRow {
   visitorId: string;
   sessionId?: string;
+  userId: string;
+  userName: string;
   firstSeenAt: number;
   lastSeenAt: number;
   views: number;
@@ -345,6 +358,8 @@ export interface VisitorRow {
 export interface SessionRow {
   sessionId: string;
   visitorId: string;
+  userId: string;
+  userName: string;
   startedAt: number;
   endedAt: number;
   durationMs: number;
@@ -531,18 +546,9 @@ export type ClientDimensionKey =
   | "screenSize";
 
 export type UtmDimensionKey =
-  | "source"
-  | "medium"
-  | "campaign"
-  | "term"
-  | "content";
+  "source" | "medium" | "campaign" | "term" | "content";
 export type OverviewGeoTabKey =
-  | "country"
-  | "region"
-  | "city"
-  | "continent"
-  | "timezone"
-  | "organization";
+  "country" | "region" | "city" | "continent" | "timezone" | "organization";
 
 export interface ClientDimensionTabs {
   browser: DimensionRow[];

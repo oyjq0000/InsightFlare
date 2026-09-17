@@ -1,13 +1,22 @@
-import { parseFilterPanelExpression } from "@/lib/dashboard/filter-panel-expression";
 import {
   analyticsFilterRegistry,
   assertFilterAudience,
+  FILTER_DSL_MAX_LENGTH,
+  parseFilterDsl,
 } from "@/lib/filter-contract";
+import {
+  decodePageCursor,
+  encodePageCursor,
+  InvalidCursorError,
+  paginationBinding,
+} from "@/lib/pagination";
 import { bad, forb, jsonResponseFor, na, nf } from "@/lib/response";
 import {
   SAVED_FILTER_DSL_VERSION,
+  SAVED_FILTER_SCOPE_PREFERENCES,
   SAVED_FILTER_VISIBILITIES,
   type SavedFilter,
+  type SavedFilterScopePreference,
   type SavedFilterVisibility,
 } from "@/lib/saved-filters";
 
@@ -18,7 +27,6 @@ import type { Env } from "./types";
 const MAX_FILTER_ID_LENGTH = 120;
 const MAX_FILTER_NAME_LENGTH = 120;
 const MAX_FILTER_DESCRIPTION_LENGTH = 2_000;
-const MAX_FILTER_DSL_LENGTH = 65_536;
 
 interface SavedFilterRow {
   id: string;
@@ -26,6 +34,7 @@ interface SavedFilterRow {
   ownerUserId: string;
   authorName: string;
   visibility: SavedFilterVisibility;
+  scopePreference?: SavedFilterScopePreference | null;
   name: string;
   description: string;
   filterDsl: string;
@@ -38,12 +47,35 @@ interface SavedFilterInput {
   readonly name: string;
   readonly description: string;
   readonly visibility: SavedFilterVisibility;
+  readonly scopePreference: SavedFilterScopePreference;
   readonly filterDsl: string;
+}
+
+interface SavedFilterCursor {
+  readonly updatedAt: number;
+  readonly id: string;
+}
+
+function savedFilterCursor(value: unknown): SavedFilterCursor | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.id === "string" &&
+    Number.isSafeInteger(candidate.updatedAt)
+    ? { id: candidate.id, updatedAt: candidate.updatedAt as number }
+    : null;
+}
+
+function parseListLimit(url: URL): number {
+  const value = Number(url.searchParams.get("limit") ?? "100");
+  return Number.isFinite(value)
+    ? Math.max(1, Math.min(100, Math.trunc(value)))
+    : 100;
 }
 
 function asSavedFilter(row: SavedFilterRow, actorUserId: string): SavedFilter {
   return {
     ...row,
+    scopePreference: row.scopePreference ?? "auto",
     isOwner: row.ownerUserId === actorUserId,
   };
 }
@@ -66,8 +98,10 @@ function savedFilterInput(
     body.description ?? "",
     MAX_FILTER_DESCRIPTION_LENGTH,
   );
-  const rawDsl = text(body.filterDsl, MAX_FILTER_DSL_LENGTH);
+  const rawDsl = text(body.filterDsl, FILTER_DSL_MAX_LENGTH);
   const rawVisibility = body.visibility;
+  const rawScopePreference =
+    body.scopePreference === undefined ? "auto" : body.scopePreference;
   if (rawName === null || !rawName.trim()) {
     return bad("name is required", "invalid_saved_filter_name");
   }
@@ -80,14 +114,22 @@ function savedFilterInput(
   ) {
     return bad("visibility is invalid", "invalid_saved_filter_visibility");
   }
+  if (
+    typeof rawScopePreference !== "string" ||
+    !SAVED_FILTER_SCOPE_PREFERENCES.includes(
+      rawScopePreference as SavedFilterScopePreference,
+    )
+  ) {
+    return bad(
+      "scopePreference is invalid",
+      "invalid_saved_filter_scope_preference",
+    );
+  }
   if (rawDsl === null) {
     return bad("filterDsl is invalid", "invalid_saved_filter_dsl");
   }
   try {
-    const document = parseFilterPanelExpression(
-      rawDsl,
-      analyticsFilterRegistry,
-    );
+    const document = parseFilterDsl(rawDsl, analyticsFilterRegistry);
     if (!document.root) {
       return bad("filterDsl must contain a filter", "empty_saved_filter_dsl");
     }
@@ -103,6 +145,7 @@ function savedFilterInput(
     name: rawName.trim(),
     description: rawDescription,
     visibility: rawVisibility as SavedFilterVisibility,
+    scopePreference: rawScopePreference as SavedFilterScopePreference,
     filterDsl: rawDsl,
   };
 }
@@ -113,6 +156,7 @@ const savedFilterColumns = `
   sf.owner_user_id AS ownerUserId,
   COALESCE(NULLIF(u.name, ''), NULLIF(u.username, ''), 'Unknown') AS authorName,
   sf.visibility,
+  sf.scope_preference AS scopePreference,
   sf.name,
   sf.description,
   sf.filter_dsl AS filterDsl,
@@ -150,18 +194,69 @@ export async function handleSavedFilters(
   const id = filterId(input.filterId);
 
   if (request.method === "GET" && !input.filterId) {
+    const url = new URL(request.url);
+    const limit = parseListLimit(url);
+    const binding = await paginationBinding([
+      "private-saved-filters-v1",
+      "private-dashboard",
+      siteId,
+      session.userId,
+      "updatedAt:desc,id:desc",
+    ]);
+    let cursor: SavedFilterCursor | null = null;
+    try {
+      cursor = await decodePageCursor(
+        env,
+        binding,
+        url.searchParams.get("cursor"),
+        "saved-filters",
+        savedFilterCursor,
+      );
+    } catch (error) {
+      if (error instanceof InvalidCursorError) {
+        return bad("Invalid saved filter cursor", "invalid_cursor", request);
+      }
+      throw error;
+    }
+    const cursorClause = cursor
+      ? "AND (sf.updated_at < ? OR (sf.updated_at = ? AND sf.id < ?))"
+      : "";
     const rows = await env.DB.prepare(
       `SELECT ${savedFilterColumns}
        FROM saved_filters sf
        INNER JOIN users u ON u.id = sf.owner_user_id
        WHERE sf.site_id = ?
          AND (sf.owner_user_id = ? OR sf.visibility = 'team')
-       ORDER BY sf.updated_at DESC, sf.id DESC`,
+         ${cursorClause}
+       ORDER BY sf.updated_at DESC, sf.id DESC
+       LIMIT ?`,
     )
-      .bind(siteId, session.userId)
+      .bind(
+        siteId,
+        session.userId,
+        ...(cursor ? [cursor.updatedAt, cursor.updatedAt, cursor.id] : []),
+        limit + 1,
+      )
       .all<SavedFilterRow>();
+    const hasMore = rows.results.length > limit;
+    const items = (hasMore ? rows.results.slice(0, limit) : rows.results).map(
+      (row) => asSavedFilter(row, session.userId),
+    );
+    const last = rows.results[hasMore ? limit - 1 : rows.results.length - 1];
     return jsonResponseFor(request, {
-      filters: rows.results.map((row) => asSavedFilter(row, session.userId)),
+      items,
+      pagination: {
+        limit,
+        returned: items.length,
+        hasMore,
+        nextCursor:
+          hasMore && last
+            ? await encodePageCursor(env, binding, {
+                updatedAt: last.updatedAt,
+                id: last.id,
+              })
+            : null,
+      },
     });
   }
 
@@ -171,9 +266,10 @@ export async function handleSavedFilters(
     const duplicate = await env.DB.prepare(
       `SELECT id FROM saved_filters
        WHERE site_id = ? AND owner_user_id = ? AND filter_dsl = ?
+         AND scope_preference = ?
        LIMIT 1`,
     )
-      .bind(siteId, session.userId, parsed.filterDsl)
+      .bind(siteId, session.userId, parsed.filterDsl, parsed.scopePreference)
       .first<{ id: string }>();
     if (duplicate) {
       return bad(
@@ -186,8 +282,8 @@ export async function handleSavedFilters(
     await env.DB.prepare(
       `INSERT INTO saved_filters (
         id, site_id, owner_user_id, visibility, name, description,
-        filter_dsl, filter_dsl_version, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())`,
+        scope_preference, filter_dsl, filter_dsl_version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())`,
     )
       .bind(
         createdId,
@@ -196,6 +292,7 @@ export async function handleSavedFilters(
         parsed.visibility,
         parsed.name,
         parsed.description,
+        parsed.scopePreference,
         parsed.filterDsl,
         SAVED_FILTER_DSL_VERSION,
       )
@@ -236,10 +333,17 @@ export async function handleSavedFilters(
     if (parsed instanceof Response) return parsed;
     const duplicate = await env.DB.prepare(
       `SELECT id FROM saved_filters
-       WHERE site_id = ? AND owner_user_id = ? AND filter_dsl = ? AND id <> ?
+       WHERE site_id = ? AND owner_user_id = ? AND filter_dsl = ?
+         AND scope_preference = ? AND id <> ?
        LIMIT 1`,
     )
-      .bind(siteId, session.userId, parsed.filterDsl, id)
+      .bind(
+        siteId,
+        session.userId,
+        parsed.filterDsl,
+        parsed.scopePreference,
+        id,
+      )
       .first<{ id: string }>();
     if (duplicate) {
       return bad(
@@ -250,12 +354,13 @@ export async function handleSavedFilters(
     }
     await env.DB.prepare(
       `UPDATE saved_filters
-       SET visibility = ?, name = ?, description = ?, filter_dsl = ?,
-           filter_dsl_version = ?, updated_at = unixepoch()
+       SET visibility = ?, scope_preference = ?, name = ?, description = ?,
+           filter_dsl = ?, filter_dsl_version = ?, updated_at = unixepoch()
        WHERE id = ? AND site_id = ? AND owner_user_id = ?`,
     )
       .bind(
         parsed.visibility,
+        parsed.scopePreference,
         parsed.name,
         parsed.description,
         parsed.filterDsl,

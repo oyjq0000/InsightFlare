@@ -7,7 +7,9 @@ export const SECRET_PURPOSES = {
     "insightflare:notification-secret-encryption:v1",
   loginTurnstileSecretEncryption:
     "insightflare:login-turnstile-secret-encryption:v1",
-  botAnalyticsSecretEncryption:
+  analyticsEngineSecretEncryption:
+    "insightflare:analytics-engine-secret-encryption:v1",
+  legacyBotAnalyticsSecretEncryption:
     "insightflare:bot-analytics-secret-encryption:v1",
   collectTokenSigning: "insightflare:collect-token-signing:v1",
   teamInviteTokenEncryption: "insightflare:team-invite-token-encryption:v1",

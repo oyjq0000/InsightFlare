@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { findSiteProfile } from "@/lib/realtime/demo-site-profiles";
 import {
   createMockRealtimeSocket,
   handleDemoRequest,
@@ -28,8 +29,10 @@ function asRecord(result: unknown): Record<string, unknown> {
 
 function dataRows(result: unknown): Array<Record<string, unknown>> {
   const data = asRecord(result).data;
-  expect(Array.isArray(data)).toBe(true);
-  return data as Array<Record<string, unknown>>;
+  if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
+  const page = data as { items?: unknown };
+  expect(Array.isArray(page?.items)).toBe(true);
+  return page.items as Array<Record<string, unknown>>;
 }
 
 afterEach(() => {
@@ -466,45 +469,115 @@ describe("mock — handleDemoRequest", () => {
       expect(res.ok).toBe(true);
     });
 
-    it("limits bot analytics overview data and paginates detail rows", () => {
-      const path = "/api/private/admin/bot-analytics";
+    it("returns blocked/included request observation data and paginates detail rows", () => {
+      const path = "/api/private/admin/request-observation";
       const params = {
         from: FIXED_FROM,
         to: FIXED_FROM + 60 * 60 * 1000,
         limit: 7,
       };
       const overview = asRecord(handleDemoRequest({ path, params }));
-      const abnormal = overview.abnormal as Record<string, unknown>;
-      const normal = overview.normal as Record<string, unknown>;
-      const abnormalEvents = overview.events as unknown[];
-      const normalEvents = overview.normalEvents as unknown[];
+      const blocked = overview.blocked as Record<string, unknown>;
+      const included = overview.included as Record<string, unknown>;
+      const blockedEvents = overview.blockedEvents as unknown[];
+      const includedEvents = overview.includedEvents as unknown[];
 
-      expect(abnormalEvents).toHaveLength(7);
-      expect(normalEvents).toHaveLength(7);
-      expect(abnormal.events).toEqual(abnormalEvents);
-      expect(normal.events).toEqual(normalEvents);
-      expect(abnormal.hasMore).toBe(true);
-      expect(normal.hasMore).toBe(true);
+      expect(blockedEvents).toHaveLength(7);
+      expect(includedEvents).toHaveLength(7);
+      expect(blocked.events).toEqual(blockedEvents);
+      expect(included.events).toEqual(includedEvents);
+      expect((blocked.pagination as Record<string, unknown>).hasMore).toBe(
+        true,
+      );
+      expect((included.pagination as Record<string, unknown>).hasMore).toBe(
+        true,
+      );
+      expect(
+        [...blockedEvents, ...includedEvents].every(
+          (event) => !(event as Record<string, unknown>).sampleWeight,
+        ),
+      ).toBe(true);
+      expect(blockedEvents[0]).toHaveProperty("ip");
+      expect(blockedEvents[0]).toHaveProperty("userAgent");
+      expect(blockedEvents[0]).not.toHaveProperty("metadataJson");
+      expect(includedEvents[0]).toHaveProperty("requestMethod");
+      expect(includedEvents[0]).toHaveProperty("hostname");
+      expect(includedEvents[0]).not.toHaveProperty("ip");
+      expect(includedEvents[0]).not.toHaveProperty("userAgent");
+      expect(includedEvents[0]).not.toHaveProperty("metadataJson");
 
-      const nextPage = asRecord(
+      const nextPageResponse = asRecord(
         handleDemoRequest({
           path,
           params: {
             ...params,
-            page: "abnormal",
-            cursor: JSON.stringify(abnormal.nextCursor),
+            source: "blocked",
+            cursor: String(
+              (blocked.pagination as Record<string, unknown>).nextCursor ?? "",
+            ),
           },
         }),
-      ).page as Record<string, unknown>;
-
-      const nextPageEvents = nextPage.events as unknown[];
-      expect(nextPageEvents).toHaveLength(7);
-      expect(nextPageEvents).not.toEqual(abnormalEvents);
-      expect((nextPageEvents[0] as Record<string, unknown>).traceId).not.toBe(
-        (abnormalEvents[0] as Record<string, unknown>).traceId,
       );
-      expect(nextPage.hasMore).toBe(true);
-      expect(nextPage.nextCursor).toEqual(expect.any(Object));
+      const nextPage = nextPageResponse.data as Record<string, unknown>;
+
+      const nextPageEvents = nextPage.items as unknown[];
+      expect(nextPageEvents).toHaveLength(7);
+      expect(nextPageEvents).not.toEqual(blockedEvents);
+      expect((nextPageEvents[0] as Record<string, unknown>).traceId).not.toBe(
+        (blockedEvents[0] as Record<string, unknown>).traceId,
+      );
+      expect(nextPageResponse.source).toBe("blocked");
+      expect((nextPage.pagination as Record<string, unknown>).hasMore).toBe(
+        true,
+      );
+      expect(
+        (nextPage.pagination as Record<string, unknown>).nextCursor,
+      ).toEqual(expect.any(String));
+    });
+
+    it("resolves demo request observation dimensions from their semantic fields", () => {
+      const path = "/api/private/admin/request-observation";
+      const params = {
+        from: FIXED_FROM,
+        to: FIXED_FROM + DAY_MS,
+        dimensionSource: "blocked",
+      };
+      const dimensionRows = (group: string, tab: string) => {
+        const response = asRecord(
+          handleDemoRequest({
+            path,
+            params: { ...params, dimensionGroup: group, dimensionTab: tab },
+          }),
+        );
+        const dimension = response.dimension as Record<string, unknown>;
+        return dimension.rows as Array<Record<string, unknown>>;
+      };
+
+      const reasonRows = dimensionRows("detection", "reason");
+      expect(reasonRows.length).toBeGreaterThan(0);
+      expect(reasonRows.every((row) => row.label !== "Unknown")).toBe(true);
+      expect(reasonRows.every((row) => Number(row.botCount) >= 0)).toBe(true);
+
+      const siteRows = dimensionRows("target", "site");
+      expect(siteRows.length).toBeGreaterThan(0);
+      expect(siteRows[0]).toMatchObject({
+        key: expect.stringMatching(/^demo-site-/),
+        label: expect.not.stringMatching(/^Unknown$/),
+        iconLabel: expect.any(String),
+      });
+
+      const ipPrefixRows = dimensionRows("client", "ipPrefix");
+      expect(ipPrefixRows.length).toBeGreaterThan(0);
+      expect(
+        ipPrefixRows.every(
+          (row) =>
+            String(row.label) === "Unknown" ||
+            String(row.label).endsWith("/24"),
+        ),
+      ).toBe(true);
+      expect(
+        ipPrefixRows.some((row) => String(row.label).endsWith("/24")),
+      ).toBe(true);
     });
 
     it("returns notification admin lists", () => {
@@ -555,6 +628,180 @@ describe("mock — handleDemoRequest", () => {
           params: { teamId: "demo-team-001" },
         }),
       ).toBeDefined();
+    });
+
+    it("models the internal scheduled-task cadence in demo mode", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(Date.UTC(2026, 7, 31, 11, 2, 55)));
+
+      const response = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { pageSize: 2000 },
+        }),
+      );
+      const tasks = response.tasks as Array<Record<string, unknown>>;
+      const taskByKey = new Map(tasks.map((task) => [String(task.key), task]));
+
+      expect(tasks).toHaveLength(3);
+      expect(taskByKey.get("notification_tick")).toMatchObject({
+        schedule: "Every 30 minutes",
+        runs30d: 1440,
+        nextRunAt: Date.UTC(2026, 7, 31, 11, 30),
+      });
+      expect(taskByKey.get("visit_hourly_rollup")).toMatchObject({
+        schedule: "Every hour",
+        runs30d: 720,
+        nextRunAt: Date.UTC(2026, 7, 31, 12),
+      });
+      expect(taskByKey.get("database_maintenance")).toMatchObject({
+        schedule: "Every day",
+        runs30d: 30,
+        skipped30d: 1,
+        nextRunAt: Date.UTC(2026, 8, 1),
+      });
+
+      const runs = (response.runs as Record<string, unknown>).items as Array<
+        Record<string, unknown>
+      >;
+      const skippedGroup = runs.find((group) =>
+        (group.runs as Array<Record<string, unknown>>).some(
+          (run) => run.status === "skipped",
+        ),
+      );
+      expect(skippedGroup).toMatchObject({
+        status: "skipped",
+        taskCount: 1,
+        skippedCount: 1,
+        logsCount: 0,
+      });
+      const selectedResponse = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { runId: String(skippedGroup?.id) },
+        }),
+      );
+      expect(selectedResponse.logs).toMatchObject({
+        items: [],
+        pagination: { hasMore: false, nextCursor: null },
+      });
+
+      const paged = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { status: "success", limit: 1 },
+        }),
+      );
+      expect((paged.runs as Record<string, unknown>).pagination).toMatchObject({
+        hasMore: true,
+        nextCursor: expect.any(String),
+      });
+
+      const firstTaskRun = ((runs[0]?.runs as Array<Record<string, unknown>>) ??
+        [])[0];
+      const childSelected = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { runId: String(firstTaskRun?.id) },
+        }),
+      );
+      expect((childSelected.selectedRun as Record<string, unknown>).id).toBe(
+        runs[0]?.id,
+      );
+
+      const emptyPage = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { page: 999, limit: 2, runId: "missing-demo-run" },
+        }),
+      );
+      expect(emptyPage.selectedRun).toBeNull();
+    });
+
+    it("keeps demo scheduled-task settings stateful", () => {
+      const unchanged = asRecord(
+        ok(
+          handleDemoRequest({
+            path: "/api/private/admin/scheduled-tasks",
+            method: "PATCH",
+            body: {},
+          }),
+        ).data,
+      );
+      expect(unchanged.tasks).toEqual(expect.any(Array));
+
+      const disabled = asRecord(
+        ok(
+          handleDemoRequest({
+            path: "/api/private/admin/scheduled-tasks",
+            method: "PATCH",
+            body: {
+              taskKey: "notification_tick",
+              enabled: 0,
+              retention: {
+                scheduledTaskLogsDays: 45,
+                notificationTestDays: 60,
+                notificationAttentionDays: 240,
+                notificationDefaultDays: 90,
+              },
+            },
+          }),
+        ).data,
+      );
+      const disabledTask = (
+        disabled.tasks as Array<Record<string, unknown>>
+      ).find((task) => task.key === "notification_tick");
+      expect(disabledTask).toMatchObject({ enabled: false, nextRunAt: null });
+      expect(disabled.retention).toEqual({
+        scheduledTaskLogsDays: 45,
+        notificationTestDays: 60,
+        notificationAttentionDays: 240,
+        notificationDefaultDays: 90,
+      });
+
+      const restored = asRecord(
+        ok(
+          handleDemoRequest({
+            path: "/api/private/admin/scheduled-tasks",
+            method: "PATCH",
+            body: {
+              taskKey: "notification_tick",
+              enabled: true,
+              retentionDays: 30,
+              retention: {
+                notificationTestDays: 30,
+                notificationAttentionDays: 180,
+                notificationDefaultDays: 120,
+              },
+            },
+          }),
+        ).data,
+      );
+      const restoredTask = (
+        restored.tasks as Array<Record<string, unknown>>
+      ).find((task) => task.key === "notification_tick");
+      expect(restoredTask).toMatchObject({ enabled: true });
+      expect(restored.retention).toMatchObject({
+        scheduledTaskLogsDays: 30,
+        notificationTestDays: 30,
+        notificationAttentionDays: 180,
+        notificationDefaultDays: 120,
+      });
+
+      const invalidPagination = asRecord(
+        handleDemoRequest({
+          path: "/api/private/admin/scheduled-tasks",
+          params: { limit: "invalid" },
+        }),
+      );
+      expect(invalidPagination.runs as Record<string, unknown>).toMatchObject({
+        pagination: {
+          limit: 50,
+          returned: expect.any(Number),
+          hasMore: expect.any(Boolean),
+          nextCursor: expect.anything(),
+        },
+      });
     });
 
     it("returns system-performance with different windowMinutes values", () => {
@@ -632,7 +879,6 @@ describe("mock — handleDemoRequest", () => {
       "/api/private/referrers",
       "/api/private/visitors",
       "/api/private/countries",
-      "/api/private/devices",
       "/api/private/page-hash",
       "/api/private/page-query",
       "/api/private/event-types",
@@ -671,8 +917,262 @@ describe("mock — handleDemoRequest", () => {
           params: baseParams,
         }),
       );
-      expect(res).toMatchObject({ ok: true, data: expect.any(Array) });
-      expect((res.data as unknown[]).length).toBeGreaterThan(0);
+      expect(res).toMatchObject({
+        ok: true,
+        data: { items: expect.any(Array), pagination: expect.any(Object) },
+      });
+      expect(
+        ((res.data as Record<string, unknown>).items as unknown[]).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it("serializes dashboard collection routes with pagination metadata", () => {
+      const serialize = (
+        path: string,
+        params: Record<string, string | number> = {},
+      ) =>
+        JSON.parse(
+          JSON.stringify(
+            handleDemoRequest({
+              path,
+              params: { ...ANALYTICS_PARAMS, limit: 2, ...params },
+            }),
+          ),
+        ) as Record<string, any>;
+
+      const collectionRequests = [
+        ["/api/private/overview-page-path", {}],
+        ["/api/private/overview-source-domain", {}],
+        ["/api/private/overview-client-browser", {}],
+        ["/api/private/filter-values", { filterKey: "page.path" }],
+        ["/api/private/pages", {}],
+        ["/api/private/referrers", {}],
+        ["/api/private/page-hash", {}],
+        ["/api/private/page-query", {}],
+        ["/api/private/event-types", {}],
+      ] as const;
+
+      for (const [path, params] of collectionRequests) {
+        const response = serialize(path, params);
+        expect(response).toMatchObject({
+          ok: true,
+          data: {
+            items: expect.any(Array),
+            pagination: {
+              limit: 2,
+              returned: expect.any(Number),
+              hasMore: expect.any(Boolean),
+            },
+          },
+        });
+        expect(
+          response.data.pagination.nextCursor === null ||
+            typeof response.data.pagination.nextCursor === "string",
+        ).toBe(true);
+        expect(response.data.items).toHaveLength(
+          response.data.pagination.returned,
+        );
+      }
+    });
+
+    it("keeps demo analytics envelopes aligned with the real route contracts", () => {
+      const request = (
+        path: string,
+        extra: Record<string, string | number> = {},
+      ) =>
+        asRecord(
+          handleDemoRequest({
+            path,
+            params: { ...ANALYTICS_PARAMS, ...extra },
+          }),
+        );
+
+      const pages = request("/api/private/pages");
+      expect(pages.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      });
+      expect(pages.tabs).toBeDefined();
+
+      const publicPages = request("/api/public/share/some-token/pages");
+      expect(publicPages.tabs).toBeUndefined();
+      expect(publicPages.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      });
+
+      const referrers = request("/api/private/referrers");
+      const referrerItems = (
+        referrers.data as { items: Array<Record<string, unknown>> }
+      ).items;
+      expect(referrerItems[0]).not.toHaveProperty("visitors");
+
+      const channel = request("/api/private/referrer-channel-dimension-trend");
+      expect(Object.keys(channel.source as object).sort()).toEqual([
+        "data",
+        "series",
+      ]);
+      expect(Object.keys(channel.channel as object).sort()).toEqual([
+        "data",
+        "series",
+      ]);
+
+      const eventsTrend = request("/api/private/events-trend");
+      expect(eventsTrend.data).toMatchObject({
+        interval: expect.any(String),
+        series: expect.any(Array),
+        data: expect.any(Array),
+      });
+
+      const utm = request("/api/private/utm-source");
+      expect(utm.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: expect.any(Object),
+      });
+      expect(utm.data).not.toEqual(expect.any(Array));
+    });
+
+    it("paginates only profile page paths and referrer domains", () => {
+      const profile = findSiteProfile(SITE_ID);
+      const serialize = (path: string) =>
+        JSON.parse(
+          JSON.stringify(
+            handleDemoRequest({
+              path,
+              params: { ...baseParams, limit: 100 },
+            }),
+          ),
+        ) as Record<string, any>;
+
+      const pageResponse = serialize("/api/private/overview-page-path");
+      const sourceResponse = serialize("/api/private/overview-source-domain");
+      const geoResponse = serialize("/api/private/overview-geo-country");
+      const pageItems = pageResponse.data.items as Array<{ label: string }>;
+      const sourceItems = sourceResponse.data.items as Array<{
+        label: string;
+      }>;
+
+      expect(pageResponse.data.pagination).toMatchObject({
+        hasMore: false,
+        nextCursor: null,
+      });
+      expect(sourceResponse.data.pagination).toMatchObject({
+        hasMore: false,
+        nextCursor: null,
+      });
+      expect(geoResponse.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: expect.objectContaining({
+          hasMore: false,
+          nextCursor: null,
+        }),
+      });
+      expect(
+        pageItems.every((item) => profile.paths.includes(item.label)),
+      ).toBe(true);
+      const profileSources = new Set(
+        profile.topReferrers.map((referrer) =>
+          referrer.name === "(direct)" ? "" : referrer.name.toLowerCase(),
+        ),
+      );
+      expect(
+        sourceItems.every((item) =>
+          profileSources.has(item.label.toLowerCase()),
+        ),
+      ).toBe(true);
+    });
+
+    it("serializes split journey collections and event payload details", () => {
+      const visitor = dataRows(
+        handleDemoRequest({
+          path: "/api/private/visitors",
+          params: ANALYTICS_PARAMS,
+        }),
+      )[0];
+      const session = dataRows(
+        handleDemoRequest({
+          path: "/api/private/sessions",
+          params: ANALYTICS_PARAMS,
+        }),
+      )[0];
+      expect(visitor?.visitorId).toEqual(expect.any(String));
+      expect(session?.sessionId).toEqual(expect.any(String));
+
+      const serialize = (
+        path: string,
+        params: Record<string, string | number>,
+      ) =>
+        JSON.parse(
+          JSON.stringify(handleDemoRequest({ path, params })),
+        ) as Record<string, any>;
+      const assertCollection = (response: Record<string, any>) => {
+        expect(response).toMatchObject({
+          ok: true,
+          data: {
+            items: expect.any(Array),
+            pagination: {
+              limit: 2,
+              returned: expect.any(Number),
+              hasMore: expect.any(Boolean),
+            },
+          },
+        });
+      };
+
+      assertCollection(
+        serialize("/api/private/visitor-events", {
+          ...ANALYTICS_PARAMS,
+          visitorId: String(visitor?.visitorId ?? ""),
+          limit: 2,
+        }),
+      );
+      assertCollection(
+        serialize("/api/private/visitor-sessions", {
+          ...ANALYTICS_PARAMS,
+          visitorId: String(visitor?.visitorId ?? ""),
+          limit: 2,
+        }),
+      );
+      const sessionEventPage = serialize("/api/private/session-events", {
+        ...ANALYTICS_PARAMS,
+        sessionId: String(session?.sessionId ?? ""),
+        limit: 2,
+      });
+      assertCollection(sessionEventPage);
+
+      const firstSessionEvent =
+        sessionEventPage.data.items.find(
+          (item: Record<string, unknown>) => item.kind === "pageview",
+        ) ?? sessionEventPage.data.items[0];
+      const journeyEventDetail = serialize(
+        "/api/private/journey-event-detail",
+        {
+          ...ANALYTICS_PARAMS,
+          eventId: String(firstSessionEvent?.id ?? ""),
+          eventKind: String(firstSessionEvent?.kind ?? ""),
+          sessionId: String(firstSessionEvent?.sessionId ?? ""),
+          visitId: String(firstSessionEvent?.visitId ?? ""),
+        },
+      );
+      expect(journeyEventDetail.data.event).toMatchObject({
+        eventId: String(firstSessionEvent?.id ?? ""),
+      });
+
+      const event = dataRows(
+        handleDemoRequest({
+          path: "/api/private/events-records",
+          params: { ...ANALYTICS_PARAMS, pageSize: 1 },
+        }),
+      )[0];
+      const detail = serialize("/api/private/event-record-detail", {
+        ...ANALYTICS_PARAMS,
+        eventId: String(event?.eventId ?? ""),
+      });
+      expect(detail.data.eventData).toMatchObject({
+        plan: expect.any(String),
+        page: expect.any(Object),
+        items: expect.any(Array),
+      });
     });
 
     it("client-cross-breakdown handles missing dimensions gracefully", () => {
@@ -681,12 +1181,8 @@ describe("mock — handleDemoRequest", () => {
         params: baseParams,
       }) as Record<string, unknown>;
       expect(res).toMatchObject({
-        ok: true,
-        data: {
-          columns: expect.any(Array),
-          rows: expect.any(Array),
-          totalVisitors: 0,
-        },
+        ok: false,
+        error: { message: "Unsupported primary dimension" },
       });
     });
 
@@ -695,11 +1191,38 @@ describe("mock — handleDemoRequest", () => {
         path: "/api/private/client-cross-breakdown",
         params: {
           ...baseParams,
-          primaryDimension: "browser",
-          secondaryDimension: "deviceType",
+          primaryDimension: "client.browser",
+          secondaryDimension: "client.deviceType",
         },
       }) as Record<string, unknown>;
-      expect(res).toBeDefined();
+      expect(res.ok).toBe(true);
+    });
+
+    it("client-cross-breakdown accepts the same generic dimensions as Edge", () => {
+      for (const [primaryDimension, secondaryDimension] of [
+        ["page.path", "utm.source"],
+        ["client.browser", "geo.country"],
+        ["browser", "language"],
+      ] as const) {
+        const res = asRecord(
+          handleDemoRequest({
+            path: "/api/private/client-cross-breakdown",
+            params: {
+              ...baseParams,
+              primaryDimension,
+              secondaryDimension,
+            },
+          }),
+        );
+        expect(res).toMatchObject({
+          ok: true,
+          data: {
+            columns: expect.any(Array),
+            rows: expect.any(Array),
+            totalVisitors: expect.any(Number),
+          },
+        });
+      }
     });
 
     it("returns ok for team dashboard", () => {
@@ -778,7 +1301,7 @@ describe("mock — handleDemoRequest", () => {
       );
     }, 20000);
 
-    it("falls back to a single trend bucket for an inverted time window", () => {
+    it("rejects an inverted time window", () => {
       const res = asRecord(
         handleDemoRequest({
           path: "/api/private/trend",
@@ -791,16 +1314,10 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
 
-      expect(res.ok).toBe(true);
-      expect(res.interval).toBe("hour");
-      expect(res.data).toEqual([
-        expect.objectContaining({
-          bucket: 0,
-          views: 0,
-          visitors: 0,
-          sessions: 0,
-        }),
-      ]);
+      expect(res).toMatchObject({
+        ok: false,
+        error: { message: "Invalid time window" },
+      });
     });
 
     it("returns event detail, context cards, and payload field values", () => {
@@ -873,18 +1390,6 @@ describe("mock — handleDemoRequest", () => {
           geo: expect.any(Object),
         }),
       );
-      expect(typeDetail.fields).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ path: "/plan", valueType: "string" }),
-          expect.objectContaining({ path: "/value", valueType: "number" }),
-          expect.objectContaining({
-            path: "/flags/signedIn",
-            valueType: "boolean",
-          }),
-          expect.objectContaining({ path: "/items/*", valueType: "null" }),
-        ]),
-      );
-
       const fieldValues = dataRows(
         handleDemoRequest({
           path: "/api/private/event-type-field-values",
@@ -912,7 +1417,9 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
       expect(fields).toMatchObject({ ok: true, eventName });
-      expect(fields.fields).toEqual(expect.any(Array));
+      expect((fields.data as Record<string, unknown>).items).toEqual(
+        expect.any(Array),
+      );
 
       const apiV1Fields = asRecord(
         handleDemoRequest({
@@ -934,7 +1441,9 @@ describe("mock — handleDemoRequest", () => {
           },
         }),
       );
-      expect(apiV1FieldValues.data).toEqual(expect.any(Array));
+      expect(apiV1FieldValues.data).toEqual(
+        expect.objectContaining({ items: expect.any(Array) }),
+      );
     });
 
     it("supports event payload filters for scalar and array values", () => {
@@ -998,12 +1507,13 @@ describe("mock — handleDemoRequest", () => {
       );
 
       expect(res.ok).toBe(true);
-      expect(res.series).toEqual(
-        expect.arrayContaining([
+      expect(res.data).toMatchObject({
+        interval: "hour",
+        series: expect.arrayContaining([
           expect.objectContaining({ key: "other", isOther: true }),
         ]),
-      );
-      expect(res.data).toEqual(expect.any(Array));
+        data: expect.any(Array),
+      });
     });
 
     it("returns empty event field values when required params are absent", () => {
@@ -1014,8 +1524,10 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
 
-      expect(res.ok).toBe(true);
-      expect(res.data).toEqual([]);
+      expect(res).toMatchObject({
+        ok: false,
+        error: { message: "fieldPath is required" },
+      });
     });
 
     it.each([
@@ -1058,10 +1570,12 @@ describe("mock — handleDemoRequest", () => {
 
       expect(res.ok).toBe(true);
       expect(asRecord(res).field).toBe(filterKey);
-      expect(Array.isArray(res.data)).toBe(true);
-      const values = (res.data as Array<{ value: string }>).map(
-        (item) => item.value,
+      expect((res.data as Record<string, unknown>).items).toEqual(
+        expect.any(Array),
       );
+      const values = (
+        (res.data as Record<string, unknown>).items as Array<{ value: string }>
+      ).map((item) => item.value);
       expect(new Set(values).size).toBe(values.length);
     });
 
@@ -1077,7 +1591,9 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
       expect(res).toMatchObject({ ok: true, field: "page.path" });
-      expect(res.data).toEqual(expect.any(Array));
+      expect(res.data).toEqual(
+        expect.objectContaining({ items: expect.any(Array) }),
+      );
     });
 
     it("removes nested NOT and OR branches for the active canonical field", () => {
@@ -1105,7 +1621,7 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
       expect(res).toMatchObject({ ok: true, eventName: "" });
-      expect(res.fields).toEqual(
+      expect((res.data as Record<string, unknown>).items).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ path: "/plan", valueType: "string" }),
           expect.objectContaining({ path: "/value", valueType: "number" }),
@@ -1120,7 +1636,10 @@ describe("mock — handleDemoRequest", () => {
           params: { ...ANALYTICS_PARAMS, filterKey: "page.query" },
         }),
       );
-      expect(denied).toMatchObject({ ok: false, data: [] });
+      expect(denied).toMatchObject({
+        ok: false,
+        error: { message: "Invalid filter field" },
+      });
     });
 
     it("returns hierarchical geo point counts with and without region filters", () => {
@@ -1228,18 +1747,14 @@ describe("mock — handleDemoRequest", () => {
           path: "/api/private/client-cross-breakdown",
           params: {
             ...ANALYTICS_PARAMS,
-            primaryDimension: "browser",
-            secondaryDimension: "browser",
+            primaryDimension: "client.browser",
+            secondaryDimension: "client.browser",
           },
         }),
       );
       expect(sameDimension).toMatchObject({
-        ok: true,
-        data: {
-          columns: [],
-          rows: [],
-          totalVisitors: 0,
-        },
+        ok: false,
+        error: { message: "Primary and secondary dimensions must differ" },
       });
 
       const clientCross = asRecord(
@@ -1247,8 +1762,8 @@ describe("mock — handleDemoRequest", () => {
           path: "/api/private/client-cross-breakdown",
           params: {
             ...ANALYTICS_PARAMS,
-            primaryDimension: "browser",
-            secondaryDimension: "language",
+            primaryDimension: "client.browser",
+            secondaryDimension: "client.language",
             primaryLimit: 1,
             secondaryLimit: 1,
           },
@@ -1263,7 +1778,7 @@ describe("mock — handleDemoRequest", () => {
       });
     });
 
-    it("returns empty shaped data for inverted-window trend and radar routes", () => {
+    it("rejects inverted-window trend and radar routes", () => {
       const invertedParams = {
         siteId: SITE_ID,
         from: FIXED_TO,
@@ -1278,10 +1793,8 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
       expect(clientTrend).toMatchObject({
-        ok: true,
-        interval: "hour",
-        series: [],
-        data: [],
+        ok: false,
+        error: { message: "Invalid time window" },
       });
 
       const utmTrend = asRecord(
@@ -1291,10 +1804,8 @@ describe("mock — handleDemoRequest", () => {
         }),
       );
       expect(utmTrend).toMatchObject({
-        ok: true,
-        interval: "hour",
-        series: [],
-        data: [],
+        ok: false,
+        error: { message: "Invalid time window" },
       });
 
       const browserRadar = asRecord(
@@ -1303,7 +1814,10 @@ describe("mock — handleDemoRequest", () => {
           params: invertedParams,
         }),
       );
-      expect(browserRadar).toMatchObject({ ok: true, data: [] });
+      expect(browserRadar).toMatchObject({
+        ok: false,
+        error: { message: "Invalid time window" },
+      });
 
       const referrerRadar = asRecord(
         handleDemoRequest({
@@ -1311,7 +1825,10 @@ describe("mock — handleDemoRequest", () => {
           params: invertedParams,
         }),
       );
-      expect(referrerRadar).toMatchObject({ ok: true, data: [] });
+      expect(referrerRadar).toMatchObject({
+        ok: false,
+        error: { message: "Invalid time window" },
+      });
 
       const browserCross = asRecord(
         handleDemoRequest({
@@ -1319,10 +1836,9 @@ describe("mock — handleDemoRequest", () => {
           params: invertedParams,
         }),
       );
-      expect(browserCross.operatingSystem).toEqual({
-        columns: [],
-        rows: [],
-        totalVisitors: 0,
+      expect(browserCross).toMatchObject({
+        ok: false,
+        error: { message: "Invalid time window" },
       });
 
       const clientCross = asRecord(
@@ -1330,18 +1846,14 @@ describe("mock — handleDemoRequest", () => {
           path: "/api/private/client-cross-breakdown",
           params: {
             ...invertedParams,
-            primaryDimension: "browser",
-            secondaryDimension: "language",
+            primaryDimension: "client.browser",
+            secondaryDimension: "client.language",
           },
         }),
       );
       expect(clientCross).toMatchObject({
-        ok: true,
-        data: {
-          columns: [],
-          rows: [],
-          totalVisitors: 0,
-        },
+        ok: false,
+        error: { message: "Invalid time window" },
       });
     });
 
@@ -1365,72 +1877,71 @@ describe("mock — handleDemoRequest", () => {
       const pages = asRecord(
         handleDemoRequest({
           path: "/api/private/pages-dashboard",
-          params: { ...ANALYTICS_PARAMS, page: 1, pageSize: 2 },
+          params: { ...ANALYTICS_PARAMS, limit: 2 },
         }),
       );
-      expect(pages.meta).toEqual(
-        expect.objectContaining({ page: 1, pageSize: 2, returned: 2 }),
-      );
+      expect(pages.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: expect.objectContaining({ limit: 2, returned: 2 }),
+      });
 
       const visitors = asRecord(
         handleDemoRequest({
           path: "/api/private/visitors",
           params: {
             ...ANALYTICS_PARAMS,
-            pageSize: 2,
+            limit: 2,
             sortBy: "views",
             sortDir: "asc",
             search: "/",
           },
         }),
       );
-      expect(visitors.meta).toEqual(
-        expect.objectContaining({
-          pageSize: 2,
-          nextCursor: expect.any(String),
-        }),
-      );
-      expect(visitors.data).toEqual(expect.any(Array));
+      expect(visitors.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: { limit: 2, nextCursor: expect.any(String) },
+      });
 
       const sessions = asRecord(
         handleDemoRequest({
           path: "/api/private/sessions",
           params: {
             ...ANALYTICS_PARAMS,
-            pageSize: 2,
+            limit: 2,
             sortBy: "durationMs",
             sortDir: "asc",
             q: "/",
           },
         }),
       );
-      expect(sessions.meta).toEqual(
-        expect.objectContaining({
-          pageSize: 2,
-          nextCursor: expect.any(String),
-        }),
-      );
+      expect(sessions.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: { limit: 2, nextCursor: expect.any(String) },
+      });
 
       const events = asRecord(
         handleDemoRequest({
           path: "/api/private/events-records",
           params: {
             ...ANALYTICS_PARAMS,
-            pageSize: 2,
+            limit: 2,
             sortBy: "eventName",
             sortDir: "asc",
             search: "/",
           },
         }),
       );
-      expect(events.meta).toEqual(expect.objectContaining({ pageSize: 2 }));
+      expect(events.data).toMatchObject({
+        items: expect.any(Array),
+        pagination: { limit: 2 },
+      });
     });
 
     it("builds visitor and session details from IDs returned by list routes", () => {
       const visitor = dataRows(
         handleDemoRequest({
           path: "/api/private/visitors",
-          params: { ...ANALYTICS_PARAMS, page: 1, pageSize: 1 },
+          params: { ...ANALYTICS_PARAMS, limit: 1 },
         }),
       )[0];
       expect(visitor).toBeTruthy();
@@ -1460,7 +1971,7 @@ describe("mock — handleDemoRequest", () => {
       const session = dataRows(
         handleDemoRequest({
           path: "/api/private/sessions",
-          params: { ...ANALYTICS_PARAMS, page: 1, pageSize: 1 },
+          params: { ...ANALYTICS_PARAMS, limit: 1 },
         }),
       )[0];
       expect(session).toBeTruthy();
@@ -1488,23 +1999,19 @@ describe("mock — handleDemoRequest", () => {
       );
     });
 
-    it("returns null details when journey IDs are missing", () => {
+    it("rejects missing journey IDs", () => {
       expect(
-        ok(
-          handleDemoRequest({
-            path: "/api/private/visitor-detail",
-            params: ANALYTICS_PARAMS,
-          }),
-        ).data,
-      ).toBeNull();
+        handleDemoRequest({
+          path: "/api/private/visitor-detail",
+          params: ANALYTICS_PARAMS,
+        }),
+      ).toMatchObject({ ok: false, error: { message: "Missing visitorId" } });
       expect(
-        ok(
-          handleDemoRequest({
-            path: "/api/private/session-detail",
-            params: ANALYTICS_PARAMS,
-          }),
-        ).data,
-      ).toBeNull();
+        handleDemoRequest({
+          path: "/api/private/session-detail",
+          params: ANALYTICS_PARAMS,
+        }),
+      ).toMatchObject({ ok: false, error: { message: "Missing sessionId" } });
     });
 
     it("normalizes retention granularity and returns monthly cohorts", () => {
@@ -1656,8 +2163,8 @@ describe("mock — handleDemoRequest", () => {
           ...params,
           dimension: "browser",
           filterKey: "client.browser",
-          primaryDimension: "browser",
-          secondaryDimension: "language",
+          primaryDimension: "client.browser",
+          secondaryDimension: "client.language",
         },
       });
 

@@ -30,13 +30,25 @@ export interface RequestObservationTrendPoint {
   count: number;
   baselineCount: number;
   normalCount: number;
-  abnormalCount: number;
+  suspectedBotCount: number;
+  botCount: number;
+  customBlockedCount: number;
+  includedCount: number;
+  blockedCount: number;
   totalCount: number;
   botRatio: number;
-  abnormalRatio: number;
+  blockedRatio: number;
   normalRatio: number;
   pageviews: number;
   customEvents: number;
+  pageviewCount: number;
+  leaveCount: number;
+  visibilityCount: number;
+  customEventCount: number;
+  identifyCount: number;
+  weightedRequestCount: number;
+  latencyWeightedSumMs: number;
+  latencySampleWeight: number;
   avgLatencyMs: number | null;
   p50LatencyMs: number | null;
   p75LatencyMs: number | null;
@@ -46,27 +58,35 @@ export interface RequestObservationTrendPoint {
 
 export interface RequestObservationTrendLabels {
   normalRequests: string;
-  abnormalRequests: string;
+  suspectedBotRequests: string;
+  botRequests: string;
+  customBlockedRequests: string;
+  includedRequests: string;
+  blockedRequests: string;
   totalRequests: string;
   pageviews: string;
   customEvents: string;
-  abnormalRatio: string;
+  pageview: string;
+  leave: string;
+  visibility: string;
+  customEvent: string;
+  identify: string;
+  botRatio: string;
+  blockedRatio: string;
+  normalRatio: string;
   avgLatency: string;
   p50Latency: string;
   p75Latency: string;
   p95Latency: string;
   p99Latency: string;
   normalTrafficShare: string;
-  lowConfidenceTraffic: string;
-  mediumConfidenceTraffic: string;
-  highConfidenceTraffic: string;
+  suspectedBotTraffic: string;
+  botTraffic: string;
+  customBlockedTraffic: string;
 }
 
 export type RequestObservationTrendVariant =
-  | "overview"
-  | "traffic-composition"
-  | "latency"
-  | "abnormal";
+  "overview" | "traffic-composition" | "latency" | "blocked" | "included";
 
 export interface RequestObservationTrendChartProps {
   data: ReadonlyArray<RequestObservationTrendPoint>;
@@ -80,9 +100,11 @@ export interface RequestObservationTrendChartProps {
 
 const PERFORMANCE_WARNING_COLOR = "oklch(0.75 0.16 80)";
 const NORMAL_TRAFFIC_SHARE_COLOR = "var(--color-chart-4)";
-const LOW_CONFIDENCE_TRAFFIC_COLOR = "var(--color-chart-5)";
-const MEDIUM_CONFIDENCE_TRAFFIC_COLOR = PERFORMANCE_WARNING_COLOR;
-const HIGH_CONFIDENCE_TRAFFIC_COLOR = "var(--color-destructive)";
+const SUSPECTED_BOT_TRAFFIC_COLOR = PERFORMANCE_WARNING_COLOR;
+const BOT_TRAFFIC_COLOR = "var(--color-destructive)";
+const CUSTOM_BLOCKED_TRAFFIC_COLOR = "var(--muted-foreground)";
+const BUSINESS_CUSTOM_EVENT_COLOR = PERFORMANCE_WARNING_COLOR;
+const BUSINESS_IDENTIFY_COLOR = "oklch(0.7 0.14 250)";
 
 type RequestObservationHoverHighlightProps = Pick<
   CategoricalChartState,
@@ -191,9 +213,11 @@ function TrendTooltipValue({
 
 function createTrendTooltipFormatter({
   labels,
+  latencyFormatter,
   locale,
 }: {
   labels: RequestObservationTrendLabels;
+  latencyFormatter: (valueMs: number) => string;
   locale: Locale;
 }) {
   return function formatTrendTooltipValue(
@@ -205,12 +229,14 @@ function createTrendTooltipFormatter({
   ) {
     const key = String(name || "");
     const row = (payload ?? null) as Record<string, unknown> | null;
-    const isRatio = key === "botRatio" || key.endsWith("Ratio");
+    const isRatio = key.endsWith("Ratio");
+    // Latency fields are explicitly suffixed with Ms by the API. Delegate
+    // formatting to the caller so the tooltip never assumes seconds.
     const isLatency = key.toLowerCase().includes("latency");
     const numeric = Number(value);
     const displayValue = Number(row?.[key] ?? numeric ?? 0);
     const formatted = isLatency
-      ? durationFormat(locale, Number.isFinite(displayValue) ? displayValue : 0)
+      ? latencyFormatter(Number.isFinite(displayValue) ? displayValue : 0)
       : isRatio
         ? percentFormat(
             locale,
@@ -222,29 +248,76 @@ function createTrendTooltipFormatter({
               Math.round(Number.isFinite(displayValue) ? displayValue : 0),
             ),
           );
+    const labelByDataKey: Record<string, string> = {
+      normalCount: labels.normalTrafficShare,
+      suspectedBotCount: labels.suspectedBotTraffic,
+      botCount: labels.botTraffic,
+      customBlockedCount: labels.customBlockedTraffic,
+      includedCount: labels.includedRequests,
+      blockedCount: labels.blockedRequests,
+      totalCount: labels.totalRequests,
+      pageviews: labels.pageviews,
+      customEvents: labels.customEvents,
+      pageviewCount: labels.pageview,
+      leaveCount: labels.leave,
+      visibilityCount: labels.visibility,
+      customEventCount: labels.customEvent,
+      identifyCount: labels.identify,
+      botRatio: labels.botRatio,
+      blockedRatio: labels.blockedRatio,
+      normalRatio: labels.normalRatio,
+      avgLatencyMs: labels.avgLatency,
+      p50LatencyMs: labels.p50Latency,
+      p75LatencyMs: labels.p75Latency,
+      p95LatencyMs: labels.p95Latency,
+      p99LatencyMs: labels.p99Latency,
+    };
     const label =
+      labelByDataKey[key] ??
       labels[key as keyof RequestObservationTrendLabels] ??
-      (isRatio ? labels.abnormalRatio : labels.abnormalRequests);
+      (isRatio ? labels.blockedRatio : labels.totalRequests);
     const indicatorColor =
       key === "normalCount"
         ? "var(--color-normalCount)"
-        : key === "totalCount"
-          ? "var(--color-totalCount)"
-          : key === "pageviews"
-            ? "var(--color-pageviews)"
-            : key === "customEvents"
-              ? "var(--color-customEvents)"
-              : key === "p50LatencyMs"
-                ? "var(--color-p50LatencyMs)"
-                : key === "p75LatencyMs"
-                  ? "var(--color-p75LatencyMs)"
-                  : key === "p95LatencyMs"
-                    ? "var(--color-p95LatencyMs)"
-                    : key === "p99LatencyMs"
-                      ? "var(--color-p99LatencyMs)"
-                      : isRatio
-                        ? "var(--color-abnormalRatio, var(--color-botRatio))"
-                        : "var(--color-abnormalCount, var(--color-count))";
+        : key === "suspectedBotCount"
+          ? "var(--color-suspectedBotCount)"
+          : key === "botCount"
+            ? "var(--color-botCount)"
+            : key === "customBlockedCount"
+              ? "var(--color-customBlockedCount)"
+              : key === "includedCount"
+                ? "var(--color-includedCount)"
+                : key === "blockedCount"
+                  ? "var(--color-blockedCount)"
+                  : key === "totalCount"
+                    ? "var(--color-totalCount)"
+                    : key === "pageviews"
+                      ? "var(--color-pageviews)"
+                      : key === "customEvents"
+                        ? "var(--color-customEvents)"
+                        : key === "pageviewCount"
+                          ? "var(--color-pageviewCount)"
+                          : key === "leaveCount"
+                            ? "var(--color-leaveCount)"
+                            : key === "visibilityCount"
+                              ? "var(--color-visibilityCount)"
+                              : key === "customEventCount"
+                                ? "var(--color-customEventCount)"
+                                : key === "identifyCount"
+                                  ? "var(--color-identifyCount)"
+                                  : key === "p50LatencyMs"
+                                    ? "var(--color-p50LatencyMs)"
+                                    : key === "p75LatencyMs"
+                                      ? "var(--color-p75LatencyMs)"
+                                      : key === "p95LatencyMs"
+                                        ? "var(--color-p95LatencyMs)"
+                                        : key === "p99LatencyMs"
+                                          ? "var(--color-p99LatencyMs)"
+                                          : isRatio
+                                            ? key === "blockedRatio"
+                                              ? "var(--color-blockedRatio)"
+                                              : "var(--color-botRatio)"
+                                            : "var(--color-count)";
 
     return (
       <TrendTooltipValue
@@ -264,8 +337,24 @@ function createTrendChartConfig(
       label: labels.normalRequests,
       color: NORMAL_TRAFFIC_SHARE_COLOR,
     },
-    abnormalCount: {
-      label: labels.abnormalRequests,
+    suspectedBotCount: {
+      label: labels.suspectedBotRequests,
+      color: SUSPECTED_BOT_TRAFFIC_COLOR,
+    },
+    botCount: {
+      label: labels.botRequests,
+      color: BOT_TRAFFIC_COLOR,
+    },
+    customBlockedCount: {
+      label: labels.customBlockedRequests,
+      color: CUSTOM_BLOCKED_TRAFFIC_COLOR,
+    },
+    includedCount: {
+      label: labels.includedRequests,
+      color: NORMAL_TRAFFIC_SHARE_COLOR,
+    },
+    blockedCount: {
+      label: labels.blockedRequests,
       color: "var(--color-destructive)",
     },
     totalCount: {
@@ -280,9 +369,37 @@ function createTrendChartConfig(
       label: labels.customEvents,
       color: PERFORMANCE_WARNING_COLOR,
     },
-    abnormalRatio: {
-      label: labels.abnormalRatio,
+    pageviewCount: {
+      label: labels.pageview,
+      color: "var(--color-chart-1)",
+    },
+    leaveCount: {
+      label: labels.leave,
+      color: "var(--color-chart-2)",
+    },
+    visibilityCount: {
+      label: labels.visibility,
+      color: "var(--color-chart-3)",
+    },
+    customEventCount: {
+      label: labels.customEvent,
+      color: BUSINESS_CUSTOM_EVENT_COLOR,
+    },
+    identifyCount: {
+      label: labels.identify,
+      color: BUSINESS_IDENTIFY_COLOR,
+    },
+    botRatio: {
+      label: labels.botRatio,
+      color: BOT_TRAFFIC_COLOR,
+    },
+    blockedRatio: {
+      label: labels.blockedRatio,
       color: "var(--color-destructive)",
+    },
+    normalRatio: {
+      label: labels.normalRatio,
+      color: NORMAL_TRAFFIC_SHARE_COLOR,
     },
     avgLatencyMs: {
       label: labels.avgLatency,
@@ -307,18 +424,6 @@ function createTrendChartConfig(
     normalTrafficShare: {
       label: labels.normalTrafficShare,
       color: NORMAL_TRAFFIC_SHARE_COLOR,
-    },
-    lowConfidenceTraffic: {
-      label: labels.lowConfidenceTraffic,
-      color: LOW_CONFIDENCE_TRAFFIC_COLOR,
-    },
-    mediumConfidenceTraffic: {
-      label: labels.mediumConfidenceTraffic,
-      color: MEDIUM_CONFIDENCE_TRAFFIC_COLOR,
-    },
-    highConfidenceTraffic: {
-      label: labels.highConfidenceTraffic,
-      color: HIGH_CONFIDENCE_TRAFFIC_COLOR,
     },
   };
 }
@@ -346,12 +451,20 @@ function RequestObservationTrendChartComponent({
     [locale, spanMs],
   );
   const formatTrendTooltipValue = useMemo(
-    () => createTrendTooltipFormatter({ labels, locale }),
-    [labels, locale],
+    () =>
+      createTrendTooltipFormatter({
+        labels,
+        latencyFormatter:
+          latencyFormatter ??
+          ((valueMs: number) => durationFormat(locale, valueMs)),
+        locale,
+      }),
+    [labels, latencyFormatter, locale],
   );
   const trendConfig = useMemo(() => createTrendChartConfig(labels), [labels]);
   const isLatency = variant === "latency";
-  const isLargeTrend = variant === "overview" || variant === "abnormal";
+  const isLargeTrend =
+    variant === "overview" || variant === "blocked" || variant === "included";
   const formatLatency =
     latencyFormatter ?? ((valueMs: number) => durationFormat(locale, valueMs));
 
@@ -361,7 +474,7 @@ function RequestObservationTrendChartComponent({
         {variant === "traffic-composition" ? (
           <defs>
             <linearGradient
-              id="request-observability-total-fill"
+              id="request-observability-pageview-fill"
               x1="0"
               y1="0"
               x2="0"
@@ -369,12 +482,84 @@ function RequestObservationTrendChartComponent({
             >
               <stop
                 offset="5%"
-                stopColor="var(--color-totalCount)"
+                stopColor="var(--color-pageviewCount)"
                 stopOpacity={0.3}
               />
               <stop
                 offset="95%"
-                stopColor="var(--color-totalCount)"
+                stopColor="var(--color-pageviewCount)"
+                stopOpacity={0.02}
+              />
+            </linearGradient>
+            <linearGradient
+              id="request-observability-leave-fill"
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="1"
+            >
+              <stop
+                offset="5%"
+                stopColor="var(--color-leaveCount)"
+                stopOpacity={0.3}
+              />
+              <stop
+                offset="95%"
+                stopColor="var(--color-leaveCount)"
+                stopOpacity={0.02}
+              />
+            </linearGradient>
+            <linearGradient
+              id="request-observability-visibility-fill"
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="1"
+            >
+              <stop
+                offset="5%"
+                stopColor="var(--color-visibilityCount)"
+                stopOpacity={0.3}
+              />
+              <stop
+                offset="95%"
+                stopColor="var(--color-visibilityCount)"
+                stopOpacity={0.02}
+              />
+            </linearGradient>
+            <linearGradient
+              id="request-observability-custom-event-fill"
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="1"
+            >
+              <stop
+                offset="5%"
+                stopColor="var(--color-customEventCount)"
+                stopOpacity={0.3}
+              />
+              <stop
+                offset="95%"
+                stopColor="var(--color-customEventCount)"
+                stopOpacity={0.02}
+              />
+            </linearGradient>
+            <linearGradient
+              id="request-observability-identify-fill"
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="1"
+            >
+              <stop
+                offset="5%"
+                stopColor="var(--color-identifyCount)"
+                stopOpacity={0.3}
+              />
+              <stop
+                offset="95%"
+                stopColor="var(--color-identifyCount)"
                 stopOpacity={0.02}
               />
             </linearGradient>
@@ -391,7 +576,7 @@ function RequestObservationTrendChartComponent({
           }
           minTickGap={14}
         />
-        {variant === "overview" || variant === "abnormal" ? (
+        {isLargeTrend ? (
           <YAxis
             yAxisId="requests"
             width={52}
@@ -400,7 +585,7 @@ function RequestObservationTrendChartComponent({
             tickFormatter={(value) => numberFormatter.format(Number(value))}
           />
         ) : null}
-        {variant === "overview" || variant === "abnormal" ? (
+        {isLargeTrend ? (
           <YAxis
             yAxisId="ratio"
             orientation="right"
@@ -410,7 +595,7 @@ function RequestObservationTrendChartComponent({
             tickFormatter={(value) => percentFormat(locale, Number(value))}
           />
         ) : null}
-        {variant !== "overview" && variant !== "abnormal" ? (
+        {!isLargeTrend ? (
           <YAxis
             width={isLatency ? 60 : 52}
             tickLine={false}
@@ -454,9 +639,27 @@ function RequestObservationTrendChartComponent({
         {variant === "overview" ? (
           <Bar
             yAxisId="requests"
-            dataKey="abnormalCount"
+            dataKey="suspectedBotCount"
             stackId="requests"
-            fill="var(--color-abnormalCount)"
+            fill="var(--color-suspectedBotCount)"
+            radius={[0, 0, 0, 0]}
+          />
+        ) : null}
+        {variant === "overview" ? (
+          <Bar
+            yAxisId="requests"
+            dataKey="botCount"
+            stackId="requests"
+            fill="var(--color-botCount)"
+            radius={[0, 0, 0, 0]}
+          />
+        ) : null}
+        {variant === "overview" ? (
+          <Bar
+            yAxisId="requests"
+            dataKey="customBlockedCount"
+            stackId="requests"
+            fill="var(--color-customBlockedCount)"
             radius={[0, 0, 0, 0]}
           />
         ) : null}
@@ -464,8 +667,8 @@ function RequestObservationTrendChartComponent({
           <Line
             yAxisId="ratio"
             type="linear"
-            dataKey="abnormalRatio"
-            stroke="var(--color-abnormalRatio)"
+            dataKey="blockedRatio"
+            stroke="var(--color-blockedRatio)"
             strokeWidth={2}
             dot={false}
             activeDot={{ r: 4 }}
@@ -474,29 +677,50 @@ function RequestObservationTrendChartComponent({
         {variant === "traffic-composition" ? (
           <Area
             type="linear"
-            dataKey="totalCount"
-            stroke="var(--color-totalCount)"
-            fill="url(#request-observability-total-fill)"
+            dataKey="pageviewCount"
+            stroke="var(--color-pageviewCount)"
+            fill="url(#request-observability-pageview-fill)"
             strokeWidth={2}
             dot={false}
           />
         ) : null}
         {variant === "traffic-composition" ? (
-          <Line
+          <Area
             type="linear"
-            dataKey="pageviews"
-            stroke="var(--color-pageviews)"
+            dataKey="leaveCount"
+            stroke="var(--color-leaveCount)"
+            fill="url(#request-observability-leave-fill)"
             strokeWidth={2}
             dot={false}
           />
         ) : null}
         {variant === "traffic-composition" ? (
-          <Line
+          <Area
             type="linear"
-            dataKey="customEvents"
-            stroke="var(--color-customEvents)"
+            dataKey="visibilityCount"
+            stroke="var(--color-visibilityCount)"
+            fill="url(#request-observability-visibility-fill)"
             strokeWidth={2}
-            strokeDasharray="4 4"
+            dot={false}
+          />
+        ) : null}
+        {variant === "traffic-composition" ? (
+          <Area
+            type="linear"
+            dataKey="customEventCount"
+            stroke="var(--color-customEventCount)"
+            fill="url(#request-observability-custom-event-fill)"
+            strokeWidth={2}
+            dot={false}
+          />
+        ) : null}
+        {variant === "traffic-composition" ? (
+          <Area
+            type="linear"
+            dataKey="identifyCount"
+            stroke="var(--color-identifyCount)"
+            fill="url(#request-observability-identify-fill)"
+            strokeWidth={2}
             dot={false}
           />
         ) : null}
@@ -541,23 +765,51 @@ function RequestObservationTrendChartComponent({
             connectNulls
           />
         ) : null}
-        {variant === "abnormal" ? (
+        {variant === "blocked" ? (
           <Bar
             yAxisId="requests"
-            dataKey="abnormalCount"
-            fill="var(--color-abnormalCount)"
-            radius={[3, 3, 0, 0]}
+            dataKey="botCount"
+            stackId="blocked"
+            fill="var(--color-botCount)"
+            radius={[0, 0, 0, 0]}
           />
         ) : null}
-        {variant === "abnormal" ? (
+        {variant === "blocked" ? (
+          <Bar
+            yAxisId="requests"
+            dataKey="customBlockedCount"
+            stackId="blocked"
+            fill="var(--color-customBlockedCount)"
+            radius={[0, 0, 0, 0]}
+          />
+        ) : null}
+        {variant === "blocked" ? (
           <Line
             yAxisId="ratio"
             type="linear"
-            dataKey="abnormalRatio"
-            stroke="var(--color-abnormalRatio)"
+            dataKey="blockedRatio"
+            stroke="var(--color-blockedRatio)"
             strokeWidth={2}
             dot={false}
             activeDot={{ r: 4 }}
+          />
+        ) : null}
+        {variant === "included" ? (
+          <Bar
+            yAxisId="requests"
+            dataKey="normalCount"
+            stackId="included"
+            fill="var(--color-normalCount)"
+            radius={[0, 0, 0, 0]}
+          />
+        ) : null}
+        {variant === "included" ? (
+          <Bar
+            yAxisId="requests"
+            dataKey="suspectedBotCount"
+            stackId="included"
+            fill="var(--color-suspectedBotCount)"
+            radius={[0, 0, 0, 0]}
           />
         ) : null}
       </ComposedChart>
