@@ -23,6 +23,12 @@ function inspect(
   file: string,
   text = readFileSync(file, "utf8"),
 ): { maps: number; violations: string[] } {
+  // Scan every source file, but do not build ASTs for unrelated modules.
+  // This keeps the repository boundary check below CI's unchanged timeout.
+  const imports = ts.preProcessFile(text, true, true).importedFiles;
+  if (!imports.some((entry) => entry.fileName.includes("maplibre"))) {
+    return { maps: 0, violations: [] };
+  }
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const mapNames = new Set<string>();
   const violations: string[] = [];
